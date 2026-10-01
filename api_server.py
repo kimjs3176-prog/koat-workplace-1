@@ -1,11 +1,10 @@
 """
-KOAT 내규&국가법령 종합 검색 서비스
+KOAT 서무비서 — 서무 규정·지침·서식을 담아 두고, 상황을 말하면 절차·기한·서식·근거를 안내
 배포: Vercel / Render / Railway
 로컬: python run_local.py
 """
 
 import os, json, re, time, threading, webbrowser, base64
-import concurrent.futures as _cf
 import xml.etree.ElementTree as ET
 # 신뢰할 수 없는 XML(업로드 파일·외부 법령 XML)의 엔티티 폭탄(billion laughs) 방어.
 # defusedxml 이 있으면 그 파서를 쓰고, 없으면 표준 파서로 폴백한다.
@@ -15,7 +14,7 @@ try:
 except Exception:
     def _xml_fromstring(s): return ET.fromstring(s)
 import urllib3
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import requests as req_lib
@@ -41,20 +40,7 @@ else:
     ]
 CORS(app, origins=_cors_origins)
 
-OC   = os.environ.get("LAW_OC", "tjsl0919")
-BASE = "https://www.law.go.kr/DRF"
-HEADERS = {
-    "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"),
-    "Accept":          "application/json, text/html, */*;q=0.9",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer":         "https://www.law.go.kr/",
-    "Origin":          "https://www.law.go.kr",
-    "Connection":      "keep-alive",
-    "Cache-Control":   "no-cache",
-}
+HEADERS = {"User-Agent": "KOAT-Secretary/1.0", "Accept": "application/json, */*;q=0.9"}
 
 # ── 재시도 정책이 적용된 requests 세션 ────────────────────────────────────────
 def _make_session(verify: bool = True) -> req_lib.Session:
@@ -81,26 +67,7 @@ def _make_session(verify: bool = True) -> req_lib.Session:
 
 # 기본 세션은 TLS 인증서를 검증한다(GitHub 토큰·Google API 키 전송에 사용).
 _SESSION = _make_session()
-# 법제처(law.go.kr)는 인증서 체인 문제가 있어 이 호출에만 검증을 끈다.
-# 민감한 토큰을 보내는 GitHub/Google 세션과 분리해 노출을 막는다.
-_LAW_SESSION = _make_session(verify=False)
 
-# ── 최근 검색어 (서버 메모리) ─────────────────────────────────────────────────
-recent_searches = []
-favorites = []
-
-def add_recent(q):
-    global recent_searches
-    q = q.strip()
-    if q and q not in recent_searches:
-        recent_searches.insert(0, q)
-        recent_searches = recent_searches[:10]
-
-# ── 공통 HTTP 헬퍼 ────────────────────────────────────────────────────────────
-# 타임아웃: (연결 대기, 읽기 대기)
-_T_JSON = (5, 12)   # JSON 검색
-_T_XML  = (5, 20)   # XML 조문 전문
-_T_LONG = (5, 30)   # 긴 응답 (조문 전문 대용량)
 
 def _decode(raw: bytes) -> str:
     for enc in ("utf-8", "euc-kr"):
@@ -110,566 +77,8 @@ def _decode(raw: bytes) -> str:
             continue
     return raw.decode("utf-8", errors="replace")
 
-def _law_get_json(params: dict, timeout=None) -> dict:
-    timeout = timeout or _T_JSON
-    last_err = None
-    for attempt in range(3):
-        try:
-            r = _LAW_SESSION.get(
-                f"{BASE}/lawSearch.do",
-                params={**params, "OC": OC, "type": "JSON"},
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            return json.loads(_decode(r.content))
-        except (req_lib.exceptions.ConnectionError,
-                req_lib.exceptions.ChunkedEncodingError) as e:
-            last_err = e
-            # 공유 세션을 close() 하면 동시 실행 중인 다른 워커 스레드의 연결이
-            # 끊긴다. 재시도는 풀에서 새 연결을 자동으로 받으므로 sleep만 한다.
-            time.sleep(1.5 * (attempt + 1))
-            continue
-    raise last_err
-
-def _law_get_xml(endpoint: str, params: dict, timeout=None) -> ET.Element:
-    timeout = timeout or _T_XML
-    last_err = None
-    for attempt in range(3):
-        try:
-            r = _LAW_SESSION.get(
-                f"{BASE}/{endpoint}",
-                params={**params, "OC": OC, "type": "XML"},
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            text = _decode(r.content).strip().lstrip("\ufeff")
-            text = re.sub(r"<\?xml[^?]*\?>", "", text, count=1).strip()
-            if not text:
-                raise ValueError("빈 XML 응답")
-            return _xml_fromstring(text)
-        except (req_lib.exceptions.ConnectionError,
-                req_lib.exceptions.ChunkedEncodingError) as e:
-            last_err = e
-            time.sleep(1.5 * (attempt + 1))
-            continue
-    raise last_err
-
-
-def _is_valid_law_xml(root: ET.Element) -> bool:
-    """법제처 XML 응답이 유효한 법령 데이터인지 확인."""
-    for tag in ("message", "Message", "error", "Error"):
-        el = root.find(f".//{tag}")
-        if el is not None and el.text:
-            txt = el.text.strip()
-            if any(w in txt for w in ("없습니다", "없음", "오류", "error", "invalid")):
-                return False
-    return len({el.tag for el in root.iter()}) > 3
-
-
-# 번호 태그 목록 (이 태그의 텍스트는 내용에서 제외)
-_NO_TAGS = {"항번호","호번호","목번호","조번호","조문번호","항수","호수","목수",
-            "조수","장번호","절번호","관번호","편번호"}
-# 구조 컨테이너 (직접 텍스트 없이 자식만 가짐)
-_SKIP_TAGS = {"조문단위","항","호","목","호목","조문","법령","조문내용그룹"}
-
-def _node_text(el) -> str:
-    """단일 노드의 직접 텍스트만 반환 (자식 텍스트 제외)"""
-    return (el.text or "").strip()
-
-# ── 항/호/목 계층 깊이 ────────────────────────────────────────────────────────
-# 법제처 XML은 <목>을 <호>의 자식이 아니라 <항>의 자식(= <호>의 형제)으로 내려준다.
-# 따라서 부모를 따라 깊이를 세면 목이 누락되므로, 태그별 고정 깊이를 사용한다.
-_ITEM_DEPTH = {"항": 1, "호": 2, "목": 3, "호목": 3}
-# 각 계층의 (번호 태그, 내용 태그)
-_ITEM_TAGS = {
-    "항":   ("항번호", "항내용"),
-    "호":   ("호번호", "호내용"),
-    "목":   ("목번호", "목내용"),
-    "호목": ("목번호", "목내용"),
-}
-_CONTENT_TAGS = ("조문내용", "항내용", "호내용", "목내용")
-
-# 내용 텍스트 맨 앞의 항·호·목 번호 패턴
-#   ① / 1. / 1의2. / 가. / 가의2. / (1) / 1) / 가)
-_NUM_PREFIX_RE = re.compile(
-    r"^(?:[①-⑮㉑-㉟]"                       # 동그라미 숫자(항)
-    r"|\d{1,3}(?:의\d{1,3})?\s*[.)]"        # 1.  1의2.  1)   (연도 '2024.' 오인 방지: 3자리 이내)
-    r"|[가-힣](?:의\d{1,3})?\s*[.)]"        # 가.  가의2.  가)
-    r"|\(\s*\d{1,3}\s*\)"                   # (1)
-    r")"
-)
-def _split_no(depth: int, no: str, txt: str) -> tuple:
-    """
-    (번호, 내용) 을 확정한다.
-      · 내용이 번호를 이미 품고 있으면 떼어내어 중복 표기를 막는다
-        (예: 번호 '1의2.' + 내용 '1의2. 농업기계의 보급…' → ('1의2.', '농업기계의 보급…'))
-      · 번호 태그가 비어 있어도 내용 앞의 번호를 인식해 계층 들여쓰기에 쓴다
-      · depth 0(조문 본문)은 '제N조(제목)' 형태를 그대로 두어야 하므로 분리하지 않는다
-    """
-    no, txt = (no or "").strip(), (txt or "").strip()
-    if depth <= 0 or not txt:
-        return no, txt
-
-    if no and txt.startswith(no):
-        return no, txt[len(no):].lstrip()
-
-    # 번호 태그가 없거나 표기가 달라도(1 vs 1.) 본문 앞 번호를 그대로 신뢰한다
-    m = _NUM_PREFIX_RE.match(txt)
-    if m:
-        return m.group().strip(), txt[m.end():].lstrip()
-
-    return no, txt
-
-
-def _render_jo_struct(u: ET.Element) -> list:
-    """
-    <조문단위> 하나를 읽어 계층 구조를 가진 항목 리스트로 반환한다.
-      [{"depth": 0, "no": "", "text": "제2조(정의) …"},
-       {"depth": 2, "no": "1.", "text": "\"농업기계\"란 …"},
-       {"depth": 3, "no": "가.", "text": "농림축산물의 생산에 …"}, …]
-    depth 0=조문본문, 1=항, 2=호, 3=목.
-    프론트엔드는 이 깊이로 매달린 들여쓰기(hanging indent)를 적용한다.
-    """
-    items = []
-
-    def _emit(depth: int, no: str, txt: str):
-        no, txt = _split_no(depth, no, txt)
-        if no or txt:
-            items.append({"depth": depth, "no": no, "text": txt})
-
-    def _walk(node: ET.Element, depth: int):
-        tag = node.tag
-
-        if tag in _NO_TAGS:
-            return                              # 번호 태그는 부모에서 처리
-
-        if tag in _ITEM_TAGS:                   # 항 / 호 / 목
-            d = _ITEM_DEPTH.get(tag, depth)
-            no_tag, con_tag = _ITEM_TAGS[tag]
-            _emit(d, _node_text(node.find(no_tag)) if node.find(no_tag) is not None else "",
-                     _node_text(node.find(con_tag)) if node.find(con_tag) is not None else "")
-            for child in node:                  # 하위 계층(호·목)은 문서 순서대로
-                if child.tag in (no_tag, con_tag):
-                    continue
-                _walk(child, d)
-            return
-
-        if tag in _CONTENT_TAGS:                # 조문내용 등 단독 내용 태그
-            _emit(depth, "", _node_text(node))
-            if node.tail and node.tail.strip():
-                _emit(depth, "", node.tail.strip())
-            return
-
-        for child in node:                      # 기타 컨테이너: 자식 순회
-            _walk(child, depth)
-
-    for child in u:
-        if child.tag in ("조번호", "조문번호", "조문가지번호", "조문제목", "조제목"):
-            continue                            # 번호·제목은 별도 필드로 추출
-        _walk(child, 0)
-
-    return items
-
-
-def _struct_to_text(items: list) -> str:
-    """계층 항목 리스트를 들여쓴 평문으로 변환(기존 조문내용 필드 호환)."""
-    lines = []
-    for it in items:
-        indent = "  " * max(0, it.get("depth", 0) - 1)
-        no, txt = it.get("no", ""), it.get("text", "")
-        lines.append(f"{indent}{(no + ' ' + txt).strip() if no else txt}")
-    return "\n".join(l for l in lines if l.strip())
-
-
-def _render_jo(u: ET.Element) -> str:
-    """<조문단위> 하나를 읽어서 깔끔한 조문 텍스트를 반환한다."""
-    return _struct_to_text(_render_jo_struct(u))
-
-
-# ── 법령MST 취득 (XML 검색 → 태그 추출) ──────────────────────────────────────
-_MST_TAGS  = ("법령MST", "법령Mst", "행정규칙MST", "행정규칙Mst", "lawMst", "MST", "mst",
-              "법령일련번호", "행정규칙일련번호")
-_NAME_TAGS = ("법령명한글", "법령명", "행정규칙명")
-
-
-def _mst_of(item: ET.Element) -> str:
-    for tag in _MST_TAGS:
-        v = (item.findtext(tag) or "").strip()
-        if v:
-            return v
-    return ""
-
-
-def _lookup_law(law_name: str, target: str = "law") -> dict:
-    """
-    법령명 → {"mst", "id", "name", "rank"}.
-    · 법제처 검색은 질의어를 포함하는 다른 법령을 먼저 주는 경우가 있어
-      (예: '특허법' → '특허료 등의 징수규칙') 이름이 정확히 일치하는 항목을 우선한다.
-    · 같은 이름이 여러 건(현행·시행예정·연혁)일 때는 '현행'을 우선하고, 그다음
-      시행일(오늘 이전) → 공포일이 최신인 항목을 고른다. 첫 항목을 무조건 쓰면
-      이전 시행본(MST)에 연결돼 최신 법령과 어긋나던 문제를 막는다.
-    · id(법령ID)는 버전과 무관한 법령 식별자라 lawService.do?ID= 로 조회하면
-      법제처가 항상 현행 본문을 준다(MST는 특정 시행본의 일련번호).
-    """
-    out = {"mst": "", "id": "", "name": "", "rank": 99}
-    try:
-        root = _law_get_xml("lawSearch.do",
-                            {"target": target, "query": law_name, "display": "30"})
-        items = [el for el in root if _mst_of(el)] or \
-                [el for el in root.iter() if el is not root and _mst_of(el)]
-        want = _norm_key(law_name)
-        today = time.strftime("%Y%m%d")
-
-        def _txt(it, *tags):
-            for t in tags:
-                v = (it.findtext(t) or "").strip()
-                if v:
-                    return v
-            return ""
-
-        best_key = None
-        for it in items:
-            nm = _txt(it, *_NAME_TAGS)
-            n = _norm_key(nm)
-            rank = (0 if n == want else            # 완전 일치
-                    1 if n.startswith(want) else   # '특허법 시행령' 류
-                    2 if want in n else 3)         # 부분 포함 → 무관
-            status = _txt(it, "현행연혁코드", "현행연혁구분", "현행여부")
-            ef = re.sub(r"\D", "", _txt(it, "시행일자"))[:8]
-            anc = re.sub(r"\D", "", _txt(it, "공포일자", "발령일자"))[:8]
-            cur = 0 if (status == "현행" or (not status and (not ef or ef <= today))) else 1
-            # 작은 값이 우선: 일치도 → 현행 → (시행일이 오늘 이전인) 최신 시행일 → 최신 공포일
-            key = (rank, cur, 0 if (ef and ef <= today) else 1,
-                   -int(ef or 0) if ef and ef <= today else 0, -int(anc or 0))
-            if best_key is None or key < best_key:
-                best_key = key
-                out = {"mst": _mst_of(it),
-                       "id": _txt(it, "법령ID", "행정규칙ID"),
-                       "name": nm, "rank": rank, "status": status, "ef": ef}
-        if out["mst"]:
-            print(f"[MST] '{law_name}'({target}) → MST={out['mst']} ID={out['id']} "
-                  f"(선택:'{out['name']}' 일치도={out['rank']} 상태={out.get('status')} 시행={out.get('ef')})")
-            return out
-
-        # 항목 단위 추출이 실패하면 문서 전체에서 첫 태그 사용(구버전 동작)
-        for tag in _MST_TAGS:
-            el = root.find(f".//{tag}")
-            if el is not None and el.text and el.text.strip():
-                print(f"[MST] '{law_name}'({target}) fallback {tag}={el.text.strip()}")
-                out["mst"] = el.text.strip()
-                return out
-        print(f"[MST] '{law_name}'({target}) 실패 — 태그: {sorted({e.tag for e in root.iter()})}")
-    except Exception as e:
-        print(f"[MST] 오류: {e}")
-    return out
-
-
-def _get_mst(law_name: str, target: str = "law") -> str:
-    """법령명 → MST(일련번호). 선택 규칙은 _lookup_law 참고."""
-    return _lookup_law(law_name, target).get("mst", "")
-
-
-def _fetch_law_root(law_name: str, target: str = "law", timeout=None, info: dict = None):
-    """
-    법령명으로 본문 XML(root)을 가져온다. 국가법령은 법령ID(→ 현행 본문)를 먼저 쓰고,
-    실패하면 선택된 시행본의 MST로 조회한다. (MST 값을 ID 파라미터로 넣던 과거 폴백은
-    전혀 다른 법령을 가져올 수 있어 쓰지 않는다.)
-    """
-    ref = info if info is not None else _lookup_law(law_name, target)
-    endpoint = "admRulService.do" if target == "admrul" else "lawService.do"
-    tries = []
-    if target == "law" and ref.get("id"):
-        tries.append({"target": target, "ID": ref["id"]})
-    if ref.get("mst"):
-        tries.append({"target": target, "MST": ref["mst"]})
-        if target == "admrul":
-            tries.append({"target": target, "ID": ref["mst"]})   # 행정규칙은 ID=일련번호
-    for params in tries:
-        try:
-            r = _law_get_xml(endpoint, params, timeout=timeout)
-            if _is_valid_law_xml(r):
-                print(f"[law] '{law_name}' ← {endpoint} {params}")
-                return r
-        except Exception as e:
-            print(f"[law] '{law_name}' {params} 실패: {e}")
-    return None
-
-# 구조 헤더 태그 (장·절·관·편 - 조문이 아님)
-_STRUCT_TAGS = {"장", "절", "관", "편", "장번호", "절번호", "관번호", "편번호",
-                "장제목", "절제목", "관제목", "편제목"}
-_STRUCT_NO_TAGS  = ("장번호","절번호","관번호","편번호")
-_STRUCT_TTL_TAGS = ("장제목","절제목","관제목","편제목")
-_STRUCT_KIND_MAP = {"장번호":"장","절번호":"절","관번호":"관","편번호":"편"}
-
-# 조문제목·조번호가 장/절/관/편임을 나타내는 패턴
-_STRUCT_TITLE_RE = re.compile(r"^제\s*\d+\s*(?:장|절|관|편)")
-_STRUCT_NO_RE    = re.compile(r"(?:장|절|관|편)")
-
-
-def _is_struct_header(u: ET.Element) -> bool:
-    """조문단위가 장/절/관/편 구조 헤더인지 판별"""
-    child_tags = {c.tag for c in u}
-
-    # ① 자식에 장/절/관/편 전용 태그가 있으면 확실한 헤더
-    if child_tags & _STRUCT_TAGS:
-        return True
-
-    # ② 조번호 텍스트 자체가 "제N장/절/관/편" 형태인 경우 (법제처 일부 법령)
-    jo_no_txt = (u.findtext("조번호") or u.findtext("조문번호") or "").strip()
-    if jo_no_txt and _STRUCT_NO_RE.search(jo_no_txt):
-        return True
-
-    # ③ 조문제목이 "제N장/절/관/편" 패턴이면 헤더
-    title_txt = (u.findtext("조문제목") or u.findtext("조제목") or "").strip()
-    if title_txt and _STRUCT_TITLE_RE.match(title_txt):
-        return True
-
-    # ④ 조문내용 텍스트가 "제N장/절/관/편 …" 패턴이면 헤더
-    #    예: <조번호>제1조</조번호><조문내용>제1장 총칙</조문내용>
-    content_el = u.find("조문내용")
-    if content_el is not None:
-        content_txt = (content_el.text or "").strip()
-        has_hang = bool(u.findall(".//항") or u.findall(".//호"))
-        if content_txt and _STRUCT_TITLE_RE.match(content_txt) and not has_hang:
-            return True
-
-    # ⑤ 조번호가 전혀 없고 실질 내용(항/조문내용/호)도 없으면 헤더
-    has_jo_no = bool(jo_no_txt)
-    if not has_jo_no:
-        has_content = bool(
-            u.findall(".//항") or u.findall(".//조문내용") or u.findall(".//호")
-        )
-        if not has_content:
-            return True
-
-    return False
-
-
-def _struct_label(u: ET.Element) -> tuple:
-    """구조 헤더의 (레이블, 제목) 반환  예: ('제1장', '총칙')"""
-    # ① 전용 번호 태그 우선
-    no_label = ""
-    for tag in _STRUCT_NO_TAGS:
-        v = (u.findtext(tag) or "").strip()
-        if v:
-            kind = _STRUCT_KIND_MAP.get(tag, "")
-            no_label = v if re.match(r"^제", v) else f"제{v}{kind}"
-            break
-
-    # ② 조번호 텍스트가 장/절 형태인 경우
-    if not no_label:
-        jo_txt = (u.findtext("조번호") or u.findtext("조문번호") or "").strip()
-        if jo_txt and _STRUCT_NO_RE.search(jo_txt):
-            no_label = jo_txt
-
-    # ③ 전용 제목 태그
-    title = ""
-    for tag in _STRUCT_TTL_TAGS:
-        v = (u.findtext(tag) or "").strip()
-        if v:
-            title = v; break
-
-    # ④ 조문제목이 "제N장 XXX" 패턴이면 분리
-    if not title:
-        ttl_txt = (u.findtext("조문제목") or u.findtext("조제목") or "").strip()
-        if ttl_txt:
-            # "제2장 발명의 진흥" → no_label="제2장", title="발명의 진흥"
-            m = re.match(r"^(제\s*\d+\s*(?:장|절|관|편))\s*(.*)", ttl_txt)
-            if m:
-                if not no_label:
-                    no_label = m.group(1).replace(" ", "")
-                title = m.group(2).strip()
-            else:
-                title = ttl_txt
-
-    # ⑤ 조문내용이 "제N장 XXX" 패턴인 경우 (조번호만 있고 조문내용에 장 정보)
-    #    예: 조번호="제1조", 조문내용="제1장 총칙"
-    if not title:
-        content_el = u.find("조문내용")
-        if content_el is not None:
-            ct = (content_el.text or "").strip()
-            m = re.match(r"^(제\s*\d+\s*(?:장|절|관|편))\s*(.*)", ct)
-            if m:
-                if not no_label:
-                    no_label = m.group(1).replace(" ", "")
-                title = m.group(2).strip()
-
-    # ⑥ 여전히 제목 없으면 자식 텍스트 fallback
-    if not title:
-        for c in u:
-            if c.tag not in _NO_TAGS and c.tag not in _STRUCT_TAGS:
-                txt = (c.text or "").strip()
-                if txt and not _STRUCT_TITLE_RE.match(txt):
-                    title = txt; break
-
-    return no_label, title
-
-
-def _art_label(no_d: str, branch: str, no_raw: str = "") -> str:
-    """조문 표시번호: 조문번호 + 가지번호 → '제5조의2'."""
-    if no_d:
-        return f"제{no_d}조" + (f"의{branch}" if branch else "")
-    m = re.match(r"^\s*(제\s*\d+\s*조(?:\s*의\s*\d+)?)", no_raw or "")
-    return m.group(1).replace(" ", "") if m else ""
-
-
-def _clean_article_title(title: str, art_no: str) -> str:
-    """조문제목에서 앞의 '제N조(의M)' 중복 접두사 제거
-    예: '제1조(목적)' → '(목적)' 또는 '목적'
-        '제100조의2 등록 신청' → '등록 신청'
-    """
-    if not title or not art_no:
-        return title
-    # "제N조" 또는 "제N조의M" 접두사 제거
-    cleaned = re.sub(r"^제\s*\d+\s*조(?:의\d+)?\s*", "", title).strip()
-    # 남은 괄호만 있으면 제거: "(목적)" → "목적"
-    if cleaned.startswith("(") and cleaned.endswith(")"):
-        cleaned = cleaned[1:-1].strip()
-    return cleaned if cleaned else title
-
-
-# ── 조문 XML 파싱 ─────────────────────────────────────────────────────────────
-def _parse_articles(root: ET.Element):
-    all_tags = {el.tag for el in root.iter()}
-    law_name = ""
-    for tag in ("법령명한글", "법령명_한글", "법령명", "행정규칙명"):
-        el = root.find(f".//{tag}")
-        if el is not None and el.text and el.text.strip():
-            law_name = el.text.strip(); break
-
-    # 법령 공포일자 (기준일)
-    law_date = ""
-    for tag in ("공포일자", "시행일자"):
-        el = root.find(f".//{tag}")
-        if el is not None and el.text and el.text.strip():
-            law_date = el.text.strip(); break
-
-    def _get_amend_info(node: ET.Element) -> dict:
-        """조문단위에서 개정·신설·삭제 정보 추출"""
-        info = {}
-        # 개정일자 태그들
-        for tag in ("개정일자", "신설일자", "제정일자", "amendDate", "revisionDate"):
-            el = node.find(tag)
-            if el is not None and el.text and el.text.strip():
-                info["amended_date"] = el.text.strip()
-                break
-        # 신설/개정/삭제 구분
-        for tag in ("개정구분", "조문구분", "신구구분"):
-            el = node.find(tag)
-            if el is not None and el.text and el.text.strip():
-                info["amend_type"] = el.text.strip()
-                break
-        # 법령 공포일자와 일치하면 최근 개정으로 마킹
-        if law_date and not info.get("amended_date"):
-            # 조문 자체에 날짜 없으면 법령 공포일을 기준으로 표시하지 않음
-            pass
-        return info
-
-    articles = []
-
-    # ── 전략 1: <조문단위> ──
-    units = root.findall(".//조문단위")
-    if units:
-        print(f"[파싱] 전략1 조문단위 {len(units)}개")
-        for u in units:
-            if _is_struct_header(u):
-                no_label, title = _struct_label(u)
-                if title or no_label:
-                    articles.append({
-                        "조문번호": "", "조문제목": title,
-                        "조문내용": "", "type": "header",
-                        "header_no": no_label,
-                    })
-                continue
-
-            no_raw = (u.findtext("조번호") or u.findtext("조문번호") or "").strip()
-            title  = (u.findtext("조문제목") or u.findtext("조제목") or "").strip()
-            branch = (u.findtext("조문가지번호") or "").strip()
-
-            # 조번호에서 첫 번째 숫자만 추출 ("제5조의2" → "5")
-            m_no  = re.search(r"\d+", no_raw)
-            no_d  = m_no.group() if m_no else ""
-
-            # 조문제목에서 앞의 "제N조" 중복 접두사 제거
-            title = _clean_article_title(title, no_d)
-
-            struct  = _render_jo_struct(u)
-            content = _struct_to_text(struct).strip()
-            amend   = _get_amend_info(u)
-            if no_d or title or content:
-                art = {"조문번호": no_d, "조문가지번호": branch,
-                       "조문표시번호": _art_label(no_d, branch, no_raw),
-                       "조문제목": title,
-                       "조문내용": content, "조문구조": struct, "type": "article"}
-                art.update(amend)
-                articles.append(art)
-        if articles:
-            return law_name, law_date, articles
-
-    # ── 전략 2: <조문> ──
-    jos = root.findall(".//조문")
-    if jos:
-        print(f"[파싱] 전략2 조문 {len(jos)}개")
-        for jo in jos:
-            no_raw = (jo.findtext("조번호") or jo.findtext("번호") or "").strip()
-            title  = (jo.findtext("조문제목") or jo.findtext("제목") or "").strip()
-            branch = (jo.findtext("조문가지번호") or "").strip()
-            m_no   = re.search(r"\d+", no_raw)
-            no_d   = m_no.group() if m_no else ""
-            title  = _clean_article_title(title, no_d)
-            struct  = _render_jo_struct(jo)
-            content = _struct_to_text(struct).strip()
-            amend   = _get_amend_info(jo)
-            if no_d or title or content:
-                art = {"조문번호": no_d, "조문가지번호": branch,
-                       "조문표시번호": _art_label(no_d, branch, no_raw),
-                       "조문제목": title,
-                       "조문내용": content, "조문구조": struct, "type": "article"}
-                art.update(amend)
-                articles.append(art)
-        if articles:
-            return law_name, law_date, articles
-
-    # ── 전략 3: <조번호> 포함 부모 탐색 ──
-    if "조번호" in all_tags:
-        print("[파싱] 전략3 조번호 기반")
-        seen = set()
-        for parent in root.iter():
-            no_el = parent.find("조번호")
-            if no_el is None: continue
-            no_raw = (no_el.text or "").strip()
-            # 장/절/관/편 번호는 건너뜀
-            if _STRUCT_NO_RE.search(no_raw): continue
-            if no_raw in seen: continue
-            seen.add(no_raw)
-            title   = (parent.findtext("조문제목") or parent.findtext("제목") or "").strip()
-            branch  = (parent.findtext("조문가지번호") or "").strip()
-            m_no    = re.search(r"\d+", no_raw)
-            no_d    = m_no.group() if m_no else ""
-            title   = _clean_article_title(title, no_d)
-            struct  = _render_jo_struct(parent)
-            content = _struct_to_text(struct).strip()
-            amend   = _get_amend_info(parent)
-            if no_d or title:
-                art = {"조문번호": no_d, "조문가지번호": branch,
-                       "조문표시번호": _art_label(no_d, branch, no_raw),
-                       "조문제목": title,
-                       "조문내용": content, "조문구조": struct, "type": "article"}
-                art.update(amend)
-                articles.append(art)
-        if articles:
-            return law_name, law_date, articles
-
-    print(f"[파싱] 실패 — 태그: {sorted(all_tags)[:40]}")
-    return law_name, law_date, articles
-
-
-# ── HTML ──────────────────────────────────────────────────────────────────────
-INDEX_HTML = None  # HTML은 index.html 파일로 분리됨
-
 
 # ── Flask 라우트 ──────────────────────────────────────────────────────────────
-
 @app.route("/")
 def index():
     # 로컬 실행 시 index.html 서빙
@@ -682,1821 +91,6 @@ def index():
     except FileNotFoundError:
         return Response("<h1>index.html not found</h1>", status=404)
 
-
-def _normalize_admrul(item: dict) -> dict:
-    """행정규칙 메타데이터를 법령 메타데이터 형식으로 정규화"""
-    out = dict(item)
-    # 법령명한글 통일
-    if not out.get("법령명한글"):
-        out["법령명한글"] = out.get("행정규칙명", "")
-    # 법령구분명 통일 (훈령/고시/예규/지침/규정 등)
-    if not out.get("법령구분명"):
-        out["법령구분명"] = out.get("행정규칙종류명", "행정규칙")
-    # 공포일자 통일 (행정규칙은 발령일자)
-    if not out.get("공포일자"):
-        out["공포일자"] = out.get("발령일자", "")
-    # 법령일련번호 통일
-    if not out.get("법령일련번호"):
-        out["법령일련번호"] = out.get("행정규칙일련번호", "")
-    # 법령URL 통일
-    if not out.get("법령URL"):
-        out["법령URL"] = out.get("행정규칙URL", "")
-    # 내부 구분 플래그 (프론트엔드에서 URL 구성 등에 활용)
-    out["_doc_type"] = "admrul"
-    return out
-
-
-@app.route("/api/search")
-def search_laws():
-    query   = request.args.get("query", "").strip()
-    display = request.args.get("display", "20")
-    if not query:
-        return jsonify({"error": "검색어를 입력하세요"}), 400
-    if len(query) < 2:
-        return jsonify({"error": "검색어는 2자 이상 입력하세요"}), 400
-    try:
-        add_recent(query)
-
-        def _do_law():
-            d = _law_get_json({"target": "law", "query": query, "display": display})
-            err = d.get("LawSearch", {}).get("message", "")
-            items = d.get("LawSearch", {}).get("law", []) or []
-            if isinstance(items, dict): items = [items]
-            return items, err
-
-        def _do_admrul():
-            try:
-                d = _law_get_json({"target": "admrul", "query": query, "display": "10"},
-                                  timeout=(5, 10))
-                ls = d.get("LawSearch", {})
-                items = ls.get("admrul") or ls.get("law") or []
-                if isinstance(items, dict): items = [items]
-                return [_normalize_admrul(i) for i in items]
-            except Exception as e:
-                print(f"[search] admrul 오류: {e}")
-                return []
-
-        with _cf.ThreadPoolExecutor(max_workers=2) as ex:
-            f_law    = ex.submit(_do_law)
-            f_admrul = ex.submit(_do_admrul)
-            laws, err = f_law.result()
-            admrul_items = f_admrul.result()
-
-        if err:
-            return jsonify({"error": f"법제처 오류: {err}"}), 502
-
-        # 중복 없이 행정규칙 병합 (법령 우선)
-        law_names = {l.get("법령명한글", "") for l in laws}
-        for item in admrul_items:
-            nm = item.get("법령명한글", "")
-            if nm and nm not in law_names:
-                laws.append(item)
-                law_names.add(nm)
-
-        if laws:
-            print(f"[search] '{query}' law={len(laws)-len(admrul_items)} "
-                  f"admrul={len(admrul_items)} 총={len(laws)}")
-        return jsonify({"success": True, "count": len(laws), "laws": laws})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/validate")
-def validate_keyword():
-    """키워드가 실제 검색 결과를 가지는지 확인"""
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"valid": False})
-    try:
-        data = _law_get_json({"target": "law", "query": q, "display": "1"})
-        laws = data.get("LawSearch", {}).get("law")
-        return jsonify({"valid": bool(laws)})
-    except Exception:
-        return jsonify({"valid": False})
-
-
-# ── 법령 조문 인메모리 캐시 (TTL 30분) ──────────────────────────────────────
-_LAW_ARTICLE_CACHE: dict = {}   # law_name → {"lname": str, "articles": list, "ts": float}
-_CACHE_LOCK = threading.Lock()
-_CACHE_TTL  = 1800              # 30분
-
-def _cache_get(law_name: str):
-    with _CACHE_LOCK:
-        entry = _LAW_ARTICLE_CACHE.get(law_name)
-        if entry and time.time() - entry["ts"] < _CACHE_TTL:
-            return entry["lname"], entry["articles"]
-    return None, None
-
-def _cache_set(law_name: str, lname: str, articles: list):
-    with _CACHE_LOCK:
-        _LAW_ARTICLE_CACHE[law_name] = {"lname": lname, "articles": articles, "ts": time.time()}
-
-
-# ── 도메인 키워드 → 관련 법령 매핑 ────────────────────────────────────────────
-# 시나리오 텍스트에서 도메인 키워드가 감지되면 해당 법령만 탐색
-DOMAIN_LAW_MAP = {
-    "농약":    ["농약관리법", "농촌진흥법"],
-    "농지":    ["농지법"],
-    "전용":    ["농지법"],
-    "임대":    ["농지법"],
-    "종자":    ["종자산업법", "식물신품종 보호법"],
-    "품종":    ["식물신품종 보호법", "종자산업법"],
-    "육종":    ["식물신품종 보호법"],
-    "특허":    ["특허법", "발명진흥법"],
-    "발명":    ["특허법", "발명진흥법"],
-    "실용신안": ["실용신안법"],
-    "상표":    ["상표법", "부정경쟁방지 및 영업비밀보호에 관한 법률"],
-    "디자인":  ["디자인보호법"],
-    "저작권":  ["저작권법"],
-    "저작물":  ["저작권법"],
-    "영업비밀": ["부정경쟁방지 및 영업비밀보호에 관한 법률"],
-    "부정경쟁": ["부정경쟁방지 및 영업비밀보호에 관한 법률"],
-    "비료":    ["비료관리법", "농촌진흥법"],
-    "축산":    ["축산법"],
-    "가축":    ["축산법"],
-    "식품":    ["식품안전기본법"],
-    "기술이전": ["기술의 이전 및 사업화 촉진에 관한 법률", "농업기술실용화 촉진법"],
-    "사업화":  ["농업기술실용화 촉진법", "기술의 이전 및 사업화 촉진에 관한 법률"],
-    "실용화":  ["농업기술실용화 촉진법"],
-    "재해보험": ["농어업재해보험법"],
-    "재해":    ["농어업재해보험법"],
-    "유통":    ["농수산물 유통 및 가격안정에 관한 법률"],
-    "수산물":  ["농수산물 유통 및 가격안정에 관한 법률"],
-    "반도체":  ["반도체집적회로의 배치설계에 관한 법률"],
-    "배치설계": ["반도체집적회로의 배치설계에 관한 법률"],
-    "농촌진흥": ["농촌진흥법"],
-    "보조금":  ["농촌진흥법", "농어업재해보험법"],
-    "인증":    ["농촌진흥법", "식품안전기본법"],
-    "유기농":  ["농촌진흥법", "식품안전기본법"],
-}
-
-
-# 농업·지식재산 분야 핵심 법령 (조문 검색 대상)
-CANDIDATE_LAWS = [
-    "특허법", "실용신안법", "디자인보호법", "상표법", "발명진흥법",
-    "농촌진흥법", "종자산업법", "농약관리법", "비료관리법", "농지법",
-    "식물신품종 보호법", "농업기술실용화 촉진법",
-    "기술의 이전 및 사업화 촉진에 관한 법률",
-    "부정경쟁방지 및 영업비밀보호에 관한 법률",
-    "저작권법", "반도체집적회로의 배치설계에 관한 법률",
-    "축산법", "식품안전기본법", "농어업재해보험법",
-    "농수산물 유통 및 가격안정에 관한 법률",
-]
-
-# 항상 탐색할 핵심 행정규칙(운영규정·훈령·예규) 목록
-# ※ 법령명 검색(Stage 1)에 걸리지 않는 운영규정도 내용 탐색 가능하도록 고정 포함
-CANDIDATE_ADMRUL = [
-    # 농촌진흥청 직무발명·기술이전 관련 훈령
-    "농촌진흥청 직무발명의 관리에 관한 규정",
-    "농촌진흥청 연구개발사업 운영규정",
-    "농촌진흥청 연구성과 기술이전 및 사업화에 관한 규정",
-    # 국가연구개발 지식재산 관련
-    "국가연구개발사업의 관리 등에 관한 규정",
-    # 발명진흥·기술이전 관련
-    "공공연구기관 기술이전·사업화 촉진 운영규정",
-    "직무발명 보상에 관한 규정",
-]
-
-# 키워드로 해당 법령 전체 조문을 불러와 매칭 조문 반환하는 공통 헬퍼
-def _law_name_rel(name: str, query: str) -> int:
-    """법령명과 질의어의 관계: 0=동일(본법), 1=같은 계열(시행령/규칙 등), 2=부분포함, 3=무관."""
-    n = re.sub(r"\s+", "", name or "")
-    q = re.sub(r"\s+", "", query or "")
-    if not n or not q:
-        return 3
-    if n == q:
-        return 0
-    if n.startswith(q):
-        return 1
-    if q in n:
-        return 2
-    return 3
-
-
-def _fetch_matching_articles(law_name: str, kw: str, doc_type: str = "law", always: bool = False):
-    cache_key = f"{doc_type}:{law_name}"
-    lname, articles = _cache_get(cache_key)
-    if articles is None:
-        root = _fetch_law_root(law_name, doc_type, timeout=(5, 18))
-        if root is None:
-            return None
-        lname, _, articles = _parse_articles(root)
-        _cache_set(cache_key, lname or law_name, articles)
-    kwL = kw.lower()
-    matched = [a for a in articles
-               if a.get("type") == "article" and
-               kwL in " ".join([a.get("조문내용",""), a.get("조문제목","")]).lower()]
-    if matched:
-        # 관련도 정렬: 제목 매칭 최우선 → 본문 내 키워드 빈도 → 조문번호
-        def _rel(a):
-            title = (a.get("조문제목","") or "").lower()
-            content = (a.get("조문내용","") or "").lower()
-            s = 0
-            if kwL in title: s += 1000
-            s += content.count(kwL) * 3
-            return s
-        matched.sort(key=lambda a: (-_rel(a),
-                                    int(re.search(r"\d+", a.get("조문번호","") or "0").group()
-                                        if re.search(r"\d+", a.get("조문번호","") or "0") else 0)))
-        return {"law_name": lname or law_name, "keyword": kw, "articles": matched}
-    if always:
-        # 법령명이 질의어와 일치하는 경우, 본문에 자기 이름이 없어 매칭이 0이어도
-        # 결과에서 빠지지 않도록 앞부분 조문을 제공한다(본법 누락 방지).
-        head = [a for a in articles if a.get("type") == "article"][:15]
-        if head:
-            return {"law_name": lname or law_name, "keyword": kw,
-                    "articles": head, "name_only": True}
-    return None
-
-
-@app.route("/api/search/article")
-def search_by_article_keyword():
-    """
-    조문 내용 키워드 검색.
-    법제처 API는 조문 내용 검색을 직접 지원하지 않으므로,
-    핵심 법령 목록에서 조문을 불러와 서버 측 필터링한다.
-    """
-    query = request.args.get("query", "").strip()
-    if not query:
-        return jsonify({"error": "검색어를 입력하세요"}), 400
-    if len(query) < 2:
-        return jsonify({"error": "검색어는 2자 이상 입력하세요"}), 400
-
-    # ── Stage 1: law + admrul 병렬 검색 ────────────────────────────────────────
-    # law_name → {"meta": dict, "doc_type": "law"|"admrul"}
-    stage1_meta: dict = {}
-
-    def _stage1_law():
-        try:
-            d = _law_get_json({"target": "law", "query": query, "display": "10"}, timeout=(5, 10))
-            items = d.get("LawSearch", {}).get("law", []) or []
-            if isinstance(items, dict): items = [items]
-            return [{"meta": l, "doc_type": "law",
-                     "name": l.get("법령명한글", "").strip()} for l in items]
-        except Exception as e:
-            print(f"[article-search] Stage1(law) 오류: {e}")
-        return []
-
-    def _stage1_admrul_multi():
-        """행정규칙 이름 검색 — 전체 쿼리 + 2글자 이상 개별 토큰으로 다중 쿼리"""
-        results = []
-        seen = set()
-        # 검색할 쿼리 목록: 전체 쿼리 + 개별 토큰
-        queries = [query] + [t for t in re.findall(r'[가-힣]{2,}', query) if t != query]
-        for q in queries[:4]:   # 최대 4개 쿼리
-            try:
-                d = _law_get_json({"target": "admrul", "query": q, "display": "10"}, timeout=(5, 10))
-                ls = d.get("LawSearch", {})
-                items = ls.get("admrul") or ls.get("law") or []
-                if isinstance(items, dict): items = [items]
-                for l in items:
-                    nm = (l.get("행정규칙명") or l.get("법령명한글") or "").strip()
-                    if nm and nm not in seen:
-                        seen.add(nm)
-                        results.append({"meta": l, "doc_type": "admrul", "name": nm})
-            except Exception as e:
-                print(f"[article-search] Stage1(admrul q={q!r}) 오류: {e}")
-        return results
-
-    with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_law    = _ex.submit(_stage1_law)
-        _f_admrul = _ex.submit(_stage1_admrul_multi)
-        for entry in _f_law.result():
-            if entry["name"]:
-                stage1_meta[entry["name"]] = entry
-        for entry in _f_admrul.result():
-            if entry["name"] and entry["name"] not in stage1_meta:
-                stage1_meta[entry["name"]] = entry
-    print(f"[article-search] Stage1 law={sum(1 for v in stage1_meta.values() if v['doc_type']=='law')} "
-          f"admrul={sum(1 for v in stage1_meta.values() if v['doc_type']=='admrul')}")
-
-    # CANDIDATE_LAWS + CANDIDATE_ADMRUL 전체 항상 탐색 + Stage 1 추가 발견 법령/행정규칙
-    _known = set(CANDIDATE_LAWS) | set(CANDIDATE_ADMRUL)
-    extra_laws = [l for l in stage1_meta if l not in _known]
-    # CANDIDATE_ADMRUL doc_type 등록 (stage1_meta에 없는 항목은 admrul 기본값)
-    for nm in CANDIDATE_ADMRUL:
-        if nm not in stage1_meta:
-            stage1_meta[nm] = {"meta": {}, "doc_type": "admrul", "name": nm}
-    all_target = list(CANDIDATE_LAWS) + list(CANDIDATE_ADMRUL) + extra_laws
-    # scope=priority: 질의어와 이름이 직접 관련된 법령만 먼저 조회(빠른 1차 응답용).
-    # 프런트가 1차/전체를 병렬 호출해, 가장 관련 높은 결과를 먼저 그린다.
-    scope = (request.args.get("scope") or "").strip()
-    if scope == "priority":
-        prio = [n for n in all_target if _law_name_rel(n, query) <= 2]
-        if prio:
-            all_target = prio[:8]
-    print(f"[article-search] '{query}' 대상 {len(all_target)}개 scope={scope or 'all'} "
-          f"(법령:{len(CANDIDATE_LAWS)} + 행정규칙:{len(CANDIDATE_ADMRUL)} + 추가:{len(extra_laws)})")
-
-    kw = query.lower()
-
-    def fetch_and_filter(law_name: str):
-        try:
-            entry = stage1_meta.get(law_name) or {}
-            doc_type = entry.get("doc_type", "law")
-            meta = entry.get("meta", {})
-            # 질의어와 이름이 같거나 같은 계열(시행령·시행규칙)인 법령은
-            # 본문 키워드 매칭이 없어도 결과에 포함한다.
-            nrel = _law_name_rel(law_name, query)
-            res = _fetch_matching_articles(law_name, kw, doc_type=doc_type,
-                                           always=(nrel <= 1))
-            if not res:
-                return None
-            lname = res["law_name"]
-            # admrul은 meta에 행정규칙명 필드가 있을 수 있음
-            if not meta:
-                meta = stage1_meta.get(lname, {}).get("meta", {})
-            # 매칭 조문 상위 15개 (내용 600자 절단) — 관련도순
-            top_arts = [
-                {"조문번호": a.get("조문번호", ""),
-                 "조문제목": a.get("조문제목", ""),
-                 "조문내용": a.get("조문내용", "")[:600] +
-                             ("…" if len(a.get("조문내용", "")) > 600 else "")}
-                for a in res["articles"][:15]
-            ]
-            return {
-                "법령명한글":   lname,
-                "법령구분명":   meta.get("법령구분명") or meta.get("행정규칙종류명") or ("행정규칙" if doc_type == "admrul" else "법률"),
-                "소관부처명":   meta.get("소관부처명", ""),
-                "공포일자":     meta.get("공포일자") or meta.get("발령일자", ""),
-                "법령일련번호": meta.get("법령일련번호") or meta.get("행정규칙일련번호", ""),
-                "matched_count": len(res["articles"]),
-                "matched_articles": top_arts,
-                "_matched_count": len(res["articles"]),
-            }
-        except Exception as e:
-            print(f"[article-search] {law_name} 오류: {e}")
-        return None
-
-    results, truncated = [], False
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=12) as ex:
-            futures = {ex.submit(fetch_and_filter, name): name for name in all_target}
-            for future in _cf.as_completed(futures, timeout=25):
-                try:
-                    res = future.result()
-                    if res:
-                        results.append(res)
-                except Exception as e:
-                    print(f"[article-search] future 오류: {e}")
-    except _cf.TimeoutError:
-        truncated = True
-        print(f"[article-search] 타임아웃, {len(results)}/{len(all_target)}건 탐색")
-
-    # 정렬: 본법 우선 → 시행령 → 시행규칙 → 그 외, 같은 순위 안에서 매칭 조문 수 순
-    # (조문이 많이 걸렸다는 이유로 시행규칙이 본법보다 앞서던 문제 수정)
-    qn = re.sub(r"\s+", "", query)
-
-    def _law_order(x):
-        name = re.sub(r"\s+", "", x.get("법령명한글", "") or "")
-        kind = x.get("법령구분명", "") or ""
-        # 1순위: 법령명과 질의어의 관계 (본법 → 같은 계열 → 부분포함 → 본문에만 언급)
-        rel = _law_name_rel(name, qn)
-        # 2순위: 같은 관계 안에서의 법령 위계 (법률 → 시행령 → 시행규칙)
-        if name.endswith("시행규칙"):
-            sub = 2
-        elif name.endswith("시행령"):
-            sub = 1
-        elif kind in ("법률", "헌법"):
-            sub = 0
-        elif kind in ("대통령령",):
-            sub = 1
-        elif kind in ("총리령", "부령", "기획재정부령", "농림축산식품부령"):
-            sub = 2
-        else:
-            sub = 3 if kind and kind != "법률" else 0
-        return (rel, sub, -int(x.get("_matched_count", 0) or 0), len(name))
-
-    results.sort(key=_law_order)
-    for r in results:
-        r.pop("_matched_count", None)
-
-    print(f"[article-search] '{query}' → {len(results)}건 매칭")
-    return jsonify({
-        "success": True,
-        "count": len(results),
-        "laws": results,
-        "truncated": truncated,
-        "searched_total": len(all_target),
-    })
-
-
-@app.route("/api/search/basis")
-def search_legal_basis():
-    """업무 상황 설명 → 2단계 근거 법령·조문 검색
-    Stage 1: 법제처 법령명 검색 API로 관련 법령 목록 확보
-    Stage 2: 해당 법령 조문에서 시나리오 키워드(OR) 필터링
-    """
-    scenario = request.args.get("scenario", "").strip()
-    if not scenario:
-        return jsonify({"error": "업무 상황을 입력하세요"}), 400
-    if len(scenario) < 4:
-        return jsonify({"error": "업무 상황을 4자 이상 입력하세요"}), 400
-
-    # ── Stage 1: law + admrul 병렬 검색 ────────────────────────────────────────
-    # name → doc_type ("law" | "admrul")
-    stage1_doc_types: dict = {}
-    stage1_names: set = set()
-
-    def _b_stage1_law():
-        try:
-            d = _law_get_json({"target": "law", "query": scenario, "display": "10"}, timeout=(5, 10))
-            items = d.get("LawSearch", {}).get("law", []) or []
-            if isinstance(items, dict): items = [items]
-            return [("law", l.get("법령명한글", "").strip()) for l in items]
-        except Exception as e:
-            print(f"[basis] Stage1(law) 오류: {e}")
-        return []
-
-    def _b_stage1_admrul():
-        results = []; seen = set()
-        queries = [scenario] + [t for t in re.findall(r'[가-힣]{2,}', scenario) if t != scenario]
-        for q in queries[:4]:
-            try:
-                d = _law_get_json({"target": "admrul", "query": q, "display": "10"}, timeout=(5, 10))
-                ls = d.get("LawSearch", {})
-                items = ls.get("admrul") or ls.get("law") or []
-                if isinstance(items, dict): items = [items]
-                for l in items:
-                    nm = (l.get("행정규칙명") or l.get("법령명한글") or "").strip()
-                    if nm and nm not in seen:
-                        seen.add(nm); results.append(("admrul", nm))
-            except Exception as e:
-                print(f"[basis] Stage1(admrul q={q!r}) 오류: {e}")
-        return results
-
-    with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_law    = _ex.submit(_b_stage1_law)
-        _f_admrul = _ex.submit(_b_stage1_admrul)
-        for doc_type, nm in _f_law.result():
-            if nm:
-                stage1_names.add(nm); stage1_doc_types[nm] = doc_type
-        for doc_type, nm in _f_admrul.result():
-            if nm and nm not in stage1_doc_types:
-                stage1_names.add(nm); stage1_doc_types[nm] = doc_type
-    print(f"[basis] Stage1 law+admrul={len(stage1_names)}")
-
-    # CANDIDATE_LAWS + CANDIDATE_ADMRUL 전체 항상 탐색 + Stage 1 추가 법령/행정규칙
-    _known = set(CANDIDATE_LAWS) | set(CANDIDATE_ADMRUL)
-    extra_laws = [l for l in stage1_names if l not in _known]
-    # CANDIDATE_ADMRUL doc_type 등록 (stage1_doc_types에 없는 항목은 admrul 기본값)
-    for nm in CANDIDATE_ADMRUL:
-        if nm not in stage1_doc_types:
-            stage1_doc_types[nm] = "admrul"
-    print(f"[basis] Stage1={len(stage1_names)} extra={len(extra_laws)}")
-
-    # ── 업무 유형 분류 ────────────────────────────────────────────────────────
-    basis_type = "일반"
-    if any(w in scenario for w in ("허가", "등록", "신고", "승인", "인가", "면허", "인증", "출원", "자격")):
-        basis_type = "허가·등록·신고"
-    elif any(w in scenario for w in ("금지", "제한", "제재", "처벌", "위반", "과태료", "벌칙", "위법")):
-        basis_type = "금지·제한"
-    elif any(w in scenario for w in ("의무", "기준", "요건", "절차", "방법", "조건")):
-        basis_type = "의무·기준"
-    elif any(w in scenario for w in ("지원", "보조금", "보상", "혜택", "권리", "보호")):
-        basis_type = "지원·권리"
-
-    # ── Stage 2 키워드: 범용 불용어 제거, 도메인 특정 명사 우선 배치 ─────────
-    STOPWORDS = {
-        "이란", "하려면", "할때", "할때는", "경우", "무엇", "어떻게", "어떤",
-        "필요한", "근거", "확인", "관련", "대한", "있나요", "있는지",
-        "하는지", "에서", "에게", "에는", "으로", "위한", "받으려면",
-    }
-    tokens = re.findall(r'[가-힣]{2,}', scenario)
-    raw_kws = [t for t in tokens if t not in STOPWORDS]
-    domain_first = [kw for kw in DOMAIN_LAW_MAP if kw in scenario]
-    rest = [kw for kw in raw_kws if kw not in set(domain_first)]
-    keywords = (domain_first + rest)[:6]  # OR 조건, 최대 6개
-
-    if not keywords:
-        return jsonify({"error": "유효한 키워드를 추출할 수 없습니다. 더 구체적인 업무 내용을 입력해주세요."}), 400
-
-    # ── Stage 2: 법령별 조문 병렬 탐색 (OR 매칭) ─────────────────────────────
-    def fetch_law(law_name: str):
-        try:
-            doc_type = stage1_doc_types.get(law_name, "law")
-            cache_key = f"{doc_type}:{law_name}"
-            lname, articles = _cache_get(cache_key)
-            if articles is None:
-                root = _fetch_law_root(law_name, doc_type, timeout=(5, 18))
-                if root is None: return None
-                lname, _, articles = _parse_articles(root)
-                _cache_set(cache_key, lname or law_name, articles)
-
-            kwL = [kw.lower() for kw in keywords]
-            matched = [
-                a for a in articles
-                if a.get("type") == "article" and
-                any(kw in " ".join([a.get("조문내용",""), a.get("조문제목","")]).lower()
-                    for kw in kwL)
-            ]
-            if not matched: return None
-
-            hit_kws = list({
-                kw for kw in keywords
-                for a in matched
-                if kw.lower() in " ".join([a.get("조문내용",""),
-                                            a.get("조문제목","")]).lower()
-            })
-            return {
-                "law_name": lname or law_name,
-                "articles": [
-                    {"조문번호": a["조문번호"], "조문제목": a["조문제목"],
-                     "조문내용": a["조문내용"][:400] + ("..." if len(a["조문내용"]) > 400 else "")}
-                    for a in matched
-                ],
-                "matched_keywords": hit_kws,
-            }
-        except Exception as e:
-            print(f"[basis] {law_name} 오류: {e}")
-        return None
-
-    all_target = list(CANDIDATE_LAWS) + list(CANDIDATE_ADMRUL) + extra_laws
-    print(f"[basis] '{scenario[:20]}' 대상 {len(all_target)}개 "
-          f"(법령:{len(CANDIDATE_LAWS)} + 행정규칙:{len(CANDIDATE_ADMRUL)} + 추가:{len(extra_laws)})")
-    results, truncated = [], False
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(fetch_law, name): name for name in all_target}
-            for future in _cf.as_completed(futures, timeout=25):
-                try:
-                    res = future.result()
-                    if res:
-                        results.append({
-                            "법령명한글":      res["law_name"],
-                            "matched_articles": res["articles"],
-                            "matched_keywords": res["matched_keywords"],
-                            "relevance":        len(res["articles"]),
-                        })
-                except Exception as e:
-                    print(f"[basis] future 오류: {e}")
-    except _cf.TimeoutError:
-        truncated = True
-        print(f"[basis] 타임아웃, {len(results)}건 반환")
-
-    results.sort(key=lambda x: x["relevance"], reverse=True)
-
-    return jsonify({
-        "success":           True,
-        "scenario":          scenario,
-        "extracted_keywords": keywords,
-        "basis_type":        basis_type,
-        "laws":              results,
-        "truncated":         truncated,
-        "searched_total":    len(all_target),
-    })
-
-
-@app.route("/api/scenario", methods=["POST"])
-def scenario_search():
-    """실무 시나리오 검색: AI(사용자 제공 키 우선, 없으면 서버 환경변수) → 관련 법령·조문"""
-    body    = request.get_json(force=True) or {}
-    query   = body.get("query", "").strip()
-    if not query or len(query) < 5:
-        return jsonify({"error": "질문을 5자 이상 입력해 주세요."}), 400
-
-    # ── AI 설정: 요청 본문(사용자 AI 설정) 우선 → 서버 환경변수 폴백 ──────────
-    provider = (body.get("provider") or os.environ.get("SCENARIO_AI_PROVIDER", "gemini")).lower()  # noqa: E501
-    api_key  = (body.get("api_key")  or os.environ.get(f"{provider.upper()}_API_KEY", "")).strip()
-    model    = (body.get("model")    or os.environ.get("SCENARIO_AI_MODEL", "")).strip()
-    # ollama는 로컬 URL을 키 대신 사용하므로 키 없이도 허용
-    if not api_key and provider != "ollama":
-        return jsonify({"error":
-            "시나리오 검색을 사용하려면 AI 키가 필요합니다. "
-            "상단 [✦ AI 설정]에서 Gemini/Claude/GPT 키를 입력하세요."
-        }), 503
-
-    mdl = model or _default_model_for(provider, api_key)
-
-    # ── AI Step-1: 의도 분석 → JSON ──────────────────────────────────────────
-    # 정식 법령명으로 표기해야 AI가 그대로 echo → MST 조회가 정확히 매칭된다.
-    # (CANDIDATE_LAWS·DOMAIN_LAW_MAP 의 표기와 일치시킬 것)
-    AVAILABLE_LAWS = (
-        "농지법, 종자산업법, 농약관리법, 비료관리법, 가축전염병예방법, "
-        "식물방역법, 농어업재해보험법, 농촌진흥법, 농어업재해대책법, "
-        "특허법, 실용신안법, 디자인보호법, 상표법, 식물신품종 보호법, "
-        "부정경쟁방지 및 영업비밀보호에 관한 법률, "
-        "기술의 이전 및 사업화 촉진에 관한 법률"
-    )
-    system_prompt = f"""당신은 대한민국 농업·지식재산 법령 전문가 AI입니다.
-사용자의 실무 질문을 분석하여 JSON만 반환하세요 (코드블록·설명 없이 JSON 텍스트만).
-
-분석 대상 법령 목록: {AVAILABLE_LAWS}
-
-반환 형식:
-{{
-  "category": "농업" | "지식재산" | "공통",
-  "basis_type": "허가·등록·신고" | "금지·제한" | "의무·기준" | "지원·권리" | "일반",
-  "guidance": "이 질문에 대한 방향 안내 2~3문장 (마크다운 **굵게** 사용 가능)",
-  "steps": ["단계1", "단계2", "단계3"],
-  "laws": ["관련 법령명1", "관련 법령명2"],
-  "keywords": ["조문 검색 키워드1", "키워드2", "키워드3"],
-  "caution": "주의사항 (없으면 null)"
-}}
-laws는 위 목록에서만 선택(최대 4개), keywords는 3~6개."""
-
-    user_msg = f"질문: {query}"
-
-    try:
-        if provider not in ("gemini", "claude", "gpt", "openai", "ollama"):
-            return jsonify({"error": f"지원하지 않는 AI 프로바이더: {provider}"}), 400
-        # 공통 생성기 사용 — Gemini 3.x 의 사고 토큰 예산까지 처리해 응답이 잘리지 않게 한다.
-        ai_text, ai_err = _ai_generate(provider, api_key, mdl, system_prompt, user_msg,
-                                       max_tokens=1200, temperature=0.2, json_mode=True)
-        if ai_err:
-            return jsonify({"error": f"AI 오류: {ai_err}"}), 502
-
-        # JSON 파싱 (코드블록·앞뒤 설명 제거 후)
-        clean = re.sub(r"```(?:json)?|```", "", ai_text).strip()
-        try:
-            ai = json.loads(clean)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", clean, re.S)      # 설명 사이에 낀 JSON 구제
-            if not m:
-                raise
-            ai = json.loads(m.group(0))
-
-    except json.JSONDecodeError:
-        # AI가 JSON을 제대로 반환 못한 경우 — 키워드 기반 폴백
-        print(f"[scenario] JSON 파싱 실패: {ai_text[:200]}")
-        tokens = re.findall(r"[가-힣]{2,}", query)
-        ai = {"category": "공통", "basis_type": "일반",
-              "guidance": "관련 조문을 검색합니다.", "steps": [],
-              "laws": [], "keywords": tokens[:5], "caution": None}
-    except Exception as e:
-        return jsonify({"error": f"AI 연결 오류: {str(e)}"}), 502
-
-    laws_to_search  = ai.get("laws", []) or []
-    keywords        = ai.get("keywords", []) or []
-    guidance        = ai.get("guidance", "")
-    steps           = ai.get("steps", []) or []
-    category        = ai.get("category", "공통")
-    basis_type      = ai.get("basis_type", "일반")
-    caution         = ai.get("caution")
-
-    if not keywords:
-        tokens = re.findall(r"[가-힣]{2,}", query)
-        keywords = tokens[:5]
-
-    # laws 가 비면 질문 어휘로 후보를 좁힌다.
-    # (예전에는 CANDIDATE_LAWS 앞 6개를 그대로 썼는데, 사내 복무 질문에 특허법·상표법이
-    #  근거로 붙어 답변이 엉뚱해지는 원인이었다.)
-    if not laws_to_search:
-        picked = []
-        for kw, names in DOMAIN_LAW_MAP.items():
-            if kw in query:
-                picked += [n for n in names if n not in picked]
-        laws_to_search = picked[:4]      # 매칭이 없으면 빈 목록 = 법령 검색 생략
-
-    # ── Step-2: 법령별 관련 조문 조회 ─────────────────────────────────────────
-    def _fetch_for_law(law_name):
-        """법령에서 keywords에 매칭되는 조문을 수집해 (표시명, 조문리스트) 반환.
-        _fetch_matching_articles 는 {'law_name','keyword','articles'} dict 를
-        돌려주므로 여기서 조문 리스트로 평탄화하고, 여러 키워드 결과를
-        조문번호·제목 기준으로 중복 제거하여 합친다."""
-        resolved = law_name
-        seen, arts = set(), []
-        try:
-            for kw in keywords:
-                res = _fetch_matching_articles(law_name, kw)
-                if not res:
-                    continue
-                resolved = res.get("law_name") or resolved
-                for a in res.get("articles", []):
-                    key = (a.get("조문번호", ""), a.get("조문제목", ""))
-                    if key not in seen:
-                        seen.add(key)
-                        arts.append(a)
-        except Exception as e:
-            print(f"[scenario] {law_name} 조문 조회 오류: {e}")
-        return resolved, arts
-
-    results = []
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=8) as ex:
-            futs = {ex.submit(_fetch_for_law, ln): ln for ln in laws_to_search}
-            for fut in _cf.as_completed(futs, timeout=20):
-                ln, arts = fut.result()
-                if arts:
-                    matched_kws = [kw for kw in keywords
-                                   if any(kw in (a.get("조문내용", "") + a.get("조문제목", ""))
-                                          for a in arts)]
-                    results.append({
-                        "법령명한글": ln,
-                        "matched_articles": arts[:8],
-                        "matched_keywords": matched_kws,
-                        "relevance": len(matched_kws) * 10 + len(arts),
-                    })
-    except _cf.TimeoutError:
-        print(f"[scenario] Step-2 타임아웃, {len(results)}건 반환")
-
-    results.sort(key=lambda x: x["relevance"], reverse=True)
-
-    # ── Step-3: 내규(사규 MCP) 동시 검색 — 시나리오는 내규+법령 전체 대상 ──────
-    internal_text, internal_struct, internal_err = "", None, ""
-    if SAGYU_MCP_URL:
-        try:
-            icli = _McpClient(SAGYU_MCP_URL)
-            icli.initialize()
-            itools = icli.list_tools()
-            itool = _mcp_pick_search_tool(itools)
-            if itool:
-                seen_blocks, parts = set(), []
-                # AI 키워드 상위 3개로 내규 검색 후 텍스트 병합
-                for kw in (keywords[:3] or [query]):
-                    try:
-                        ires = icli.call_tool(itool.get("name"), _mcp_build_args(itool, kw))
-                        txt = _mcp_extract_text(ires)
-                        if txt and txt not in seen_blocks:
-                            seen_blocks.add(txt); parts.append(txt)
-                        st = ires.get("structuredContent") if isinstance(ires, dict) else None
-                        if st and internal_struct is None:
-                            internal_struct = st
-                    except Exception as e:
-                        print(f"[scenario] 내규 검색 오류(kw={kw}): {e}")
-                internal_text = "\n\n".join(parts)
-            else:
-                internal_err = "내규 검색 도구 없음"
-        except Exception as e:
-            internal_err = str(e)
-            print(f"[scenario] 내규 MCP 오류: {e}")
-
-    # ── Step-4: 조회한 내규·법령을 근거로 자연어 답변 생성(RAG) ───────────────
-    # 키워드 나열이 아니라, 실제 조문·내규 본문만 근거로 질문에 답하게 한다.
-    answer, answer_err, sources = "", "", []
-    ctx_parts, budget = [], 14000
-
-    for r in results[:5]:                       # 법령 조문 근거
-        ln = r.get("법령명한글", "")
-        for a in (r.get("matched_articles") or [])[:4]:
-            no = a.get("조문번호", ""); ti = a.get("조문제목", "")
-            body_txt = re.sub(r"\s+", " ", (a.get("조문내용", "") or ""))[:700]
-            tag = f"{ln} 제{no}조" + (f"({ti})" if ti else "")
-            blk = f"[법령] {tag}\n{body_txt}"
-            if budget - len(blk) < 0:
-                break
-            ctx_parts.append(blk); budget -= len(blk)
-            sources.append({"type": "law", "label": tag})
-
-    # 의미 검색으로 찾은 내규 조문 — 질문 어휘가 규정 표현과 달라도 근거를 잡아준다.
-    sem_hits = []
-    emb_available = False   # 내규 의미검색(임베딩)이 실제로 수행됐는지
-    try:
-        # 채팅 프로바이더와 무관하게 임베딩엔 Gemini 키를 쓴다(사용자 키→서버 키 폴백).
-        gkey = (api_key if provider == "gemini" else "") or os.environ.get("GEMINI_API_KEY", "")
-        emb_available = bool(gkey.strip())
-        if emb_available:
-            sem_hits = [h for h in semantic_search(query, gkey.strip(), top_k=10)
-                        if h["score"] >= _SEM_MIN]
-    except Exception as e:
-        print(f"[scenario] 의미 검색 생략: {e}")
-    for h in sem_hits[:8]:
-        tag = f"{h['title']} 제{h['no']}조" + (f"({h['art_title']})" if h["art_title"] else "")
-        prev = re.sub(r"\s+", " ", h.get("preview") or "")
-        blk = "[내규] " + tag + "\n" + prev
-        if budget - len(blk) < 0:
-            break
-        ctx_parts.append(blk); budget -= len(blk)
-        sources.append({"type": "internal", "label": tag, "slug": h["slug"]})
-
-    if internal_text:                            # 내규 근거(키워드 검색)
-        itxt = re.sub(r"\n{3,}", "\n\n", internal_text)[:max(1500, min(5000, budget))]
-        blk = f"[내규] 사내 규정 키워드 검색 결과\n{itxt}"
-        ctx_parts.append(blk)
-        sources.append({"type": "internal", "label": "사내 내규 검색 결과"})
-
-    if ctx_parts and (api_key or provider == "ollama"):
-        ctx = "\n\n---\n\n".join(ctx_parts)
-        ans_system = (
-            "당신은 한국농업기술진흥원(KOAT)의 법무·규정 담당 전문가입니다.\n"
-            "아래 <자료>에 담긴 사내 내규와 국가법령 조문만을 근거로 질문에 답하세요.\n\n"
-            "규칙:\n"
-            "1. 자료에 없는 내용은 지어내지 말고, 필요하면 '제공된 자료에서 확인되지 않습니다'라고 밝히세요.\n"
-            "2. 근거가 되는 조문을 문장 끝에 [내규명 제N조] 또는 [법령명 제N조] 형태로 표기하세요.\n"
-            "3. 사내 내규와 국가법령이 모두 관련되면 '내규 기준'과 '법령 근거'를 나누어 설명하세요.\n"
-            "4. 질문과 관계없는 자료는 언급하지 말고, 질문에 실제로 답하는 조문만 골라 쓰세요.\n"
-            "5. 다음 순서를 모두 채워 완결된 답변을 쓰세요 — "
-            "**결론**(1~2문장) → **근거 조문**(조문별로 무엇을 정하는지) → "
-            "**절차**(실무자가 밟을 단계를 번호 목록으로) → **유의사항**.\n"
-            "6. 한국어 존댓말, 마크다운(**굵게**, 번호·불릿 목록) 사용. "
-            "1,000~1,500자로 충분히 설명하되 같은 말을 반복하지 마세요.\n"
-            "7. 문장을 중간에 끊지 말고 반드시 끝맺으세요.\n"
-            "8. 질문이 자료와 무관하면 억지로 답하지 말고 그 사실을 알린 뒤, "
-            "어떤 규정을 확인하면 좋을지 안내하세요."
-        )
-        ans_user = f"<자료>\n{ctx}\n</자료>\n\n질문: {query}"
-        answer, answer_err = _ai_generate(provider, api_key, mdl, ans_system, ans_user,
-                                          max_tokens=4000, temperature=0.15)
-        if answer_err:
-            print(f"[scenario] 답변 생성 실패: {answer_err}")
-
-    return jsonify({
-        "success":    True,
-        "query":      query,
-        "category":   category,
-        "basis_type": basis_type,
-        "guidance":   guidance,
-        "answer":     (answer or "").strip(),
-        "answer_error": answer_err,
-        "sources":    sources,
-        "steps":      steps,
-        "caution":    caution,
-        "keywords":   keywords,
-        "laws":       results,
-        "internal_text":   internal_text,
-        "internal_structured": internal_struct,
-        "internal_error":  internal_err,
-        # 내규 의미검색(임베딩) 수행 여부 — false면 UI가 '내규 근거 일부 미반영'을 안내.
-        "internal_semantic": emb_available,
-    })
-
-
-# ── 법령명 자동완성(검색창 입력 중 제안) ─────────────────────────────────────────
-_LAW_SUGGEST_CACHE: dict = {}
-_SUGGEST_TTL = 3600
-
-@app.route("/api/law/suggest")
-def law_suggest():
-    """입력 중인 검색어 → 법령명 후보(현행). 최근 검색 기록에 남기지 않는 가벼운 조회."""
-    q = request.args.get("q", "").strip()
-    if len(q) < 2:
-        return jsonify({"success": True, "items": []})
-    key = _norm_key(q)
-    hit = _LAW_SUGGEST_CACHE.get(key)
-    if hit and time.time() - hit["ts"] < _SUGGEST_TTL:
-        return jsonify({"success": True, "items": hit["items"]})
-    items, seen = [], set()
-    try:
-        root = _law_get_xml("lawSearch.do", {"target": "law", "query": q, "display": "20"},
-                            timeout=(4, 8))
-        for it in [el for el in root if _mst_of(el)]:
-            nm = ""
-            for tag in _NAME_TAGS:
-                nm = (it.findtext(tag) or "").strip()
-                if nm:
-                    break
-            k = _norm_key(nm)
-            if not nm or k in seen:
-                continue
-            seen.add(k)
-            items.append({"name": nm, "type": (it.findtext("법령구분명") or "").strip()})
-    except Exception as e:
-        return jsonify({"success": False, "items": [], "error": str(e)})
-    # 입력어로 시작하는 이름 → 짧은 이름 순(본법이 시행령·시행규칙보다 앞)
-    items.sort(key=lambda x: (0 if _norm_key(x["name"]).startswith(key) else 1, len(x["name"])))
-    items = items[:8]
-    _LAW_SUGGEST_CACHE[key] = {"items": items, "ts": time.time()}
-    return jsonify({"success": True, "items": items})
-
-
-# ── 연계 법령(법률 · 시행령 · 시행규칙) ────────────────────────────────────────
-_LAW_FAMILY_CACHE: dict = {}
-_FAMILY_TTL = 6 * 3600
-
-def _law_family_base(name: str) -> str:
-    return re.sub(r"\s*(시행령|시행규칙)$", "", (name or "").strip())
-
-@app.route("/api/law/family")
-def law_family():
-    """법령명 → 같은 계열의 법률·시행령·시행규칙 중 실제로 존재하는 것(현행)."""
-    name = request.args.get("name", "").strip()
-    if not name:
-        return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-    base = _law_family_base(name)
-    hit = _LAW_FAMILY_CACHE.get(base)
-    if hit and time.time() - hit["ts"] < _FAMILY_TTL:
-        return jsonify({"success": True, "base": base, "items": hit["items"]})
-    want = {_norm_key(base): "법률", _norm_key(base + "시행령"): "시행령",
-            _norm_key(base + "시행규칙"): "시행규칙"}
-    found = {}
-    try:
-        root = _law_get_xml("lawSearch.do", {"target": "law", "query": base, "display": "50"})
-        items = [el for el in root if _mst_of(el)] or \
-                [el for el in root.iter() if el is not root and _mst_of(el)]
-        for it in items:
-            nm = ""
-            for tag in _NAME_TAGS:
-                nm = (it.findtext(tag) or "").strip()
-                if nm:
-                    break
-            kind = want.get(_norm_key(nm))
-            if not kind:
-                continue
-            status = (it.findtext("현행연혁코드") or "").strip()
-            ef = re.sub(r"\D", "", it.findtext("시행일자") or "")[:8]
-            prev = found.get(kind)
-            # 같은 이름이 여러 건이면 현행 우선
-            if prev is None or (prev["status"] != "현행" and status == "현행"):
-                found[kind] = {"name": nm, "kind": kind, "status": status, "ef": ef,
-                               "type": (it.findtext("법령구분명") or "").strip()}
-    except Exception as e:
-        return jsonify({"success": False, "error": f"조회 실패: {e}", "base": base, "items": []})
-    order = ["법률", "시행령", "시행규칙"]
-    out = [found[k] for k in order if k in found]
-    _LAW_FAMILY_CACHE[base] = {"items": out, "ts": time.time()}
-    return jsonify({"success": True, "base": base, "items": out})
-
-
-@app.route("/api/law/articles")
-def get_law_articles():
-    """법령명으로 조문 전체 조회"""
-    law_name = request.args.get("name", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-    try:
-        # Step 1~3: 법령ID(현행 본문) → 현행 시행본 MST 순으로 조회
-        tried = []
-        info = _lookup_law(law_name, "law")
-        root = None
-        if info.get("rank", 99) > 1:
-            # 국가법령 중 이름이 맞는 게 없으면(부분 일치뿐) 행정규칙에 정확히 같은 이름이
-            # 있는지 먼저 본다 — 엉뚱한 법령 본문을 여는 것 방지
-            adm = _lookup_law(law_name, "admrul")
-            if adm.get("rank") == 0:
-                root = _fetch_law_root(law_name, "admrul", timeout=(5, 20), info=adm)
-                tried.append("admrul(정확일치):" + ("성공" if root is not None else "실패"))
-        if root is None:
-            root = _fetch_law_root(law_name, "law", info=info)
-            tried.append("law:" + ("성공" if root is not None else "실패"))
-
-        # Step 4: 행정규칙(admrul) fallback — lawService.do 모두 실패한 경우
-        if root is None:
-            try:
-                mst_admrul = _get_mst(law_name, target="admrul")
-                if mst_admrul:
-                    for param_name in ("MST", "ID"):
-                        try:
-                            r_adm = _law_get_xml("admRulService.do",
-                                                 {"target": "admrul", param_name: mst_admrul},
-                                                 timeout=(5, 20))
-                            if _is_valid_law_xml(r_adm):
-                                root = r_adm
-                                tried.append(f"admrul:{param_name}={mst_admrul}(성공)")
-                                break
-                        except Exception as e_adm:
-                            tried.append(f"admrul:{param_name}={mst_admrul}({e_adm})")
-                else:
-                    tried.append("admrul:MST 없음")
-            except Exception as e4:
-                print(f"[articles] Step4(admrul) 오류: {e4}")
-
-        print(f"[articles] '{law_name}' 시도 내역: {tried}")
-
-        if root is None:
-            return jsonify({
-                "success": True, "law_name": law_name, "count": 0, "articles": [],
-                "message": f"조문 데이터를 가져올 수 없습니다. 법제처에서 직접 확인해주세요."
-            })
-
-        lname, law_date, articles = _parse_articles(root)
-        return jsonify({"success": True, "law_name": lname or law_name,
-                        "law_date": law_date,
-                        "version": ({"status": info.get("status", ""), "ef": info.get("ef", ""),
-                                     "mst": info.get("mst", ""), "id": info.get("id", "")}
-                                    if "law:성공" in tried else {}),
-                        "count": len(articles), "articles": articles})
-
-    except req_lib.exceptions.ConnectTimeout:
-        return jsonify({"error": "법제처 서버 연결 시간 초과 (5초). 잠시 후 다시 시도해주세요."}), 504
-    except req_lib.exceptions.ReadTimeout:
-        return jsonify({"error": "법제처 서버 응답 시간 초과. 법령 데이터가 클 수 있습니다. 잠시 후 다시 시도해주세요."}), 504
-    except req_lib.exceptions.ConnectionError as e:
-        return jsonify({"error": f"법제처 서버에 연결할 수 없습니다: {e}"}), 502
-    except req_lib.exceptions.Timeout:
-        return jsonify({"error": "법제처 API 응답 시간 초과"}), 504
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": f"오류: {e}"}), 500
-
-
-@app.route("/api/favorites")
-def get_favorites():
-    return jsonify({"favorites": favorites})
-
-
-@app.route("/api/favorites/toggle")
-def toggle_favorite():
-    global favorites
-    name = request.args.get("name", "").strip()
-    org  = request.args.get("org",  "").strip()
-    typ  = request.args.get("type", "법률").strip()
-    url  = request.args.get("url",  "").strip()
-    if not name:
-        return jsonify({"error": "name 필요"}), 400
-    existing = next((f for f in favorites if f["name"] == name), None)
-    if existing:
-        favorites = [f for f in favorites if f["name"] != name]
-        return jsonify({"added": False})
-    else:
-        favorites.insert(0, {"name": name, "org": org, "type": typ, "url": url})
-        favorites = favorites[:30]
-        return jsonify({"added": True})
-
-
-@app.route("/api/favorites/remove")
-def remove_favorite():
-    global favorites
-    name = request.args.get("name", "").strip()
-    favorites = [f for f in favorites if f["name"] != name]
-    return jsonify({"ok": True})
-
-
-# ── AI 모델 자동 현행화 ─────────────────────────────────────────────────────
-# Gemini는 모델명이 자주 갱신되므로 하드코딩하지 않고 ListModels로 최신을 고른다.
-_AI_MODEL_FALLBACK = {"gemini": "gemini-flash-latest",
-                      "claude": "claude-haiku-4-5-20251001",
-                      "gpt": "gpt-4.1-mini", "openai": "gpt-4.1-mini"}
-# 콜드 스타트에서 시나리오/해석 핫패스가 ListModels 왕복을 동기로 기다리지 않도록
-# 즉시 반환할 기본 모델(캐시가 비었을 때 사용).
-GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "") or "gemini-2.5-flash"
-_GEMINI_MODEL_CACHE: dict = {"model": None, "ts": 0.0}
-_GEMINI_CACHE_TTL = 6 * 3600          # 6시간
-# 선호 Gemini 버전. 기본은 비워 두고 ListModels 기준 '사용 가능한 최신'을 자동 선택한다
-# (현재 최신 계열은 3.x). 특정 버전으로 묶고 싶을 때만 GEMINI_MODEL_PREF=3.0 처럼 지정.
-_GEMINI_PREF_DEFAULT = ""
-
-
-# 텍스트 생성용이 아닌 계열(이미지·음성·로보틱스 등)은 generateContent 를 지원해도 제외한다.
-_GEMINI_SKIP = re.compile(
-    r"(image|nano-banana|tts|audio|native-audio|live|robotics|computer-use|omni|"
-    r"embedding|deep-research|antigravity|gemma|lyria|veo|imagen)")
-
-
-def _gemini_model_score(name: str):
-    """모델명에서 (버전, 등급, 안정성) 점수를 뽑아 최신·상위 모델을 고른다."""
-    n = name.lower()
-    if _GEMINI_SKIP.search(n):
-        return None
-    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", n)
-    if not m:
-        return None
-    ver = int(m.group(1)) * 100 + int(m.group(2) or 0)
-    # 등급: pro > flash > flash-lite  (본 서비스는 응답속도 중요 → flash 우대)
-    if "flash-lite" in n:
-        tier = 1
-    elif "flash" in n:
-        tier = 3
-    elif "pro" in n:
-        tier = 2
-    else:
-        tier = 0
-    # 실험/프리뷰 버전은 안정 버전보다 후순위
-    stable = 0 if re.search(r"(exp|preview|thinking|-\d{3,})", n) else 1
-    return (ver, stable, tier)
-
-
-def _gemini_latest_model(api_key: str) -> str:
-    """Gemini ListModels로 모델명을 결정(6시간 캐시).
-
-    GEMINI_MODEL_PREF(예: "4.6")로 선호 버전을 지정할 수 있고, 계정에서 해당 버전을
-    쓸 수 있으면 그 버전을 우선 사용한다. 없으면 사용 가능한 최신 버전으로 폴백한다.
-    (모델명을 고정하면 미출시/미허용 버전일 때 AI 기능 전체가 실패하므로 검증 후 사용)
-    """
-    now = time.time()
-    if _GEMINI_MODEL_CACHE["model"] and now - _GEMINI_MODEL_CACHE["ts"] < _GEMINI_CACHE_TTL:
-        return _GEMINI_MODEL_CACHE["model"]
-    fallback = _AI_MODEL_FALLBACK["gemini"]
-    if not api_key:
-        return fallback
-    try:
-        r = _SESSION.get(
-            "https://generativelanguage.googleapis.com/v1beta/models",
-            params={"key": api_key, "pageSize": 200}, timeout=8)
-        if r.status_code != 200:
-            print(f"[ai-model] ListModels 실패({r.status_code}) → 폴백 {fallback}")
-            return fallback
-        pref = (os.environ.get("GEMINI_MODEL_PREF") or _GEMINI_PREF_DEFAULT).strip()
-        pref_ver = None
-        if pref:
-            pm = re.match(r"(\d+)(?:\.(\d+))?$", pref)
-            if pm:
-                pref_ver = int(pm.group(1)) * 100 + int(pm.group(2) or 0)
-        best, best_score = None, None
-        pbest, pbest_score = None, None      # 선호 버전 중 최적
-        for m in (r.json().get("models") or []):
-            name = (m.get("name") or "").split("/")[-1]
-            methods = m.get("supportedGenerationMethods") or []
-            if "generateContent" not in methods:
-                continue
-            sc = _gemini_model_score(name)
-            if not sc:
-                continue
-            if best_score is None or sc > best_score:
-                best, best_score = name, sc
-            if pref_ver is not None and sc[0] == pref_ver:
-                if pbest_score is None or sc > pbest_score:
-                    pbest, pbest_score = name, sc
-            elif pref and not pref_ver and pref.lower() in name.lower():
-                if pbest_score is None or sc > pbest_score:
-                    pbest, pbest_score = name, sc
-        if pbest:
-            _GEMINI_MODEL_CACHE.update({"model": pbest, "ts": now})
-            print(f"[ai-model] 선호 버전({pref}) 모델 사용: {pbest}")
-            return pbest
-        if pref:
-            print(f"[ai-model] 선호 버전({pref}) 사용 불가 → 최신 버전으로 대체")
-        if best:
-            _GEMINI_MODEL_CACHE.update({"model": best, "ts": now})
-            print(f"[ai-model] Gemini 최신 모델 선택: {best}")
-            return best
-    except Exception as e:
-        print(f"[ai-model] 조회 오류: {e}")
-    return fallback
-
-
-def _default_model_for(provider: str, api_key: str = "") -> str:
-    """프로바이더별 기본 모델.
-
-    Gemini 는 캐시에 값이 있으면 그것을, 없으면 상수 기본값을 '즉시' 돌려준다.
-    핫패스(시나리오/해석)에서 콜드 인스턴스가 ListModels 네트워크 왕복을 동기로
-    기다려 플랫폼 504 로 죽는 것을 막기 위함이다. 동적 최신화는 캐시가 채워진
-    뒤(또는 /api/ai/models 명시 호출 시)에만 반영된다.
-    """
-    if provider == "gemini":
-        return _GEMINI_MODEL_CACHE.get("model") or GEMINI_DEFAULT_MODEL
-    return _AI_MODEL_FALLBACK.get(provider, _AI_MODEL_FALLBACK["gemini"])
-
-
-@app.route("/api/ai/models")
-def ai_models():
-    """현재 선택될 기본 모델 확인용(설정 화면 표시).
-
-    이 엔드포인트는 명시 호출이므로 Gemini 는 실시간 ListModels 로 캐시를 채운다.
-    """
-    provider = (request.args.get("provider") or "gemini").lower()
-    key = (request.args.get("api_key") or
-           os.environ.get(f"{provider.upper()}_API_KEY", "")).strip()
-    if provider == "gemini":
-        mdl = _gemini_latest_model(key)
-    else:
-        mdl = _default_model_for(provider, key)
-    return jsonify({"success": True, "provider": provider, "model": mdl,
-                    "resolved": provider == "gemini" and bool(key),
-                    "cached_at": _GEMINI_MODEL_CACHE["ts"] if provider == "gemini" else 0})
-
-
-def _gemini_thinking_cfg(mdl: str):
-    """모델 세대에 맞는 사고(thinking) 설정.
-
-    Gemini 3.x 는 기본적으로 길게 '생각'하고, 그 토큰이 maxOutputTokens 를 함께 쓴다.
-    설정하지 않으면 답변이 나오기도 전에 예산이 소진돼 본문이 잘린다(finishReason=MAX_TOKENS).
-    """
-    n = (mdl or "").lower()
-    if "gemini-2.5" in n:
-        return {"thinkingBudget": 0}          # 2.5 계열은 예산(int)만 받는다
-    if re.search(r"gemini-(1\.5|2\.0)", n):
-        return None                           # 사고 기능 없음
-    return {"thinkingLevel": "low"}           # 3.x·'-latest' 별칭
-
-
-def _ai_generate(provider: str, api_key: str, mdl: str, system: str, user: str,
-                 max_tokens: int = 1800, temperature: float = 0.2,
-                 json_mode: bool = False):
-    """프로바이더 공통 텍스트 생성. 반환: (text, error_message). 실패 시 text=''."""
-    try:
-        if provider == "gemini":
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models"
-                   f"/{mdl}:generateContent?key={api_key}")
-
-            def call(limit, think):
-                cfg = {"maxOutputTokens": limit, "temperature": temperature}
-                if json_mode:
-                    cfg["responseMimeType"] = "application/json"
-                if think:
-                    cfg["thinkingConfig"] = think
-                return _ai_post_retry(lambda: req_lib.post(
-                    url, timeout=60, headers={"Content-Type": "application/json"},
-                    json={"contents": [{"parts": [{"text": f"{system}\n\n{user}"}]}],
-                          "generationConfig": cfg}))
-
-            think = _gemini_thinking_cfg(mdl)
-            # 사고 토큰까지 감안해 넉넉히 잡는다(본문이 잘리는 것보다 낫다)
-            limit = max(max_tokens, 3000)
-            r = call(limit, think)
-            if r.status_code == 400 and think and "thinking" in (r.text or "").lower():
-                r = call(limit, None)           # 사고 설정 미지원 모델 폴백
-            if r.status_code != 200:
-                return "", _ai_error(r)[0]
-            data = r.json()
-            cands = data.get("candidates") or []
-            if not cands:
-                return "", "AI 응답이 비어 있습니다."
-
-            def text_of(d):
-                cs = d.get("candidates") or [{}]
-                ps = cs[0].get("content", {}).get("parts") or []
-                return "".join(p.get("text", "") for p in ps)
-
-            txt = text_of(data)
-            # 사고에 예산을 다 써서 본문이 잘렸으면 한 번 더 크게 잡아 재시도
-            if cands[0].get("finishReason") == "MAX_TOKENS":
-                r2 = call(min(limit * 3, 12000), think or {"thinkingLevel": "low"})
-                if r2.status_code == 200:
-                    t2 = text_of(r2.json())
-                    if len(t2) > len(txt):
-                        txt = t2
-            if not txt.strip():
-                return "", "AI가 본문을 생성하지 못했습니다(사고 토큰 초과). 잠시 후 다시 시도하세요."
-            return txt, ""
-        if provider == "claude":
-            r = _ai_post_retry(lambda: req_lib.post(
-                "https://api.anthropic.com/v1/messages", timeout=40,
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": mdl, "max_tokens": max_tokens, "temperature": temperature,
-                      "system": system, "messages": [{"role": "user", "content": user}]}))
-            if r.status_code != 200:
-                return "", _ai_error(r)[0]
-            return "".join(p.get("text", "") for p in r.json().get("content", [])), ""
-        if provider in ("gpt", "openai"):
-            r = _ai_post_retry(lambda: req_lib.post(
-                "https://api.openai.com/v1/chat/completions", timeout=40,
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json={"model": mdl, "temperature": temperature,
-                      "max_tokens": max_tokens,
-                      "messages": [{"role": "system", "content": system},
-                                   {"role": "user", "content": user}]}))
-            if r.status_code != 200:
-                return "", _ai_error(r)[0]
-            return r.json()["choices"][0]["message"]["content"], ""
-        if provider == "ollama":
-            base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-            r = req_lib.post(f"{base}/api/chat", timeout=60,
-                             json={"model": mdl or "gemma2", "stream": False,
-                                   "messages": [{"role": "system", "content": system},
-                                                {"role": "user", "content": user}]})
-            if r.status_code != 200:
-                return "", f"Ollama 오류({r.status_code})"
-            return (r.json().get("message") or {}).get("content", ""), ""
-    except Exception as e:
-        return "", f"AI 호출 오류: {e}"
-    return "", f"지원하지 않는 프로바이더: {provider}"
-
-
-def _ai_post_retry(do_post, tries=3):
-    """AI 프로바이더 호출 — 과부하/일시오류(429/500/502/503/504)는 백오프 재시도."""
-    import time as _t
-    resp = None
-    for i in range(tries):
-        resp = do_post()
-        if resp.status_code not in (429, 500, 502, 503, 504):
-            return resp
-        if i < tries - 1:
-            _t.sleep(0.8 * (i + 1))
-    return resp
-
-
-def _ai_error(resp):
-    """AI 응답 에러를 (사용자 메시지, 분류) 로 정규화."""
-    try:
-        msg = resp.json().get("error", {})
-        msg = msg.get("message", "") if isinstance(msg, dict) else str(msg)
-    except Exception:
-        msg = (resp.text or "")[:200]
-    low = (msg or "").lower()
-    code = resp.status_code
-    if code in (429, 503) or "overload" in low or "high demand" in low or "unavailable" in low or "quota" in low or "rate" in low:
-        kind = "overload"
-        user = f"AI 모델이 일시적으로 과부하 상태입니다 (재시도 후에도 실패). 잠시 뒤 다시 시도하거나 다른 모델을 선택하세요. (원문: {msg})"
-    elif code in (401, 403) or "api key" in low or "permission" in low or "invalid" in low or "unauthenticated" in low:
-        kind = "auth"
-        user = f"API 키가 올바르지 않거나 권한이 없습니다. 키를 확인하세요. (원문: {msg})"
-    else:
-        kind = "error"
-        user = msg or f"AI API 오류 ({code})"
-    return user, kind
-
-
-def _ai_url_allowed(url: str) -> bool:
-    """승인된 모델 서버 URL 검증(F01/SSRF 방어).
-
-    · http/https 스킴과 호스트가 있어야 한다.
-    · OLLAMA_ALLOWED_HOSTS(쉼표 구분)가 설정돼 있으면 그 호스트만 허용한다.
-      미설정이면 OLLAMA_BASE_URL 자체가 관리자 승인값이므로 형식만 확인한다.
-    """
-    try:
-        from urllib.parse import urlparse
-        u = urlparse(url)
-        if u.scheme not in ("http", "https") or not u.hostname:
-            return False
-        allow = [h.strip().lower() for h in
-                 (os.environ.get("OLLAMA_ALLOWED_HOSTS") or "").split(",") if h.strip()]
-        if allow and u.hostname.lower() not in allow:
-            return False
-        return True
-    except Exception:
-        return False
-
-
-@app.route("/api/ai/interpret", methods=["POST"])
-def ai_interpret():
-    """멀티 프로바이더 조문 해석 (Claude / GPT / Gemini / Ollama)"""
-    body = request.get_json(force=True) or {}
-    provider    = body.get("provider", "claude").lower()
-    api_key     = body.get("api_key", "").strip()
-    model       = body.get("model", "").strip()
-    law_name    = body.get("law_name", "")
-    art_no      = body.get("art_no", "")
-    art_title   = body.get("art_title", "")
-    art_content = body.get("art_content", "")
-
-    if not art_content:
-        return jsonify({"error": "조문 내용이 없습니다."}), 400
-    if provider != "ollama" and not api_key:
-        return jsonify({"error": f"API 키가 없습니다. 상단 [✦ AI 설정]에서 {provider} 키를 입력하세요."}), 400
-
-    system_prompt = f"""당신은 대한민국 농업·지식재산 분야 법률 전문 해석 AI입니다.
-아래 조문을 **마크다운 형식**으로 구조화하여 해석하세요.
-
-## 핵심 요약
-이 조문이 말하는 핵심을 1~2문장으로.
-
-## 쉬운 해설
-법률 비전문가(농업인·중소기업 담당자)가 이해할 수 있도록 3~5문장으로 풀어서 설명하세요.
-
-## 실무 포인트
-농업인·기업 담당자가 주의해야 할 실질적 사항을 항목으로 정리하세요 (2~4개).
-
-## 위반 시 제재 (해당하는 경우)
-이 조문을 위반하면 어떤 불이익이 있는지 간략히.
-
----
-대상 법령: 「{law_name}」 {art_no} {art_title}
-답변은 한국어로, 각 섹션을 빠짐없이 작성하되 간결하게 유지하세요.
-마크다운 **굵게**, ## 헤더, - 목록을 적극 활용하세요."""
-
-    user_msg = f"조문 내용:\n{art_content}"
-
-    try:
-        # ── Claude ─────────────────────────────────────────────────────────────
-        if provider == "claude":
-            mdl = model or "claude-sonnet-4-5"
-            resp = _ai_post_retry(lambda: req_lib.post(
-                "https://api.anthropic.com/v1/messages",
-                json={"model": mdl, "max_tokens": 1500,
-                      "system": system_prompt,
-                      "messages": [{"role": "user", "content": user_msg}]},
-                headers={"Content-Type": "application/json",
-                         "x-api-key": api_key,
-                         "anthropic-version": "2023-06-01"},
-                timeout=30,
-            ))
-            if resp.status_code != 200:
-                user, kind = _ai_error(resp)
-                return jsonify({"error": user, "kind": kind}), resp.status_code
-            return jsonify({"result": resp.json()["content"][0]["text"]})
-
-        # ── OpenAI GPT ─────────────────────────────────────────────────────────
-        elif provider == "gpt":
-            mdl = model or "gpt-4o"
-            resp = _ai_post_retry(lambda: req_lib.post(
-                "https://api.openai.com/v1/chat/completions",
-                json={"model": mdl, "max_tokens": 1500,
-                      "messages": [{"role": "system", "content": system_prompt},
-                                   {"role": "user",   "content": user_msg}]},
-                headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {api_key}"},
-                timeout=30,
-            ))
-            if resp.status_code != 200:
-                user, kind = _ai_error(resp)
-                return jsonify({"error": user, "kind": kind}), resp.status_code
-            return jsonify({"result": resp.json()["choices"][0]["message"]["content"]})
-
-        # ── Google Gemini ──────────────────────────────────────────────────────
-        elif provider == "gemini":
-            # 2.5/3.x 사고(thinking) 모델은 사고 토큰이 출력 예산을 잠식해
-            # parts 가 비어 오는 경우가 있다. 이를 처리하는 공통 헬퍼로 통일한다.
-            mdl = model or _default_model_for("gemini", api_key)
-            text, err = _ai_generate("gemini", api_key, mdl,
-                                     system_prompt, user_msg, max_tokens=1500)
-            if err or not text:
-                return jsonify({"error": err or "AI 응답이 비어 있습니다."}), 502
-            return jsonify({"result": text})
-
-        # ── Ollama (로컬) ──────────────────────────────────────────────────────
-        elif provider == "ollama":
-            # 보안(F01/SSRF): 사용자 입력(api_key)을 서버 요청 URL로 쓰지 않는다.
-            # 관리자 환경변수 OLLAMA_BASE_URL(승인된 모델 서버)만 사용하며,
-            # 미설정 시 이 배포에서는 Ollama를 제공하지 않는다.
-            base_url = (os.environ.get("OLLAMA_BASE_URL") or "").strip().rstrip("/")
-            if not base_url:
-                return jsonify({"error": "이 배포에서는 Ollama를 사용할 수 없습니다. "
-                                         "관리자가 승인된 모델 서버(OLLAMA_BASE_URL)를 "
-                                         "설정하면 사용할 수 있습니다.",
-                                "kind": "config"}), 400
-            if not _ai_url_allowed(base_url):
-                return jsonify({"error": "허용되지 않은 모델 서버 주소입니다.",
-                                "kind": "config"}), 403
-            mdl = model or "gemma3"
-            resp = req_lib.post(
-                f"{base_url}/api/chat",
-                json={"model": mdl, "stream": False,
-                      "messages": [{"role": "system", "content": system_prompt},
-                                   {"role": "user",   "content": user_msg}]},
-                headers={"Content-Type": "application/json"},
-                timeout=60,
-                allow_redirects=False,   # 리디렉션으로 승인 외 주소로 우회되는 것 차단
-            )
-            d = resp.json()
-            if resp.status_code != 200:
-                return jsonify({"error": d.get("error", "Ollama API 오류")}), resp.status_code
-            return jsonify({"result": d["message"]["content"]})
-
-        else:
-            return jsonify({"error": f"지원하지 않는 프로바이더: {provider}"}), 400
-
-    except req_lib.exceptions.Timeout:
-        return jsonify({"error": f"AI 응답 시간 초과 ({provider})"}), 504
-    except req_lib.exceptions.ConnectionError as e:
-        return jsonify({"error": f"서버 연결 실패: {e}"}), 502
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/law/amendments")
-def get_law_amendments():
-    """
-    최근 개정 조문 조회.
-    1) 현재 법령 XML → 조문별 개정일 태그 탐색
-    2) 개정일 태그 없으면 → 직전 버전 XML과 조문 내용 비교로 변경 감지
-    3) 공포일자 기준 법령 자체 최신 개정 날짜와 함께 반환
-    """
-    law_name = request.args.get("name", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-
-    try:
-        from datetime import datetime, timedelta
-
-        # ── Step 1: 현재 법령 XML 취득 ─────────────────────────────────────────
-        root = _fetch_law_root(law_name, "law")
-
-        if root is None:
-            return jsonify({"error": "법령 XML을 불러오지 못했습니다."}), 502
-
-        law_name_real, law_date, articles = _parse_articles(root)
-        law_date_fmt = re.sub(r"(\d{4})(\d{2})(\d{2})", r"\1.\2.\3", law_date) if law_date else ""
-
-        # ── Step 2: 조문별 개정일 태그가 있는지 확인 ────────────────────────────
-        amended_arts = [a for a in articles
-                        if a.get("type") == "article" and a.get("amended_date")]
-
-        if amended_arts:
-            # 태그에서 개정일 직접 추출 성공
-            # 최근 2년 이내 조문만 필터
-            cutoff = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
-            recent = [a for a in amended_arts
-                      if re.sub(r"\D", "", a.get("amended_date", "")) >= cutoff]
-            recent.sort(key=lambda x: re.sub(r"\D", "", x.get("amended_date", "")), reverse=True)
-
-            return jsonify({
-                "success": True,
-                "law_name": law_name_real or law_name,
-                "law_date": law_date_fmt,
-                "method": "tag",
-                "amended_articles": [
-                    {
-                        "조문번호": a["조문번호"],
-                        "조문제목": a["조문제목"],
-                        "amended_date": re.sub(r"(\d{4})(\d{2})(\d{2})", r"\1.\2.\3",
-                                               re.sub(r"\D", "", a["amended_date"])),
-                        "amend_type": a.get("amend_type", "개정"),
-                        "조문내용": a["조문내용"][:200] + ("..." if len(a["조문내용"]) > 200 else ""),
-                    }
-                    for a in recent
-                ]
-            })
-
-        # ── Step 3: 태그 없으면 이전 버전 XML과 비교 ─────────────────────────
-        # 법제처 JSON 검색으로 동일 법령 이전 버전 목록 취득
-        hist_data = _law_get_json({"target": "law", "query": law_name, "display": "20"})
-        hist_laws = hist_data.get("LawSearch", {}).get("law", []) or []
-        if isinstance(hist_laws, dict): hist_laws = [hist_laws]
-
-        # 현재 법령과 이름이 같은 것만 필터 → 공포일자 기준 정렬
-        same_laws = [l for l in hist_laws
-                     if (l.get("법령명한글") or "") == (law_name_real or law_name)]
-        same_laws.sort(key=lambda x: x.get("공포일자", ""), reverse=True)
-
-        prev_root = None
-        if len(same_laws) >= 2:
-            prev_law = same_laws[1]
-            prev_no  = prev_law.get("법령일련번호", "")
-            if prev_no:
-                for param in ("ID", "MST"):
-                    try:
-                        pr = _law_get_xml("lawService.do", {"target": "law", param: prev_no})
-                        if _is_valid_law_xml(pr):
-                            prev_root = pr; break
-                    except Exception:
-                        continue
-
-        changed = []
-        if prev_root is not None:
-            _, _, prev_articles = _parse_articles(prev_root)
-            # 조문번호 기준으로 dict 구성
-            prev_map = {a["조문번호"]: a for a in prev_articles if a.get("type") == "article"}
-            curr_map = {a["조문번호"]: a for a in articles       if a.get("type") == "article"}
-
-            for no, curr in curr_map.items():
-                prev = prev_map.get(no)
-                if prev is None:
-                    # 신설 조문
-                    changed.append({
-                        "조문번호": no, "조문제목": curr["조문제목"],
-                        "amended_date": law_date_fmt, "amend_type": "신설",
-                        "조문내용": curr["조문내용"][:200] + ("..." if len(curr["조문내용"]) > 200 else ""),
-                    })
-                elif prev["조문내용"].strip() != curr["조문내용"].strip():
-                    # 내용 변경
-                    changed.append({
-                        "조문번호": no, "조문제목": curr["조문제목"],
-                        "amended_date": law_date_fmt, "amend_type": "개정",
-                        "조문내용": curr["조문내용"][:200] + ("..." if len(curr["조문내용"]) > 200 else ""),
-                    })
-            for no, prev in prev_map.items():
-                if no not in curr_map:
-                    changed.append({
-                        "조문번호": no, "조문제목": prev["조문제목"],
-                        "amended_date": law_date_fmt, "amend_type": "삭제",
-                        "조문내용": "(삭제된 조문)",
-                    })
-
-        return jsonify({
-            "success": True,
-            "law_name": law_name_real or law_name,
-            "law_date": law_date_fmt,
-            "method": "diff" if changed else "none",
-            "amended_articles": changed,
-        })
-
-    except req_lib.exceptions.Timeout:
-        return jsonify({"error": "법제처 API 응답 시간 초과"}), 504
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-
-@app.route("/api/law/history")
-def get_law_history():
-    """법령 개정이력 조회"""
-    law_name = request.args.get("name", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 필요"}), 400
-    try:
-        # 법령 검색으로 이력 정보 수집
-        data = _law_get_json({"target": "law", "query": law_name, "display": "20"})
-        laws = data.get("LawSearch", {}).get("law", []) or []
-        if isinstance(laws, dict): laws = [laws]
-
-        # 같은 법령명의 이력 추출
-        history = []
-        for law in laws:
-            name_k = law.get("법령명한글", "")
-            # 이름이 유사한 것만 (정확히 같거나 포함)
-            if law_name in name_k or name_k in law_name:
-                pdate = law.get("공포일자", "")
-                pno   = law.get("공포번호", "")
-                typ   = law.get("법령구분명", "")
-                if pdate:
-                    date_str = re.sub(r"(\d{4})(\d{2})(\d{2})", r"\1.\2.\3", pdate)
-                    desc = f"{typ} 공포" + (f" (법률 제{pno}호)" if pno else "")
-                    history.append({"date": date_str, "desc": desc})
-
-        history.sort(key=lambda x: x["date"], reverse=True)
-        return jsonify({"success": True, "law_name": law_name, "history": history})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/law/prev_article")
-def get_prev_article():
-    """이전 버전 법령에서 특정 조문 내용 조회 (diff용)"""
-    law_name = request.args.get("name", "").strip()
-    art_no   = request.args.get("art_no", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 필요"}), 400
-    try:
-        hist_data = _law_get_json({"target": "law", "query": law_name, "display": "20"})
-        hist_laws = hist_data.get("LawSearch", {}).get("law", []) or []
-        if isinstance(hist_laws, dict): hist_laws = [hist_laws]
-        same = [l for l in hist_laws if (l.get("법령명한글","")) == law_name]
-        same.sort(key=lambda x: x.get("공포일자",""), reverse=True)
-        if len(same) < 2:
-            return jsonify({"content": "(이전 버전 없음)"})
-        prev = same[1]
-        prev_no = prev.get("법령일련번호","")
-        if not prev_no:
-            return jsonify({"content": "(이전 버전 없음)"})
-        for param in ("ID","MST"):
-            try:
-                root = _law_get_xml("lawService.do", {"target":"law", param: prev_no})
-                _, _, arts = _parse_articles(root)
-                art = next((a for a in arts
-                            if a.get("type")=="article" and a.get("조문번호")==art_no), None)
-                if art:
-                    return jsonify({"content": art.get("조문내용",""),
-                                    "date": re.sub(r"(\d{4})(\d{2})(\d{2})",r"\1.\2.\3",
-                                                   prev.get("공포일자",""))})
-            except Exception:
-                continue
-        return jsonify({"content": "(이전 버전 조문 없음)"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/law/art_history")
-def get_art_history():
-    """조문 단위 개정 히스토리 (버전별 내용 비교)"""
-    law_name = request.args.get("name", "").strip()
-    art_no   = request.args.get("art_no", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 필요"}), 400
-    try:
-        hist_data = _law_get_json({"target": "law", "query": law_name, "display": "20"})
-        hist_laws = hist_data.get("LawSearch", {}).get("law", []) or []
-        if isinstance(hist_laws, dict): hist_laws = [hist_laws]
-        same = [l for l in hist_laws if (l.get("법령명한글","")) == law_name]
-        same.sort(key=lambda x: x.get("공포일자",""))
-
-        history = []
-        prev_content = None
-        prev_date    = None
-
-        for i, law in enumerate(same):
-            lsi = law.get("법령일련번호","")
-            if not lsi: continue
-            root = None
-            for param in ("ID","MST"):
-                try:
-                    r = _law_get_xml("lawService.do", {"target":"law", param: lsi})
-                    if _is_valid_law_xml(r):
-                        root = r; break
-                except Exception:
-                    continue
-            if not root: continue
-
-            try:
-                _, _, arts = _parse_articles(root)
-                art = next((a for a in arts
-                            if a.get("type")=="article" and a.get("조문번호")==art_no), None)
-                if not art: continue
-
-                content = art.get("조문내용","")
-                date_raw = law.get("공포일자","")
-                date_fmt = re.sub(r"(\d{4})(\d{2})(\d{2})", r"\1.\2.\3", date_raw)
-                is_last  = (i == len(same)-1)
-
-                if prev_content is None:
-                    entry_type = "신설"
-                elif content.strip() != prev_content.strip():
-                    entry_type = "개정"
-                else:
-                    prev_content = content
-                    prev_date    = date_fmt
-                    continue
-
-                history.append({
-                    "date": date_fmt,
-                    "type": "현행" if is_last else entry_type,
-                    "content": content,
-                    "prev": prev_content,
-                    "prev_date": prev_date or "",
-                })
-                prev_content = content
-                prev_date    = date_fmt
-            except Exception:
-                continue
-
-        history.reverse()
-        return jsonify({"success": True, "law_name": law_name,
-                        "art_no": art_no, "history": history})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-# ── 관련 판례·자치법규(조례) 연계 ────────────────────────────────────────────
-def _fmt_law_date(s: str) -> str:
-    """YYYYMMDD → YYYY.MM.DD (그 외 형식은 그대로 반환)"""
-    d = re.sub(r"\D", "", s or "")
-    return re.sub(r"(\d{4})(\d{2})(\d{2})", r"\1.\2.\3", d) if len(d) == 8 else (s or "").strip()
-
-
-def _abs_law_url(link: str) -> str:
-    """법제처 상세링크(상대경로 가능)를 절대 URL로 변환"""
-    link = (link or "").strip()
-    if not link:
-        return ""
-    if link.startswith("http"):
-        return link
-    if link.startswith("/"):
-        return "https://www.law.go.kr" + link
-    return "https://www.law.go.kr/" + link
-
-
-def _search_root_items(data: dict, item_keys) -> list:
-    """법제처 검색 JSON에서 결과 리스트 추출.
-    루트 키(PrecSearch/OrdinSearch/LawSearch 등)와 항목 키가 타깃마다 달라
-    최상위 dict 값들을 훑으며 item_keys 중 첫 매칭 리스트를 돌려준다."""
-    if not isinstance(data, dict):
-        return []
-    for root_val in data.values():
-        if isinstance(root_val, dict):
-            for k in item_keys:
-                v = root_val.get(k)
-                if v:
-                    return v if isinstance(v, list) else [v]
-    return []
-
-
-@app.route("/api/law/related")
-def get_law_related():
-    """법령명 기준 관련 판례·자치법규(조례) 연계 제안.
-    법제처 통합검색 API의 판례(target=prec)·자치법규(target=ordin)를 병렬 조회한다."""
-    law_name = request.args.get("name", "").strip()
-    if not law_name:
-        return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-    display = request.args.get("display", "12")
-
-    def _do_prec():
-        try:
-            d = _law_get_json({"target": "prec", "query": law_name, "display": display},
-                              timeout=(5, 12))
-            out = []
-            for it in _search_root_items(d, ("prec", "law")):
-                if not isinstance(it, dict):
-                    continue
-                seq = (it.get("판례일련번호") or "").strip()
-                out.append({
-                    "title":     (it.get("사건명") or "").strip(),
-                    "case_no":   (it.get("사건번호") or "").strip(),
-                    "court":     (it.get("법원명") or "").strip(),
-                    "date":      _fmt_law_date(it.get("선고일자")),
-                    "case_type": (it.get("사건종류명") or "").strip(),
-                    "id":        seq,
-                    "url":       (f"https://www.law.go.kr/precInfoP.do?precSeq={seq}" if seq
-                                  else _abs_law_url(it.get("판례상세링크"))),
-                })
-            return [o for o in out if o["title"]]
-        except Exception as e:
-            print(f"[related] prec 오류: {e}")
-            return []
-
-    def _do_ordin():
-        try:
-            d = _law_get_json({"target": "ordin", "query": law_name, "display": display},
-                              timeout=(5, 12))
-            out = []
-            for it in _search_root_items(d, ("ordin", "law")):
-                if not isinstance(it, dict):
-                    continue
-                nm = (it.get("자치법규명") or it.get("법령명한글") or "").strip()
-                seq = (it.get("자치법규일련번호") or "").strip()
-                out.append({
-                    "name": nm,
-                    "org":  (it.get("지자체기관명") or it.get("소관부처명") or "").strip(),
-                    "kind": (it.get("자치법규종류") or "").strip(),
-                    "date": _fmt_law_date(it.get("공포일자") or it.get("발령일자")),
-                    "id":   seq,
-                    "url":  (f"https://www.law.go.kr/ordinInfoP.do?ordinSeq={seq}" if seq
-                             else _abs_law_url(it.get("자치법규상세링크"))),
-                })
-            return [o for o in out if o["name"]]
-        except Exception as e:
-            print(f"[related] ordin 오류: {e}")
-            return []
-
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=2) as ex:
-            f_prec = ex.submit(_do_prec)
-            f_ord  = ex.submit(_do_ordin)
-            precedents = f_prec.result()
-            ordinances = f_ord.result()
-        print(f"[related] '{law_name}' 판례={len(precedents)} 자치법규={len(ordinances)}")
-        return jsonify({
-            "success":     True,
-            "law_name":    law_name,
-            "precedents":  precedents,
-            "ordinances":  ordinances,
-            "prec_count":  len(precedents),
-            "ordin_count": len(ordinances),
-        })
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-# ── 사규(내규) MCP 연동 ────────────────────────────────────────────────────────
-# 외부 사규 MCP 서버(Streamable HTTP)를 호출하여 내규를 검색하고,
-# 내규 본문 속 법령 참조는 프론트엔드에서 법령 조문 조회와 연계한다.
-SAGYU_MCP_URL = os.environ.get(
-    "SAGYU_MCP_URL", "https://tech-transfer-platform-zt79.vercel.app/mcp"
-).strip()
 
 # ── 내규 원본 PDF(Supabase Storage 등) ───────────────────────────────────────
 # 원본 HWP/HWPX를 PDF로 변환해 올린 스토리지의 공개 URL 접두사.
@@ -3133,7 +727,7 @@ def _convert_upload(filename: str, raw: bytes, title: str, meta: dict) -> dict:
             "text": text, "converted": True, "warning": ""}
 
 
-# ── 업로드된 내규의 로컬 본문 (내규 검색·전문 조회에 사용) ────────────────────
+# ── 업로드된 내규의 로컬 본문 ────────────────────
 def _local_reg_text(slug: str) -> str:
     try:
         p = os.path.join(REG_DIR, slug, "text.txt")
@@ -3147,136 +741,6 @@ def _local_reg_text(slug: str) -> str:
 
 def _uploaded_regs() -> list:
     return [m for m in _load_reg_manifest() if m.get("uploaded_at") or m.get("history")]
-
-
-def _item_title(it) -> str:
-    """구조화 검색 항목에서 규정명 추출(키 이름이 여러 형태)."""
-    if isinstance(it, dict):
-        return str(it.get("title") or it.get("name")
-                   or it.get("제목") or it.get("규정명") or "")
-    return ""
-
-
-def _merge_local_hits(resp: dict, local_hits: list) -> dict:
-    """업로드된 내규 검색 결과를 MCP 응답에 병합(업로드분을 앞쪽에 노출)."""
-    if not local_hits:
-        return resp
-    resp["local"] = local_hits
-    resp["local_count"] = len(local_hits)
-    st = resp.get("structured")
-    if isinstance(st, list):
-        titles = {_norm_key(h["title"]) for h in local_hits}
-        rest = [it for it in st
-                if _norm_key(str((it or {}).get("title") or (it or {}).get("name") or "")) not in titles]
-        resp["structured"] = local_hits + rest
-    elif not st:
-        resp["structured"] = local_hits
-    return resp
-
-
-def _local_reg_search(query: str, limit: int = 20) -> list:
-    """업로드된 내규 본문에서 키워드 검색 → MCP 결과와 같은 형식의 항목 반환."""
-    q = (query or "").strip()
-    if not q:
-        return []
-    qL = q.lower()
-    hits = []
-    for m in _uploaded_regs():
-        text = _local_reg_text(m.get("slug", ""))
-        if not text:
-            continue
-        if qL in text.lower() or qL in _norm_key(m.get("title", "")):
-            hits.append({"title": m.get("title", ""), "content": text,
-                         "source": "upload", "revision": m.get("revision", ""),
-                         "category": m.get("category", "")})
-        if len(hits) >= limit:
-            break
-    return hits
-
-
-# ── 번들된 규정 HTML 본문 인덱스 ──────────────────────────────────────────────
-# regulations/<slug>/index.html 은 123건 전체가 있으나(의미검색 인덱스의 원천),
-# 키워드 검색·전문 열람은 그동안 text.txt(업로드분)나 외부 MCP 에만 의존했다.
-# 아래 헬퍼로 번들 HTML 본문을 검색·열람에 활용해 MCP 하드의존을 없앤다.
-_REG_BODY_CACHE: dict = {}   # slug -> (mtime, 평문)
-
-
-def _reg_body_text(slug: str) -> str:
-    """규정 본문 평문. 업로드분 text.txt 우선, 없으면 번들 index.html 에서 추출."""
-    if not slug:
-        return ""
-    t = _local_reg_text(slug)                       # 업로드분(text.txt)
-    if t:
-        return t
-    path = os.path.join(REG_DIR, slug, "index.html")
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return ""
-    cached = _REG_BODY_CACHE.get(slug)
-    if cached and cached[0] == mtime:
-        return cached[1]
-    try:
-        import reg_chunks                            # stdlib 만 사용(지연 임포트)
-        with open(path, encoding="utf-8", errors="replace") as f:
-            body = reg_chunks.html_to_text(f.read())
-    except Exception as e:
-        print(f"[reg] 본문 추출 실패({slug}): {e}")
-        return ""
-    _REG_BODY_CACHE[slug] = (mtime, body)
-    return body
-
-
-def _catalog_reg_hits(query: str, exclude_titles=None, limit: int = 12) -> list:
-    """번들 규정 HTML 전체에서 키워드 검색. MCP 가 못 준(또는 없을 때의) 규정을
-    보완하기 위한 용도. exclude_titles(정규화된 규정명 set)는 건너뛴다."""
-    q = (query or "").strip()
-    if not q:
-        return []
-    qL = q.lower()
-    exclude = exclude_titles or set()
-    title_hits, body_hits = [], []
-    for m in _load_reg_manifest():
-        slug, title = m.get("slug", ""), m.get("title", "")
-        if not slug or _norm_key(title) in exclude:
-            continue
-        name_match = qL in _norm_key(title) or qL in title.lower()
-        body = _reg_body_text(slug)
-        if not body:
-            continue
-        if not name_match and qL not in body.lower():
-            continue
-        # F07: 본문 매칭이면 일치 위치를 중심으로 발췌해 검색어가 반드시 포함되게 한다.
-        # (기존 body[:20000]은 매칭이 20,000자 밖일 때 검색어가 빠진 앞부분만 반환)
-        if name_match:
-            content = body[:20000]
-        else:
-            pos = body.lower().find(qL)
-            if pos < 0:
-                content = body[:20000]
-            else:
-                start = max(0, pos - 4000)
-                content = ("…" if start > 0 else "") + body[start:start + 20000]
-        item = {"title": title, "content": content, "source": "local",
-                "revision": m.get("revision", ""), "category": m.get("category", "")}
-        (title_hits if name_match else body_hits).append(item)
-        if len(title_hits) + len(body_hits) >= limit:
-            break
-    return (title_hits + body_hits)[:limit]
-
-
-def _local_only_search(query: str, local_hits: list, mcp_error: str = "") -> dict:
-    """MCP 미설정/실패 시 번들 규정 본문만으로 검색 응답을 구성한다."""
-    cat = _catalog_reg_hits(query, {_norm_key(h["title"]) for h in local_hits})
-    resp = {"success": True, "query": query, "tool": "local-html",
-            "text": "", "structured": local_hits + cat,
-            "local_count": len(local_hits),
-            "name_matches": _name_match_regs(query),
-            "semantic": _semantic_for_search(query),
-            "semantic_available": _semantic_available()}
-    if mcp_error:
-        resp["mcp_error"] = mcp_error
-    return resp
 
 
 REG_BACKUP_DIR = os.path.join(REG_DIR, ".backup")
@@ -3605,6 +1069,20 @@ def serve_regulation_file(subpath):
     except Exception:
         return Response("<h1>404 — 규정 파일을 찾을 수 없습니다</h1>",
                         status=404, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/assets/<path:subpath>")
+def serve_asset_file(subpath):
+    """정적 리소스(서무비서 스크립트·엑셀 서식 등) 서빙 — 로컬 실행용. Vercel은 vercel.json이 정적 처리."""
+    from flask import send_from_directory
+    if any(part.startswith(".") for part in subpath.replace("\\", "/").split("/")):
+        return Response("Not found", status=404)
+    try:
+        resp = send_from_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"), subpath)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+    except Exception:
+        return Response("Not found", status=404)
 
 
 @app.route("/upload")
@@ -4085,112 +1563,13 @@ def _semantic_for_search(query: str, top_k: int = 18):
         return []
 
 
-def _semantic_available() -> bool:
-    """의미 검색이 실제로 수행 가능한지(임베딩 키 + 벡터 인덱스 존재)."""
-    key = _user_gemini_key()
-    if not key:
-        return False
-    try:
-        return _vec_load()["mat"] is not None
-    except Exception:
-        return False
-
-
-@app.route("/api/internal/semantic")
-def internal_semantic():
-    """의미 검색 결과(규정 단위로 묶어 반환)."""
-    q = (request.args.get("query") or "").strip()
-    if len(q) < 2:
-        return jsonify({"error": "검색어는 2자 이상 입력하세요"}), 400
-    key = _user_gemini_key()
-    c = _vec_load()
-    if c["mat"] is None:
-        return jsonify({"success": True, "available": False, "regs": [],
-                        "message": "의미 검색 인덱스가 없습니다(벡터 파일 미배포)."})
-    if not key:
-        return jsonify({"success": True, "available": False, "regs": [],
-                        "message": "Gemini 키가 필요합니다(AI 설정 또는 서버 환경변수)."})
-    hits = semantic_search(q, key, top_k=int(request.args.get("top", 24)))
-    regs: dict = {}
-    for h in hits:
-        r = regs.setdefault(h["title"], {"name": h["title"], "org": "사내 규정",
-                                         "slug": h["slug"], "matched_articles": [],
-                                         "score": 0.0})
-        r["score"] = max(r["score"], h["score"])
-        if len(r["matched_articles"]) < 5:
-            r["matched_articles"].append({
-                "조문번호": h["no"], "조문제목": h["art_title"],
-                "조문내용": h["preview"]})
-    out = sorted(regs.values(), key=lambda x: -x["score"])
-    for r in out:
-        r["matched_count"] = len(r["matched_articles"])
-    return jsonify({"success": True, "available": True, "query": q,
-                    "count": len(out), "regs": out,
-                    "index": {"chunks": c["meta"]["count"],
-                              "total_chunks": c["meta"].get("total_chunks"),
-                              "complete": c["meta"].get("complete", True),
-                              "model": c["meta"].get("model"),
-                              "built_at": c["meta"].get("built_at")}})
-
-
-@app.route("/api/internal/names")
-def internal_names():
-    """내규 명칭 목록(원본 manifest 기준) — 본문 참조가 내규인지 법령인지 판별용."""
-    man = _load_reg_manifest()
-    items = []
-    for m in man:
-        if not m.get("title"):
-            continue
-        # 개정 이력: 업로드 시 누적된 이전 개정본(최신순)
-        hist = []
-        for h in (m.get("history") or [])[:20]:
-            e = h.get("entry") or h
-            rv = (e.get("revision") or h.get("revision") or "").strip()
-            if rv:
-                hist.append({"revision": rv,
-                             "effective_date": e.get("effective_date", ""),
-                             "uploaded_at": e.get("uploaded_at", ""),
-                             # 이 이전 개정본이 '언제 교체(개정)되었는지'
-                             "replaced_at": h.get("replaced_at", "")})
-        items.append({"title": m.get("title", ""), "category": m.get("category", ""),
-                      "revision": m.get("revision", ""),
-                      "effective_date": m.get("effective_date", ""),
-                      "uploaded_at": m.get("uploaded_at", ""),
-                      "history": hist})
-    return jsonify({"success": True, "count": len(items), "names": items})
-
-
-def _name_match_regs(query: str, limit: int = 30) -> list:
-    """규정 '명칭'에 검색어가 포함된 내규 목록(본문 검색과 병행해 완성도를 높임)."""
-    man = _load_reg_manifest()
-    if not man or not query:
-        return []
-    q = _norm_key(query)
-    hits = []
-    for m in man:
-        t = m.get("title", "")
-        if not t:
-            continue
-        nt = _norm_key(t)
-        if q in nt:
-            exact = (nt == q)               # 규정명과 100% 일치
-            # 완전일치 최우선 → 앞부분 일치 → 짧은 이름
-            score = (10000 if exact else 0) + 200 - nt.index(q) - len(nt) * 0.1
-            hits.append((score, {"title": t, "category": m.get("category", ""),
-                                 "revision": m.get("revision", ""),
-                                 "match": "exact" if exact else "name",
-                                 "exact": exact}))
-    hits.sort(key=lambda x: -x[0])
-    return [h[1] for h in hits[:limit]]
-
-
 @app.route("/api/internal/original")
 def internal_original():
     """내규 원본(PDF) 위치 조회 — 전문 화면의 '원본 보기/다운로드'용."""
     name = request.args.get("name", "").strip()
     if not name:
         return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-    m = _find_reg_original(name)
+    m, _via = _sec_resolve_reg(name)      # 다른 기관: 규정명 매핑·접두어·근사 연결까지
     if not m:
         return jsonify({"success": True, "found": False, "name": name})
     out = {"success": True, "found": True, "name": name,
@@ -4205,2052 +1584,624 @@ def internal_original():
         fname = os.path.basename(m.get("pdf", "")) or (slug + ".pdf")
         out["pdf_url"] = f"{REG_PDF_BASE_URL}/{quote(fname)}"
     return jsonify(out)
-# MCP 도구 목록 캐시 (URL → {tools, ts}) — 워밍된 프로세스에서 tools/list 왕복 절약
-_MCP_TOOLS_CACHE: dict = {}
-# 내규 검색 키워드 후보(도구/인자 자동 선택용)
-_MCP_SEARCH_HINTS = ("search", "검색", "find", "query", "lookup", "조회", "retrieve")
-_MCP_RULE_HINTS   = ("rule", "규정", "사규", "내규", "regulation", "정관",
-                     "지침", "policy", "bylaw", "문서", "document")
-
-
-def _mcp_parse_response(resp) -> dict:
-    """MCP 응답을 파싱. application/json 또는 text/event-stream(SSE) 모두 지원."""
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    text = _decode(resp.content).strip()
-    if "text/event-stream" in ct or text.startswith("event:") or "\ndata:" in text:
-        # SSE: 'data:' 라인들에서 마지막으로 파싱 가능한 JSON을 사용
-        for line in reversed(text.splitlines()):
-            line = line.strip()
-            if line.startswith("data:"):
-                chunk = line[5:].strip()
-                if not chunk or chunk == "[DONE]":
-                    continue
-                try:
-                    return json.loads(chunk)
-                except Exception:
-                    continue
-        raise ValueError("SSE 응답 파싱 실패")
-    return json.loads(text)
-
-
-class _McpClient:
-    """최소 기능 MCP Streamable HTTP 클라이언트 (initialize → tools/list → tools/call)."""
-    def __init__(self, url: str):
-        self.url = url
-        self.sid = None
-        self._id = 0
-        self._tools = None
-
-    def _post(self, method: str, params=None, notify: bool = False, timeout=(5, 25)):
-        self._id += 1
-        payload = {"jsonrpc": "2.0", "method": method}
-        if not notify:
-            payload["id"] = self._id
-        if params is not None:
-            payload["params"] = params
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.sid:
-            headers["Mcp-Session-Id"] = self.sid
-        r = req_lib.post(self.url, json=payload, headers=headers, timeout=timeout)
-        sid = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id")
-        if sid:
-            self.sid = sid
-        r.raise_for_status()
-        if notify or not (r.content or b"").strip():
-            return None
-        data = _mcp_parse_response(r)
-        if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(data["error"].get("message", "MCP 오류"))
-        return data.get("result") if isinstance(data, dict) else data
-
-    def initialize(self):
-        res = self._post("initialize", {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "agro-law", "version": "1.0"},
-        })
-        try:
-            self._post("notifications/initialized", notify=True)
-        except Exception:
-            pass
-        return res
-
-    def list_tools(self):
-        if self._tools is None:
-            ent = _MCP_TOOLS_CACHE.get(self.url)
-            if ent and (time.time() - ent["ts"] < 300):   # 5분 캐시 (워밍된 프로세스에서 왕복 절약)
-                self._tools = ent["tools"]
-            else:
-                res = self._post("tools/list", {}) or {}
-                self._tools = res.get("tools", []) or []
-                if self._tools:
-                    _MCP_TOOLS_CACHE[self.url] = {"tools": self._tools, "ts": time.time()}
-        return self._tools
-
-    def call_tool(self, name: str, args: dict):
-        return self._post("tools/call", {"name": name, "arguments": args})
-
-
-def _mcp_pick_search_tool(tools: list):
-    """검색 성격의 도구를 휴리스틱으로 선택."""
-    def score(t):
-        blob = (str(t.get("name", "")) + " " + str(t.get("description", ""))).lower()
-        s = 0
-        if any(k in blob for k in _MCP_SEARCH_HINTS): s += 3
-        if any(k in blob for k in _MCP_RULE_HINTS):   s += 2
-        if any(k in blob for k in ("list", "목록")):   s += 1
-        return s
-    if not tools:
-        return None
-    ranked = sorted(tools, key=score, reverse=True)
-    return ranked[0] if score(ranked[0]) > 0 else tools[0]
-
-
-# 전문(전체 문서) 조회 성격의 도구 힌트 (검색/목록보다 우선)
-_MCP_DOC_HINTS = ("get", "read", "detail", "fetch", "retrieve", "document",
-                  "view", "content", "전문", "원문", "본문", "내용", "조회", "상세")
-
-def _mcp_pick_doc_tool(tools: list):
-    """전문(전체 문서) 조회 도구를 우선 선택. 없으면 None(→ 검색 도구 폴백)."""
-    def score(t):
-        blob = (str(t.get("name", "")) + " " + str(t.get("description", ""))).lower()
-        s = 0
-        if any(k in blob for k in _MCP_DOC_HINTS): s += 4
-        if any(k in blob for k in _MCP_RULE_HINTS): s += 2
-        # 검색/목록 도구는 전문 조회 목적에는 부적합 → 감점
-        if any(k in blob for k in ("search", "검색", "list", "목록")): s -= 3
-        return s
-    if not tools:
-        return None
-    ranked = sorted(tools, key=score, reverse=True)
-    return ranked[0] if score(ranked[0]) > 0 else None
-
-
-def _mcp_build_doc_args(tool: dict, name: str, doc_id: str = "") -> dict:
-    """전문 조회 도구 인자 구성. id 계열 속성이 있고 doc_id가 있으면 id 우선."""
-    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
-    props = schema.get("properties") or {}
-    if props and doc_id:
-        for k in props:
-            if any(x in k.lower() for x in ("id", "seq", "no", "번호", "코드", "code")):
-                return {k: doc_id}
-    if props:
-        # 이름/제목 계열 우선
-        for k in list(schema.get("required") or []) + list(props):
-            if any(x in k.lower() for x in ("name", "title", "규정", "제목", "명")):
-                return {k: name}
-    return _mcp_build_args(tool, name)
-
-
-def _mcp_build_args(tool: dict, query: str) -> dict:
-    """도구 inputSchema에서 질의 문자열을 담을 속성을 선택해 인자 구성."""
-    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
-    props = schema.get("properties") or {}
-    required = schema.get("required") or []
-    if not props:
-        return {"query": query}
-    def is_str(p):
-        t = p.get("type")
-        return t == "string" or (isinstance(t, list) and "string" in t)
-    order = list(required) + [k for k in props if k not in required]
-    chosen = None
-    for k in order:
-        p = props.get(k, {})
-        if is_str(p):
-            chosen = chosen or k
-            if any(x in k.lower() for x in
-                   ("query", "keyword", "term", "search", "text", "q", "name", "title", "검색")):
-                chosen = k
-                break
-    args = {chosen or "query": query}
-    return args
-
-
-def _mcp_extract_text(result) -> str:
-    """tools/call 결과의 content 배열에서 텍스트 추출."""
-    if isinstance(result, str):
-        return result
-    if not isinstance(result, dict):
-        return ""
-    parts = []
-    for c in result.get("content", []) or []:
-        if not isinstance(c, dict):
-            continue
-        if c.get("type") == "text" and c.get("text"):
-            parts.append(c["text"])
-        elif isinstance(c.get("resource"), dict) and c["resource"].get("text"):
-            parts.append(c["resource"]["text"])
-    return "\n\n".join(parts).strip()
-
-
-@app.route("/api/internal/status")
-def internal_status():
-    """사규 MCP 연결 상태 및 사용 가능한 도구 목록 확인."""
-    if not SAGYU_MCP_URL:
-        return jsonify({"connected": False, "message": "SAGYU_MCP_URL 미설정"})
-    try:
-        cli = _McpClient(SAGYU_MCP_URL)
-        info = cli.initialize()
-        tools = cli.list_tools()
-        picked = _mcp_pick_search_tool(tools)
-        return jsonify({
-            "connected": True,
-            "server": (info or {}).get("serverInfo", {}),
-            "tools": [{"name": t.get("name"), "description": t.get("description", "")} for t in tools],
-            "search_tool": picked.get("name") if picked else None,
-        })
-    except Exception as e:
-        return jsonify({"connected": False, "message": str(e)})
-
-
-@app.route("/api/internal/search")
-def internal_search():
-    """사규 MCP로 내규 검색. 결과 텍스트/구조화 데이터를 반환하며,
-    본문 속 법령 참조는 프론트엔드에서 법령 조문 조회와 연계한다."""
-    query = request.args.get("query", "").strip()
-    if not query:
-        return jsonify({"error": "검색어를 입력하세요"}), 400
-    if len(query) < 2:
-        return jsonify({"error": "검색어는 2자 이상 입력하세요"}), 400
-
-    # 업로드된 개정 내규는 로컬 본문에서 먼저 찾는다(MCP 서버에는 아직 없음)
-    local_hits = _local_reg_search(query)
-
-    if not SAGYU_MCP_URL:
-        # MCP 미설정이어도 번들된 규정 본문으로 자체 검색한다(외부 하드의존 제거).
-        return jsonify(_local_only_search(query, local_hits))
-    try:
-        cli = _McpClient(SAGYU_MCP_URL)
-        cli.initialize()
-        tools = cli.list_tools()
-        tool = _mcp_pick_search_tool(tools)
-        if not tool:
-            return jsonify({"error": "사규 MCP에서 사용 가능한 도구가 없습니다."}), 502
-        # 결과 완성도: limit류 인자를 크게 채워 더 많은 규정을 받아옴
-        args = _mcp_fill_limits(tool, _mcp_build_args(tool, query), big=50)
-        result = cli.call_tool(tool.get("name"), args)
-        text = _mcp_extract_text(result)
-        structured = result.get("structuredContent") if isinstance(result, dict) else None
-        is_error = bool(result.get("isError")) if isinstance(result, dict) else False
-        if is_error and not local_hits:
-            return jsonify({"error": text or "내규 검색 중 오류가 발생했습니다."}), 502
-        resp = {
-            "success": True,
-            "query": query,
-            "tool": tool.get("name"),
-            "arguments": args,
-            "text": "" if is_error else text,
-            "structured": structured,
-            # 명칭 검색 결과(본문 검색과 병행) — 규정명에 검색어가 들어간 내규
-            "name_matches": _name_match_regs(query),
-            # 의미 검색(임베딩) — 어휘가 달라 키워드로 못 찾는 조문을 보완
-            "semantic": _semantic_for_search(query),
-            "semantic_available": _semantic_available(),
-        }
-        merged = _merge_local_hits(resp, local_hits)
-        # MCP·로컬·명칭검색에 없는 규정을 번들 본문으로 보강(결과 뒤에 덧붙임 —
-        # MCP 순위는 유지). MCP 가 놓친 규정의 커버리지만 채운다.
-        present = {_norm_key(_item_title(it)) for it in (merged.get("structured") or [])}
-        present |= {_norm_key(h.get("title", "")) for h in (merged.get("name_matches") or [])}
-        cat = _catalog_reg_hits(query, present)
-        if cat:
-            merged["structured"] = (merged.get("structured") or []) + cat
-        return jsonify(merged)
-    except (req_lib.exceptions.Timeout,
-            req_lib.exceptions.ConnectionError) as e:
-        # MCP 서버가 죽어도 번들된 규정 본문으로 계속 검색되도록 한다
-        return jsonify(_local_only_search(
-            query, local_hits, f"사규 MCP 서버 연결 실패: {e}"))
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify(_local_only_search(query, local_hits, str(e)))
-
-
-@app.route("/api/internal/doc")
-def internal_doc():
-    """내규 전문 조회 — 규정명을 질의로 MCP를 호출해 해당 규정의 전문 텍스트 반환."""
-    name = request.args.get("name", "").strip()
-    doc_id = request.args.get("id", "").strip()
-    if not name:
-        return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-
-    # 업로드로 등록된 개정 내규는 로컬 본문을 최신본으로 사용(MCP 왕복 없음)
-    m_local = _find_reg_original(name)
-    local_text = _local_reg_text(m_local.get("slug", "")) if m_local else ""
-    if local_text and m_local.get("uploaded_at"):
-        return jsonify({"success": True, "name": m_local.get("title", name),
-                        "tool": "local-upload", "is_full": True,
-                        "text": local_text, "structured": None,
-                        "source": "upload", "revision": m_local.get("revision", ""),
-                        "uploaded_at": m_local.get("uploaded_at", "")})
-
-    # 정확한 규정명이 로컬(번들/업로드)에 있으면 그 본문을 MCP보다 우선한다.
-    # 외부 MCP의 유사명 검색이 '감사규정' → '감사규정 시행세칙'처럼 접두어가
-    # 같은 다른 규정으로 잘못 연결하는 것을 원천 차단한다(업로드 개정본은 위에서 처리).
-    m_exact = _find_reg_exact(name)
-    if m_exact:
-        body = _reg_body_text(m_exact.get("slug", ""))
-        if body and len(body) >= 40:
-            return jsonify({"success": True, "name": m_exact.get("title", name),
-                            "tool": "local-html", "is_full": True,
-                            "text": body, "structured": None, "source": "local",
-                            "revision": m_exact.get("revision", "")})
-
-    # 번들된 규정 HTML 본문으로 전문을 구성(오프라인/무MCP 리더 지원).
-    def _local_doc():
-        if not m_local:
-            return None
-        body = _reg_body_text(m_local.get("slug", ""))
-        if not body or len(body) < 40:
-            return None
-        return {"success": True, "name": m_local.get("title", name),
-                "tool": "local-html", "is_full": True,
-                "text": body, "structured": None, "source": "local",
-                "revision": m_local.get("revision", "")}
-
-    if not SAGYU_MCP_URL:
-        doc = _local_doc()
-        if doc:
-            return jsonify(doc)
-        return jsonify({"error": "사규 MCP 서버가 설정되지 않았습니다(SAGYU_MCP_URL)."}), 503
-    try:
-        cli = _McpClient(SAGYU_MCP_URL)
-        cli.initialize()
-        tools = cli.list_tools()
-        # 전문 조회 도구 우선 → 없으면 검색 도구 폴백
-        doc_tool = _mcp_pick_doc_tool(tools)
-        if doc_tool:
-            args = _mcp_build_doc_args(doc_tool, name, doc_id)
-            tool = doc_tool
-        else:
-            tool = _mcp_pick_search_tool(tools)
-            if not tool:
-                return jsonify({"error": "사규 MCP에서 사용 가능한 도구가 없습니다."}), 502
-            args = _mcp_build_args(tool, name)
-        result = cli.call_tool(tool.get("name"), args)
-        text = _mcp_extract_text(result)
-        structured = result.get("structuredContent") if isinstance(result, dict) else None
-        if isinstance(result, dict) and result.get("isError"):
-            doc = _local_doc()                       # MCP 오류 시 번들 본문으로
-            if doc:
-                return jsonify(doc)
-            return jsonify({"error": text or "내규 전문 조회 중 오류가 발생했습니다."}), 502
-        # MCP 가 빈 응답이면 번들 본문으로 보완
-        if not (text or "").strip() and not structured:
-            doc = _local_doc()
-            if doc:
-                return jsonify(doc)
-        return jsonify({"success": True, "name": name, "tool": tool.get("name"),
-                        "is_full": bool(doc_tool), "text": text, "structured": structured})
-    except req_lib.exceptions.Timeout:
-        doc = _local_doc()
-        if doc:
-            return jsonify(doc)
-        return jsonify({"error": "사규 MCP 서버 응답 시간 초과"}), 504
-    except Exception as e:
-        doc = _local_doc()
-        if doc:
-            doc["mcp_error"] = str(e)
-            return jsonify(doc)
-        return jsonify({"error": f"내규 전문 조회 오류: {e}"}), 500
-
-
-# ── 내규 전체 목록 (사이드바 트리용) ──────────────────────────────────────
-_MCP_LIST_HINTS = ("list", "목록", "all", "전체", "index", "catalog", "browse", "리스트")
-
-def _mcp_pick_list_tool(tools: list):
-    """전체 목록 조회 도구 우선 선택(list/목록/index 등). 없으면 None."""
-    def score(t):
-        blob = (str(t.get("name", "")) + " " + str(t.get("description", ""))).lower()
-        s = 0
-        if any(k in blob for k in _MCP_LIST_HINTS): s += 4
-        if any(k in blob for k in _MCP_RULE_HINTS): s += 2
-        if "search" in blob or "검색" in blob or "get" in blob: s -= 1
-        return s
-    if not tools:
-        return None
-    ranked = sorted(tools, key=score, reverse=True)
-    return ranked[0] if score(ranked[0]) > 0 else None
-
-
-# 규정명으로 볼 수 있는 접미어 (목록 추출용)
-_RULE_NAME_SUFFIX = ("정관", "규정", "규칙", "예규", "지침", "세칙", "기준",
-                     "요령", "매뉴얼", "메뉴얼", "지시", "훈령", "방침", "계획")
-# 규정명에 있으면 문장·설명 조각으로 판단(제외)
-_RULE_NAME_BAD = ("예시", "이하", "한다", "말한다", "된다", "따른다", "이란",
-                  "삭제", "추가", "신설", "경우", "다음", "또는", "관리번호",
-                  "에 따라", "에 따른", "하는 것",
-                  # 본문·부칙에서 딸려오는 설명형 조각(규정명이 아님)
-                  "관련", "참고", "제반", "별칙", "시행일", "각종", "상기", "해당")
-# 규정명 앞머리에 "수식어 + 공백"으로 오면 조각으로 판단(예: "동 규정", "위 규정").
-# 공백을 요구하므로 '위임전결규정'·'위원회운영규정' 등은 영향받지 않음.
-_RULE_FRAG_PREFIX_RE = re.compile(r"^(?:해당|상기|동|본|위|기타|다음|각|별첨|별표|별지)\s+\S")
-# 선행 불릿/리스트 마커 (반복 제거)
-_RULE_MARKER_RE = re.compile(
-    r"^\s*(?:\[\d+\]|\d+\s*[.)]|[가-힣]\s*[.)]|[①-⑳㉠-㉭]|"
-    r"[-–—*○◯●■□▪▶▷◆◇◦·•※☆★✓❍→▶️])\s*")
-# 정관은 기관당 1개 — 옛 명칭/약칭 등 본문 인용에서 딸려오는 정관명은 제외(KOAT 특화)
-_STALE_ORG_TOKENS = ("농업기술실용화재단", "실용화재단", "농업기술실용화농진원", "농진원")
-
-def _norm_rule_name(nm: str) -> str:
-    """규정명 후보 정규화 — 주석 괄호/마커/예시 라벨 제거."""
-    if not nm:
-        return ""
-    nm = nm.strip()
-    # 선행 불릿/마커 반복 제거(■ □ ○ 가) 1) ① 등)
-    for _ in range(4):
-        new = _RULE_MARKER_RE.sub("", nm)
-        if new == nm:
-            break
-        nm = new.strip()
-    nm = nm.strip("《》「」『』[]•·-*").strip()
-    # "… 예시:" / "… 예:" 라벨 앞부분 제거
-    nm = re.sub(r"^.*?(?:예시|보기|예)\s*[:：]\s*", "", nm).strip()
-    # 첫 괄호/따옴표/마커/콜론 이후 잘라 제목 stem 만 취득
-    nm = re.split(r"[(（「『《》」』:：\"'”“]", nm)[0].strip()
-    # 접속/조사 꼬리 정리
-    nm = re.sub(r"\s*(?:및|또는|와|과|의)\s*$", "", nm).strip()
-    return nm
-
-def _is_valid_rule_name(nm: str) -> bool:
-    if not nm or not (3 <= len(nm) <= 40):
-        return False
-    if nm in _RULE_NAME_SUFFIX:            # 맨 접미어(일반명사)
-        return False
-    if not nm.endswith(_RULE_NAME_SUFFIX):
-        return False
-    if any(bad in nm for bad in _RULE_NAME_BAD):
-        return False
-    # 수식어 + 공백으로 시작하는 조각("동 규정", "위 규정" 등) 제외
-    if _RULE_FRAG_PREFIX_RE.match(nm):
-        return False
-    if re.search(r"[.。]", nm):
-        return False
-    # 정관: 옛 명칭·약칭 인용은 실제 내규가 아님
-    if nm.endswith("정관") and any(tok in nm for tok in _STALE_ORG_TOKENS):
-        return False
-    return True
-
-def _extract_rule_names(text: str, structured) -> list:
-    """MCP 응답(구조화/텍스트)에서 서로 다른 규정명 목록을 정규화·검증하여 추출."""
-    names = []
-    seen = set()
-    def add(raw):
-        nm = _norm_rule_name(raw)
-        if not _is_valid_rule_name(nm):
-            return
-        key = nm.replace(" ", "")          # 띄어쓰기 차이 중복 제거
-        if key in seen:
-            return
-        seen.add(key); names.append(nm)
-    if isinstance(structured, list):
-        for it in structured:
-            if isinstance(it, dict):
-                add(it.get("title") or it.get("name") or it.get("규정명") or it.get("제목"))
-            elif isinstance(it, str):
-                add(it)
-    if text:
-        # 1) 《규정명》 / 「규정명」 마커
-        for m in re.findall(r"[《「『]\s*([^》」』\n]{2,60})\s*[》」』]", text):
-            add(m)
-        # 2) 접미어로 끝나는 짧은 라인 (목록 텍스트)
-        for line in text.splitlines():
-            t = re.sub(r"^\s*(?:\[\d+\]|\d+[.)]|[-*○·•])\s*", "", line).strip()
-            if 3 <= len(t) <= 40 and t.endswith(_RULE_NAME_SUFFIX):
-                add(t)
-    return names
-
-
-# 내규 목록 캐시 (전체 수집 비용이 크므로 10분 캐시)
-_INTERNAL_LIST_CACHE: dict = {"names": None, "ts": 0.0}
-# 광역 검색 시드 (규정 접미어 + 행정 도메인 키워드)
-_LIST_SEED_TERMS = _RULE_NAME_SUFFIX + (
-    "인사", "보수", "복무", "여비", "회계", "재무", "예산", "자금", "계약", "감사",
-    "보안", "정보", "개인정보", "연구", "기술", "사업", "조직", "위임전결", "이사회",
-    "교육", "출장", "자산", "물품", "복리후생", "윤리", "성과", "용역", "공사", "안전",
-    "채용", "급여", "휴가", "징계", "위원회", "직제", "문서", "정관", "특허", "발명",
-)
-
-def _mcp_fill_limits(tool, args, big=1000):
-    """도구 스키마의 limit/size/count/display류 숫자 인자를 크게 채운다."""
-    props = (tool.get("inputSchema") or tool.get("input_schema") or {}).get("properties") or {}
-    for k, p in props.items():
-        kl = k.lower()
-        ty = p.get("type")
-        isnum = ty in ("integer", "number") or (isinstance(ty, list) and ("integer" in ty or "number" in ty))
-        if isnum and any(x in kl for x in ("limit", "size", "count", "max", "per", "display", "top", "num", "rows")):
-            args.setdefault(k, big)
-    return args
-
-def _mcp_page_key(tool):
-    props = (tool.get("inputSchema") or {}).get("properties") or {}
-    for k in props:
-        kl = k.lower()
-        if any(x in kl for x in ("page", "offset", "cursor", "start", "skip")):
-            return k
-    return None
-
-def _harvest_internal_names(cli, tools):
-    """가능한 많은 규정명을 수집 — 목록도구(페이지네이션) + 광역 검색."""
-    names, seen = [], set()
-    def add(nm_list):
-        for nm in nm_list:
-            if nm not in seen:
-                seen.add(nm); names.append(nm)
-    def call_names(tool, extra):
-        args = _mcp_fill_limits(tool, dict(extra))
-        res = cli.call_tool(tool.get("name"), args)
-        return _extract_rule_names(_mcp_extract_text(res),
-                                   res.get("structuredContent") if isinstance(res, dict) else None)
-
-    calls = 0
-    MAX_CALLS = 45
-    # 1) 목록 도구 (있으면) — 페이지네이션
-    list_tool = _mcp_pick_list_tool(tools)
-    if list_tool:
-        props = (list_tool.get("inputSchema") or {}).get("properties") or {}
-        required = (list_tool.get("inputSchema") or {}).get("required") or []
-        base = {}
-        for k in required:
-            if props.get(k, {}).get("type") == "string":
-                base[k] = "규정"   # 필수 질의가 있으면 광역어
-        pk = _mcp_page_key(list_tool)
-        for pg in range(0, 20):
-            if calls >= MAX_CALLS: break
-            extra = dict(base)
-            if pk is not None:
-                extra[pk] = (pg + 1) if "page" in pk.lower() else pg * 100
-            before = len(seen)
-            try:
-                add(call_names(list_tool, extra)); calls += 1
-            except Exception as e:
-                print(f"[list] 목록도구 오류(p={pg}): {e}"); break
-            if pk is None or len(seen) == before:
-                break   # 페이지 파라미터 없음 또는 더 이상 증가 없음
-
-    # 2) 검색 도구로 광역 수집(부족하거나 목록도구 없을 때)
-    stool = _mcp_pick_search_tool(tools)
-    if stool and len(names) < 140:
-        dry = 0
-        for q in _LIST_SEED_TERMS:
-            if calls >= MAX_CALLS: break
-            before = len(seen)
-            try:
-                add(call_names(stool, _mcp_build_args(stool, q))); calls += 1
-            except Exception:
-                pass
-            dry = dry + 1 if len(seen) == before else 0
-    # 파일명(규정명) 기준 정렬 — 한글 사전순
-    names.sort(key=lambda n: (n or "").strip())
-    print(f"[internal-list] 수집 {len(names)}건 (calls={calls})")
-    return names
-
-
-# 원본(정관/규정/규칙/세칙/예규/매뉴얼) 분류 표시 순서
-_REG_CAT_ORDER = ("정관", "규정", "규칙", "세칙", "예규", "매뉴얼")
-
-
-@app.route("/api/internal/list")
-def internal_list():
-    """내규 전체 목록 — 업로드 원본(regulations_manifest.json)을 기준으로 제공.
-
-    MCP 검색 텍스트에서 이름을 수집하면 본문에 인용된 정부 지침·법령까지 섞이므로,
-    실제 내규 원본 파일 목록을 정본으로 쓴다. 원본이 없을 때만 MCP 수집으로 대체.
-    """
-    man = _load_reg_manifest()
-    if man:
-        items, seen = [], set()
-        for m in man:
-            t = (m.get("title") or "").strip()
-            if not t or _norm_key(t) in seen:
-                continue
-            seen.add(_norm_key(t))
-            items.append({"title": t,
-                          "category": (m.get("category") or "기타").strip(),
-                          "revision": (m.get("revision") or "").strip(),
-                          "slug": m.get("slug", "")})
-        order = {c: i for i, c in enumerate(_REG_CAT_ORDER)}
-        items.sort(key=lambda x: (order.get(x["category"], 99), x["title"]))
-        return jsonify({"success": True, "count": len(items),
-                        "names": [x["title"] for x in items],
-                        "items": items, "source": "originals",
-                        "categories": list(_REG_CAT_ORDER)})
-    # ── 원본 목록이 없을 때만 MCP 수집(하위 호환) ──
-    if not SAGYU_MCP_URL:
-        return jsonify({"error": "사규 MCP 서버가 설정되지 않았습니다(SAGYU_MCP_URL)."}), 503
-    force = request.args.get("t", "")  # 캐시 무시용 파라미터
-    if not force and _INTERNAL_LIST_CACHE["names"] and (time.time() - _INTERNAL_LIST_CACHE["ts"] < 600):
-        nm = _INTERNAL_LIST_CACHE["names"]
-        return jsonify({"success": True, "count": len(nm), "names": nm, "cached": True,
-                        "source": "mcp"})
-    try:
-        cli = _McpClient(SAGYU_MCP_URL)
-        cli.initialize()
-        tools = cli.list_tools()
-        names = _harvest_internal_names(cli, tools)
-        if names:
-            _INTERNAL_LIST_CACHE["names"] = names
-            _INTERNAL_LIST_CACHE["ts"] = time.time()
-        return jsonify({"success": True, "count": len(names), "names": names,
-                        "source": "mcp"})
-    except req_lib.exceptions.Timeout:
-        return jsonify({"error": "사규 MCP 서버 응답 시간 초과"}), 504
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": f"내규 목록 조회 오류: {e}"}), 500
-
-
-@app.route("/api/recent")
-def get_recent():
-    return jsonify({"recent": recent_searches})
-
-@app.route("/api/recent/add")
-def add_recent_api():
-    q = request.args.get("q", "").strip()
-    if q:
-        add_recent(q)
-    return jsonify({"ok": True})
 
 
 @app.route("/api/ping")
 def ping():
-    """서버 생존 확인 - 빠른 응답 (법제처 API 호출 없음)"""
+    """서버 생존 확인"""
     return jsonify({"server": True, "ok": True})
 
 
-@app.route("/api/law_check")
-def law_check():
-    """법제처 API 연결 확인 - 별도 비동기 호출용"""
-    try:
-        # 1) JSON 검색 확인 (기본)
-        data = _law_get_json(
-            {"target": "law", "query": "농지법", "display": "1"},
-            timeout=(5, 15),
-        )
-        message = data.get("LawSearch", {}).get("message", "")
-        if message:
-            return jsonify({"law_api": False, "message": f"법제처 응답 메시지: {message}"})
-
-        laws = data.get("LawSearch", {}).get("law")
-        if laws:
-            return jsonify({"law_api": True})
-
-        # 2) JSON 결과가 비어 있으면 XML 조회로 재검증
-        root = _law_get_xml(
-            "lawSearch.do",
-            {"target": "law", "query": "농지법", "display": "1"},
-            timeout=(5, 15),
-        )
-        has_result = bool(root.findall(".//law") or root.findall(".//법령"))
-        return jsonify({"law_api": has_result})
-    except Exception as e:
-        return jsonify({"law_api": False, "message": str(e)})
-
-
-@app.route("/api/debug/law")
-def debug_law_xml():
-    if os.environ.get("DEBUG_ENDPOINTS") != "1":
-        return jsonify({"error": "not found"}), 404
-    name = request.args.get("name", "").strip()
-    mst  = request.args.get("mst", "").strip()
-    try:
-        if name:
-            mst = _get_mst(name)
-        if not mst:
-            return "mst 또는 name 파라미터 필요", 400
-        for param in ("MST", "ID"):
-            r = req_lib.get(f"{BASE}/lawService.do",
-                            params={"OC": OC, "target": "law", "type": "XML", param: mst},
-                            headers=HEADERS, timeout=15, verify=False)
-            text = _decode(r.content)
-            if "없습니다" not in text:
-                return Response(text, mimetype="text/xml; charset=utf-8")
-        return Response(text, mimetype="text/xml; charset=utf-8")
-    except Exception as e:
-        return str(e), 500
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# 업무 도우미 — 공공 API 프록시 (기업/특허/지원사업/조달)
-# 서비스키는 환경변수로 주입한다. 키 미설정 시 need_key 응답으로 UI가 안내한다.
-#   DART_API_KEY    : DART 오픈API — 기업 회사명 검색·기업개황·재무 요약
-#   DATA_GO_KR_KEY  : 공공데이터포털 서비스키 (국세청 사업자상태·나라장터 입찰공고·지원사업)
-#   KIPRIS_API_KEY  : 키프리스 플러스 서비스키 (특허·상표·디자인)
-#   BIZINFO_API_KEY : 공공데이터포털(기업마당·중소벤처기업부) 인증키 (정부 지원사업 공고)
-#   PATENT_REG_API_KEY : 공공데이터포털 지식재산처 '등록원부 실시간 정보조회'(15124946) 서비스키
-#                        — 특허 상세의 등록원부(권리자·연차·권리변동) 표시. 미설정 시 DATA_GO_KR_KEY 폴백.
-# 기업조회는 DART(회사명 검색)와 공공데이터포털(국세청 사업자상태)을 함께 활용한다.
+# 서무비서 — 서무 규정·지침·서식을 담아 두고, 상황을 말하면 절차·기한·서식·근거를 안내
+#   공통(secretary/procedures.json, 저장소 기본 탑재) → 기관(secretary/org.json, 관리자 등록)
+#   → 개인 보충(브라우저 localStorage) 세 층으로 관리한다. 근거 조문은 번들 내규 원문에서 뽑는다.
+#
+#   다른 기관에서 쓰려면: secretary/config.json(기관명·명칭·규정명 매핑·휴일)을 바꾸고
+#   자기 내규를 regulations/ 에 올린다(scripts/import_regs.py). 절차의 규정명은
+#   매핑 → 정확 일치 → 기관명 접두어 제거 → 포함 관계 순으로 그 기관 규정에 연결된다.
 # ══════════════════════════════════════════════════════════════════════════
-_ASSIST_ENV = {"company": "DART_API_KEY", "patent": "KIPRIS_API_KEY",
-               "support": "DATA_GO_KR_KEY", "procurement": "DATA_GO_KR_KEY"}
-_ASSIST_APPLY = {
-    "company":     "https://www.data.go.kr/data/15043184/openapi.do",
-    "patent":      "https://plus.kipris.or.kr/portal/main/main.do",
-    "support":     "https://www.data.go.kr/data/15125364/openapi.do",
-    "procurement": "https://www.data.go.kr/data/15129394/openapi.do",
-}
-_ASSIST_PROVIDER = {
-    "company": "공공데이터포털(금융위·국세청)", "patent": "특허청 KIPRIS",
-    "support": "공공데이터포털(K-Startup)", "procurement": "공공데이터포털(나라장터)",
+SEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secretary")
+SEC_COMMON_PATH = os.path.join(SEC_DIR, "procedures.json")
+SEC_ORG_PATH = os.path.join(SEC_DIR, "org.json")
+SEC_ORG_REPO_PATH = "secretary/org.json"
+SEC_CONFIG_PATH = os.environ.get("SECRETARY_CONFIG", "").strip() or os.path.join(SEC_DIR, "config.json")
+SEC_CONFIG_REPO_PATH = "secretary/config.json"
+SEC_HOLIDAYS_PATH = os.path.join(SEC_DIR, "holidays.json")
+_SEC_ORG_CACHE: dict = {"ts": 0.0, "data": None}
+_SEC_CFG_CACHE: dict = {"ts": 0.0, "data": None}
+_SEC_CHUNKS = None            # [(title, no, art_title, body)] — 근거 조문·관련 조문 검색용(모듈 캐시)
+_SEC_ART_INDEX = None         # {(norm 규정명, 조번호): (title, no, art_title, text)}
+_SEC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{1,47}$")
+_SEC_ACT_KINDS = {"proc"}          # 단계 바로가기는 다른 절차로의 이동만 허용
+_SEC_TERM_KEYS = ("erp", "portal", "accounting", "approval")
+_SEC_CFG_DEFAULT = {
+    "schema_version": 1,
+    "org": {"name": "한국농업기술진흥원", "short": "KOAT", "abbr": "농진원"},
+    "service": {"title": "서무비서", "icon": "🗂", "primary": "#256ef4",
+                "tagline": "출장·물품·행사·복무·결재 — 상황을 말하면 절차·기한·서식·근거 안내",
+                "footer": "근거 조문은 기관 현행 내규 원문을 기준으로 안내합니다. 최종 판단은 원문과 담당 부서 확인을 거쳐 주세요."},
+    # 절차 문장 속 [[erp]] 같은 자리표시를 기관 명칭으로 바꾼다
+    "terms": {"erp": "ERP", "portal": "내부 포털", "accounting": "회계부서", "approval": "전자결재"},
+    # 절차가 가리키는 규정명 → 우리 기관 규정명
+    "reg_aliases": {},
+    # 기본 공휴일(holidays.json) 외 기관 휴일(창립기념일 등) 추가·제외
+    "holidays": {"extra": [], "exclude": []},
 }
 
-def _fmtbno_disp(b):
-    """사업자등록번호 숫자 → 000-00-00000 표기."""
-    b = re.sub(r"\D", "", str(b or ""))
-    return f"{b[:3]}-{b[3:5]}-{b[5:]}" if len(b) == 10 else b
 
-def _fmtymd(v):
-    """YYYYMMDD → YYYY-MM-DD (그 외는 원본)."""
-    v = re.sub(r"\D", "", str(v or ""))
-    return f"{v[:4]}-{v[4:6]}-{v[6:8]}" if len(v) >= 8 else v
-
-def _dgk_key() -> str:
-    """공공데이터포털 서비스키(Decoding 형태로 정규화).
-
-    data.go.kr은 Decoding/Encoding 두 형태 키를 발급한다. Encoding 키(%2B·%2F·%3D
-    포함)를 그대로 requests params로 넘기면 이중 인코딩되어 인증 실패한다.
-    퍼센트 인코딩이 보이면 한 번 unquote 해 Decoding 형태로 맞춘다(requests가
-    한 번만 인코딩하도록)."""
-    k = (os.environ.get("DATA_GO_KR_KEY", "") or "").strip()
-    if k and re.search(r"%[0-9A-Fa-f]{2}", k):
-        try:
-            return unquote(k)
-        except Exception:
-            return k
-    return k
-
-def _assist_key(kind: str) -> str:
-    # 기업조회는 공공데이터포털(회사명·사업자상태) 우선, DART는 선택(재무 보강).
-    if kind == "company":
-        return (_dgk_key() or _dart_key())
-    if kind in ("support", "procurement"):
-        return _dgk_key()
-    return (os.environ.get(_ASSIST_ENV.get(kind, ""), "") or "").strip()
-
-def _assist_need_key(kind: str):
-    return jsonify({"success": False, "need_key": True,
-                    "provider": _ASSIST_PROVIDER.get(kind, ""),
-                    "apply_url": _ASSIST_APPLY.get(kind, ""),
-                    "message": "서비스키가 설정되지 않았습니다. 관리자에게 문의하거나 "
-                               "환경변수를 설정하세요."})
-
-@app.route("/api/assist/status")
-def assist_status():
-    """각 조회 기능의 서비스키 설정 여부(배지 표시용).
-
-    ?debug=1 이면 배포 환경이 실제로 인식하는 환경변수 존재 여부(값이 아닌 bool)도
-    함께 반환한다 — 배포 후 '조회 안 됨' 원인(키 스코프/리디플로이) 진단용.
-    """
-    out = {k: bool(_assist_key(k))
-           for k in ("company", "patent", "support", "procurement")}
-    if request.args.get("debug"):
-        out["keys"] = {name: bool((os.environ.get(name, "") or "").strip())
-                       for name in ("DART_API_KEY", "DATA_GO_KR_KEY",
-                                    "KIPRIS_API_KEY", "BIZINFO_API_KEY", "LAW_OC")}
-    return jsonify(out)
-
-def _nts_status(bno):
-    """국세청 사업자등록 상태(계속/휴업/폐업) — DATA_GO_KR_KEY 있을 때만."""
-    gk = _dgk_key()
-    bno = re.sub(r"\D", "", bno or "")
-    if not gk or len(bno) != 10:
-        return {}
+def _sec_read_json(path: str, default):
     try:
-        r = _SESSION.post("https://api.odcloud.kr/api/nts-businessman/v1/status",
-                          params={"serviceKey": gk}, json={"b_no": [bno]}, timeout=12)
-        rows = (r.json() or {}).get("data") or []
-        if rows:
-            row = rows[0]
-            return {"납세자 상태": row.get("b_stt") or "", "과세유형": row.get("tax_type") or "",
-                    "폐업일": row.get("end_dt") or ""}
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        pass
-    return {}
+        return default
 
-# ── DART(금융감독원 전자공시) 보조 조회 ─────────────────────────────────────
-# 상장·외부감사 대상 법인의 재무정보·기업개황을 회사명으로 매칭해 함께 보여준다.
-# DART_API_KEY(opendart 인증키) 미설정 시 이 블록은 조용히 건너뛴다.
-_DART_CORP = {"map": None, "at": 0.0, "http": 0, "err": "", "snippet": "", "n": 0}
-_DART_LOCK = threading.Lock()
-_DART_KEYACCTS = ["매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계"]
 
-def _dart_key():
-    return (os.environ.get("DART_API_KEY", "") or "").strip()
-
-def _dart_norm(s):
-    """상호 정규화 — 법인격 표기·공백 제거 후 소문자."""
-    s = unicodedata.normalize("NFKC", str(s or ""))
-    s = re.sub(r"주식회사|유한회사|유한책임회사|합자회사|합명회사|재단법인|사단법인|\(주\)|㈜|\(유\)|㈜", "", s)
-    return re.sub(r"\s+", "", s).lower()
-
-def _dart_fresh():
-    """캐시 유효 판단 — 성공(비어있지 않음) 24h, 실패(빈 맵) 60s만 유지."""
-    mp = _DART_CORP["map"]
-    if mp is None:
-        return False
-    age = time.time() - _DART_CORP["at"]
-    return (age < 86400) if mp else (age < 60)
-
-def _dart_corp_map(key):
-    """corpCode.xml(zip) 1회 로드 → 정규화상호별 후보 목록. 성공 24h/실패 60s 캐시.
-    실패 원인(HTTP 상태·예외·응답 앞부분)은 _DART_CORP에 기록(진단용)."""
-    if _dart_fresh():
-        return _DART_CORP["map"]
-    with _DART_LOCK:
-        if _dart_fresh():
-            return _DART_CORP["map"]
-        m, http, err, snippet = {}, 0, "", ""
-        r = None
-        try:
-            r = _SESSION.get("https://opendart.fss.or.kr/api/corpCode.xml",
-                             params={"crtfcKey": key}, timeout=30)
-            http = r.status_code
-            zf = zipfile.ZipFile(_io.BytesIO(r.content))
-            root = _xml_fromstring(zf.read(zf.namelist()[0]))
-            for el in root.iter("list"):
-                cc = (el.findtext("corp_code") or "").strip()
-                nm = (el.findtext("corp_name") or "").strip()
-                sk = (el.findtext("stock_code") or "").strip()
-                if not cc or not nm:
-                    continue
-                m.setdefault(_dart_norm(nm), []).append((cc, nm, sk))
-        except Exception as e:
-            m = {}
-            err = f"{type(e).__name__}: {e}"
-            try:                              # zip 아니면 대개 DART 오류 XML/JSON 본문
-                snippet = (r.content[:300].decode("utf-8", "replace") if r is not None else "")
+def _sec_layer_load(cache: dict, repo_path: str, local_path: str, force: bool = False):
+    """저장소 파일(기관 층·설정). GitHub 연동 시 저장소 최신본(60초 캐시) — 배포 전에도 방금 저장한 값이 보이게."""
+    if not force and cache["data"] is not None and time.time() - cache["ts"] < 60:
+        return cache["data"]
+    data = None
+    if _gh_enabled():
+        raw = _gh_file(repo_path)
+        if raw:
+            try:
+                data = json.loads(raw.decode("utf-8"))
             except Exception:
-                snippet = ""
-        _DART_CORP.update(map=m, at=time.time(), http=http, err=err,
-                          snippet=snippet, n=len(m))
-        return m
+                data = None
+    if data is None:
+        data = _sec_read_json(local_path, {})
+    data = data if isinstance(data, dict) else {}
+    cache.update({"ts": time.time(), "data": data})
+    return data
 
-def _dart_find_corp(key, name):
-    """회사명 → (corp_code, corp_name, stock_code). 상장기업 우선, 정확 매칭만."""
-    cand = _dart_corp_map(key).get(_dart_norm(name)) or []
-    if not cand:
-        return None
-    listed = [c for c in cand if c[2]]        # stock_code 있는(상장) 후보 우선
-    return (listed or cand)[0]
 
-def _dart_search(key, q, limit=30):
-    """회사명(부분일치) → DART 후보 [(corp_code, corp_name, stock_code)].
-    정확 일치 → 부분 일치 순, 상장(종목코드 보유) 우선·상호 짧은 순."""
-    nq = _dart_norm(q)
-    if not nq:
-        return []
-    m = _dart_corp_map(key)
-    hits, seen = [], set()
-    for c in (m.get(nq) or []):               # 정확 일치 우선
-        if c[0] not in seen:
-            hits.append(c); seen.add(c[0])
-    for norm, lst in m.items():               # 부분 일치 보강
-        if norm == nq or nq not in norm:
+def _sec_org_load(force: bool = False) -> dict:
+    data = _sec_layer_load(_SEC_ORG_CACHE, SEC_ORG_REPO_PATH, SEC_ORG_PATH, force)
+    data.setdefault("procedures", [])
+    data.setdefault("drafts", {})
+    return data
+
+
+def _sec_config(force: bool = False) -> dict:
+    """기관 설정 = 기본값 위에 config.json 을 얕게(섹션 단위) 덮어쓴 값."""
+    raw = _sec_layer_load(_SEC_CFG_CACHE, SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, force)
+    cfg = json.loads(json.dumps(_SEC_CFG_DEFAULT))
+    for k, v in raw.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict) and k != "reg_aliases":
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+
+def _sec_clean_str(v, n: int = 400) -> str:
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v or "")).strip()[:n]
+
+
+def _sec_ref_list(arr, n=6):
+    out = []
+    for b in (arr or [])[:n]:
+        if not isinstance(b, dict) or not _sec_clean_str(b.get("reg"), 80):
             continue
-        for c in lst:
-            if c[0] not in seen:
-                hits.append(c); seen.add(c[0])
-        if len(hits) >= limit * 4:
-            break
-    hits.sort(key=lambda c: (0 if c[2] else 1, len(c[1] or "")))
-    return hits[:limit]
-
-def _num(v):
-    try:
-        return int(re.sub(r"[^\d-]", "", str(v)))
-    except Exception:
-        return None
-
-def _dart_financials(key, corp_code):
-    """단일회사 주요계정(최근 사업연도) — 연결 우선, 없으면 재무제표."""
-    now = datetime.now()
-    for yr in (now.year - 1, now.year - 2):
-        try:
-            r = _SESSION.get("https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-                             params={"crtfcKey": key, "corp_code": corp_code,
-                                     "bsns_year": str(yr), "reprt_code": "11011"},
-                             timeout=15)
-            d = r.json() or {}
-        except Exception:
-            continue
-        if d.get("status") != "000":
-            continue
-        rows = d.get("list") or []
-        fs = "CFS" if any(x.get("fs_div") == "CFS" for x in rows) else "OFS"
-        picked = {}
-        for x in rows:
-            if x.get("fs_div") != fs:
-                continue
-            nm = (x.get("account_nm") or "").strip()
-            if nm in _DART_KEYACCTS and nm not in picked:
-                picked[nm] = {"name": nm,
-                              "cur": _num(x.get("thstrm_amount")),
-                              "prev": _num(x.get("frmtrm_amount"))}
-        items = [picked[n] for n in _DART_KEYACCTS if n in picked]
-        if items:
-            return {"year": str(yr), "report": "사업보고서",
-                    "fs": "연결" if fs == "CFS" else "개별/별도", "items": items}
-    return None
-
-_DART_CLS = {"Y": "유가증권시장 상장", "K": "코스닥 상장", "N": "코넥스 상장", "E": "기타(외부감사 등)"}
-_DART_COMPANY_FIELDS = {      # company.json 필드 → 그리드 라벨
-    "corp_name": "상호", "corp_name_eng": "영문상호", "ceo_nm": "대표자",
-    "corp_cls": "법인구분", "jurir_no": "법인등록번호",
-    "adres": "주소", "hm_url": "홈페이지", "phn_no": "전화번호", "fax_no": "팩스",
-    "induty_code": "업종코드", "est_dt": "설립일", "acc_mt": "결산월",
-    "stock_name": "종목명", "stock_code": "종목코드",
-}
-# 상세 그리드 표시 순서(라벨 기준). 없는 라벨은 건너뛴다.
-_COMP_GRID_ORDER = ["상호", "영문상호", "대표자", "사업자등록번호", "법인등록번호",
-                    "법인구분", "상장여부", "상장시장", "종목명", "종목코드",
-                    "주요사업", "업종코드", "종업원수", "설립일", "결산월",
-                    "납세자 상태", "과세유형", "폐업일", "감사인", "주거래은행",
-                    "주소", "전화번호", "팩스", "홈페이지", "공시(DART)"]
-
-# ── 금융위원회 기업기본정보(공공데이터포털) — 회사명 검색 주 소스 ──────────────
-# apis.data.go.kr/1160100/service/GetCorpBasicInfoService_V2/getCorpOutline_V2
-# 회사명(corpNm)·법인등록번호(crno)로 조회. DATA_GO_KR_KEY 사용.
-_FSC_BASE = ("https://apis.data.go.kr/1160100/service/"
-             "GetCorpBasicInfoService_V2/getCorpOutline_V2")
-_FSC_FIELDS = {              # getCorpOutline_V2 필드 → 그리드 라벨
-    "corpNm": "상호", "corpEngNm": "영문상호", "enpRprfNm": "대표자",
-    "corpRegMrktDcdNm": "상장시장", "enpMainBizNm": "주요사업",
-    "enpEmpeCnt": "종업원수", "enpEstbDt": "설립일", "enpStacMm": "결산월",
-    "enpBsadr": "주소", "enpTlno": "전화번호", "enpFxno": "팩스",
-    "enpHmpgUrl": "홈페이지", "actnAudpnNm": "감사인", "enpMntrBnkNm": "주거래은행",
-}
-
-def _fsc_company(key, corp_nm=None, crno=None, rows="30"):
-    """금융위 기업기본정보 조회 → (records list | None, requests.Response).
-    corpNm(회사명, 부분검색) 또는 crno(법인등록번호)로 조회. 비 JSON이면 None."""
-    params = {"serviceKey": key, "pageNo": "1", "numOfRows": rows, "resultType": "json"}
-    if corp_nm:
-        params["corpNm"] = corp_nm
-    if crno:
-        params["crno"] = crno
-    r = _SESSION.get(_FSC_BASE, params=params, timeout=15)
-    try:
-        j = r.json() or {}
-    except Exception:
-        return None, r
-    items = (((j.get("response") or {}).get("body") or {}).get("items") or [])
-    if isinstance(items, dict):
-        items = items.get("item") or []
-    if isinstance(items, dict):
-        items = [items]
-    return (items if isinstance(items, list) else []), r
-
-def _fsc_labeled(rec):
-    """금융위 레코드 → 그리드 라벨 dict(+_bno/_crno)."""
-    out = {}
-    for k, lab in _FSC_FIELDS.items():
-        v = str(rec.get(k) or "").strip()
-        if not v or v in ("0", "-", "null"):
-            continue
-        if k == "enpEstbDt":
-            v = _fmtymd(v)
-        elif k == "enpStacMm":
-            mm = re.sub(r"\D", "", v)
-            v = f"{mm}월" if mm else v
-        out[lab] = v
-    bno = re.sub(r"\D", "", str(rec.get("bzno") or ""))
-    crno = re.sub(r"\D", "", str(rec.get("crno") or ""))
-    if bno:
-        out["사업자등록번호"] = _fmtbno_disp(bno); out["_bno"] = bno
-    if crno:
-        out["법인등록번호"] = crno; out["_crno"] = crno
-    mkt = str(rec.get("corpRegMrktDcdNm") or "").strip()
-    out["상장여부"] = ("상장" if mkt and mkt not in ("기타", "비상장", "해당없음", "기타법인")
-                    else "비상장")
+        r = {"reg": _sec_clean_str(b.get("reg"), 80)}
+        for k in ("art", "q", "label", "title"):
+            if b.get(k):
+                r[k] = _sec_clean_str(b.get(k), 60)
+        out.append(r)
     return out
 
-# ── 금융위원회 기업재무정보(공공데이터포털) — 요약재무제표 ────────────────────
-_FSC_FIN_BASE = ("https://apis.data.go.kr/1160100/service/"
-                 "GetFinaStatInfoService_V2/getSummFinaStat_V2")
-# 지표 라벨 → 응답 후보 필드명(버전차 대비 여러 후보). 값은 원(₩).
-_FSC_FIN_METRICS = [
-    ("매출액",   ("enpSaleAmt", "saleAmt", "revenue")),
-    ("영업이익", ("enpBzopPft", "bzopPft", "operatingProfit")),
-    ("당기순이익", ("enpCrtmNpf", "crtmNpf", "netIncome", "thstrmNpf")),
-    ("자산총계", ("enpTastAmt", "tastAmt", "totalAssets")),
-    ("부채총계", ("enpTdbtAmt", "tdbtAmt", "totalDebt", "totalLiabilities")),
-    ("자본총계", ("enpTcptAmt", "tcptAmt", "totalCapital", "totalEquity")),
-    ("자본금",   ("enpCptlAmt", "cptlAmt", "capital")),
-]
 
-def _fsc_financials(key, crno):
-    """금융위 요약재무제표(법인등록번호 기준) → DART finance와 동일 형태 dict|None."""
-    crno = re.sub(r"\D", "", str(crno or ""))
-    if not key or not crno:
+def _sec_clean_proc(p: dict) -> dict | None:
+    """관리자가 보낸 절차 1건 정규화. 허용된 필드·길이만 남긴다(화면에서 실행되는 값은 화이트리스트)."""
+    if not isinstance(p, dict):
         return None
-    try:
-        # numOfRows를 넉넉히(전 사업연도 포함) 받아야 한다. 예전에 30으로 제한하면
-        # 원천이 사업연도 오름차순으로 주는 경우 오래된 연도(개별+연결)로 30행이 차
-        # 최근 연도가 응답에서 잘려 재무가 '2021년까지'만 나오던 문제가 있었다.
-        r = _SESSION.get(_FSC_FIN_BASE, params={"serviceKey": key, "pageNo": "1",
-                         "numOfRows": "200", "resultType": "json", "crno": crno}, timeout=15)
-        j = r.json() or {}
-    except Exception:
+    pid = _sec_clean_str(p.get("id"), 48).lower()
+    title = _sec_clean_str(p.get("title"), 80)
+    if not _SEC_ID_RE.match(pid) or not title:
         return None
-    items = (((j.get("response") or {}).get("body") or {}).get("items") or [])
-    if isinstance(items, dict):
-        items = items.get("item") or []
-    if isinstance(items, dict):
-        items = [items]
-    if not isinstance(items, list) or not items:
-        return None
-    yr = lambda x: re.sub(r"\D", "", str(x.get("bizYear") or ""))[:4]
-    _is_conso = lambda x: "연결" in str(x.get("fnclDcdNm") or x.get("fnclGrpDcdNm") or "")
-    # 사업연도별 1개 행 선택 — 그 해에 연결이 있으면 연결, 없으면 개별/별도.
-    # (연결만 전역 필터하면 최근 연도가 개별만 있을 때 통째로 누락될 수 있어 연도별로 판단)
-    by_year = {}
-    for x in items:
-        y = yr(x)
-        if not y:
-            continue
-        cur = by_year.get(y)
-        if cur is None or (_is_conso(x) and not _is_conso(cur)):
-            by_year[y] = x
-    years = sorted(by_year.keys())[-5:]     # 최근 5개년(오름차순)
-    if not years:
-        return None
+    if p.get("hidden"):
+        return {"id": pid, "title": title, "hidden": True}   # 기관 층에서 공통 절차 숨김(같은 id)
 
-    def pick(row, keys):
-        if not row:
+    def act(a):
+        if not isinstance(a, dict) or a.get("k") not in _SEC_ACT_KINDS:
             return None
-        for k in keys:
-            n = _num(row.get(k))
-            if n is not None:
-                return n
-        return None
-    series = []
-    for label, keys in _FSC_FIN_METRICS:
-        vals = [pick(by_year[y], keys) for y in years]
-        if any(v is not None for v in vals):
-            series.append({"name": label, "values": vals})
-    if not series:
-        return None
-    # 상단 지표용 items(최신연도 cur, 직전연도 prev)
-    latest = years[-1]
-    prev_y = years[-2] if len(years) > 1 else None
-    out = []
-    for label, keys in _FSC_FIN_METRICS:
-        c = pick(by_year[latest], keys)
-        if c is not None:
-            out.append({"name": label, "cur": c,
-                        "prev": (pick(by_year[prev_y], keys) if prev_y else None)})
-    fs = str(by_year[latest].get("fnclDcdNm") or by_year[latest].get("fnclGrpDcdNm") or "").strip()
-    return {"year": latest, "years": years, "series": series, "items": out,
-            "report": "요약재무제표", "fs": fs, "source": "금융위 공공데이터"}
+        r = {"k": a["k"], "l": _sec_clean_str(a.get("l"), 30) or "바로가기"}
+        if a.get("id"):
+            r["id"] = _sec_clean_str(a.get("id"), 48)
+        return r
 
-def _dart_company(key, corp_code):
-    """corp_code → DART 기업개황(company.json) 라벨 dict. 실패 시 {}.
-    사업자등록번호는 '_bno' 키로 함께 반환(국세청 상태 연계용)."""
-    try:
-        r = _SESSION.get("https://opendart.fss.or.kr/api/company.json",
-                         params={"crtfcKey": key, "corp_code": corp_code}, timeout=15)
-        d = r.json() or {}
-    except Exception:
-        return {}
-    if d.get("status") != "000":
-        return {}
-    out = {}
-    for k, lab in _DART_COMPANY_FIELDS.items():
-        v = (d.get(k) or "").strip()
-        if not v:
+    steps = []
+    for s in (p.get("steps") or [])[:20]:
+        if not isinstance(s, dict) or not _sec_clean_str(s.get("t")):
             continue
-        if k == "corp_cls":
-            v = _DART_CLS.get(v, v)
-        elif k == "acc_mt":
-            v = f"{v}월"
-        elif k == "est_dt":
-            v = _fmtymd(v)
-        out[lab] = v
-    out["상장여부"] = "상장" if (d.get("stock_code") or "").strip() else "비상장"
-    out["공시(DART)"] = f"https://dart.fss.or.kr/dsae001/main.do?corp_code={corp_code}"
-    bno = re.sub(r"\D", "", d.get("bizr_no", "") or "")
-    if bno:
-        out["_bno"] = bno
-    return out
-
-@app.route("/api/assist/company")
-def assist_company():
-    """기업 조회 — 공공데이터포털(금융위 기업기본정보) 회사명 검색 / 국세청 사업자상태.
-
-    · 사업자등록번호(10자리) → 국세청 사업자상태(계속/휴업/폐업) 단건.
-    · 그 외(회사명) → 금융위 기업기본정보 후보 목록(상세에서 개황·재무 조회).
-    """
-    if not _assist_key("company"):
-        return _assist_need_key("company")
-    query = request.args.get("query", "").strip()
-    if not query:
-        return jsonify({"success": False,
-                        "error": "회사명 또는 사업자등록번호를 입력하세요."})
-    digits = re.sub(r"\D", "", query)
-    gk = _dgk_key()
-    # 사업자등록번호(10자리, 숫자·구분기호만) → 국세청 상태 단건
-    if len(digits) == 10 and re.fullmatch(r"[\d\s-]+", query):
-        if not gk:
-            return jsonify({"success": False, "mode": "bno",
-                            "error": "사업자등록번호 조회에는 공공데이터포털 서비스키(DATA_GO_KR_KEY)가 필요합니다."})
-        st = _nts_status(digits)
-        if not st:
-            return jsonify({"success": True, "count": 0, "items": [], "mode": "bno",
-                            "note": "국세청에 등록된 상태 정보가 없습니다."})
-        biz = " · ".join(v for v in (st.get("납세자 상태"), st.get("과세유형")) if v)
-        item = {"name": _fmtbno_disp(digits), "ceo": "", "bno": digits,
-                "addr": "", "biz": biz, "corp": "", "closed": bool(st.get("폐업일"))}
-        return jsonify({"success": True, "count": 1, "total": "1",
-                        "items": [item], "mode": "bno"})
-    # 회사명 → 금융위 기업기본정보(공공데이터포털)
-    if not gk:
-        return jsonify({"success": False, "mode": "name",
-                        "error": "회사명 검색에는 공공데이터포털 서비스키(DATA_GO_KR_KEY)가 필요합니다."})
-    try:
-        recs, r = _fsc_company(gk, corp_nm=query, rows="50")
-        if recs is None:                        # 비 JSON(대개 data.go.kr 오류 XML)
-            body_txt = r.content[:600].decode("utf-8", "replace")
-            cm = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>", body_txt) or \
-                 re.search(r"<errMsg>(.*?)</errMsg>", body_txt) or \
-                 re.search(r"<resultMsg>(.*?)</resultMsg>", body_txt)
-            msg = cm.group(1) if cm else "응답을 해석할 수 없습니다(비 JSON)."
-            out = {"success": False, "mode": "name",
-                   "error": f"기업기본정보 응답 오류: {msg} (HTTP {r.status_code}). "
-                            f"DATA_GO_KR_KEY의 '금융위원회_기업기본정보'(15043184) 활용신청·"
-                            f"Decoding 키 여부를 확인하세요."}
-            if request.args.get("debug"):
-                out["_debug"] = {"http": r.status_code, "base": _FSC_BASE, "snippet": body_txt}
-            return jsonify(out)
-        # F06: 법인등록번호(crno)/사업자번호(bno) 기준 중복 제거 후 목록화.
-        # 식별자가 있는 레코드는 한 번만, 식별자가 없으면 (상호,대표,주소) 조합으로 판단.
-        items, seen = [], set()
-        for rec in recs:
-            nm = str(rec.get("corpNm") or "").strip()
-            bno = re.sub(r"\D", "", str(rec.get("bzno") or ""))
-            crno = re.sub(r"\D", "", str(rec.get("crno") or ""))
-            mkt = str(rec.get("corpRegMrktDcdNm") or "").strip()
-            listed = mkt and mkt not in ("기타", "기타법인", "해당없음", "비상장")
-            ceo = str(rec.get("enpRprfNm") or "").strip()
-            addr = str(rec.get("enpBsadr") or "").strip()
-            key = ("id:" + (crno or bno)) if (crno or bno) else ("nm:" + nm + "|" + ceo + "|" + addr)
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append({"name": nm or "(상호 미상)", "ceo": ceo,
-                          "bno": bno, "addr": addr,
-                          "biz": str(rec.get("enpMainBizNm") or "").strip(),
-                          "corp": crno, "stock": (mkt if listed else "")})
-        # 정렬: 완전일치 → 대표법인(질의+법인표기) → 접두일치 → 부분일치 → 그 외.
-        # (판매점·물류 자회사보다 대표 회사가 앞에 오도록)
-        qn = re.sub(r"\s+", "", query)
-        _CORP_MARK = ("(주)", "㈜", "주식회사", "(유)", "유한회사", "(재)", "재단법인", "(사)", "사단법인")
-        def _rank(it):
-            n = re.sub(r"\s+", "", it["name"])
-            if not qn:
-                return 5
-            if n == qn:
-                return 0
-            if n.startswith(qn):
-                rest = n[len(qn):]
-                if rest in _CORP_MARK or rest.strip("()") in ("주", "유", "재", "사"):
-                    return 1
-                return 2
-            return 3 if qn in n else 4
-        items.sort(key=_rank)
-        # 원천 총건수(있으면) — 없으면 중복 제거 결과 수
-        try:
-            src_total = int((((r.json() or {}).get("response") or {})
-                             .get("body") or {}).get("totalCount") or 0)
-        except Exception:
-            src_total = 0
-        shown = items[:30]
-        resp = {"success": True, "count": len(shown),
-                "total": str(src_total or len(items)),
-                "items": shown, "mode": "name"}
-        if request.args.get("debug"):
-            resp["_debug"] = {"http": r.status_code, "rows": len(recs),
-                              "deduped": len(items), "src_total": src_total,
-                              "resultMsg": (((r.json() or {}).get("response") or {})
-                                            .get("header") or {}).get("resultMsg", ""),
-                              "base": _FSC_BASE}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"조회 실패: {e}"})
-
-@app.route("/api/assist/company/detail")
-def assist_company_detail():
-    """기업 상세 — DART 기업개황·재무 + 국세청 사업자상태(공공데이터포털).
-
-    corp(=DART corp_code) 우선, 없으면 query(회사명)로 DART 매칭, bno(사업자번호)로
-    국세청 상태를 조회한다. 셋 다 없으면 오류.
-    """
-    if not _assist_key("company"):
-        return _assist_need_key("company")
-    corp = re.sub(r"\D", "", request.args.get("corp", ""))   # crno(법인등록번호 13자리)
-    bno = re.sub(r"\D", "", request.args.get("bno", ""))
-    query = request.args.get("query", "").strip()
-    if not (corp or bno or query):
-        return jsonify({"success": False, "error": "회사명·사업자번호 또는 기업코드가 필요합니다."})
-    gk = _dgk_key()
-    dk = _dart_key()
-    try:
-        name, labeled, finance = "", {}, None
-        rec = None
-        # 금융위 기업기본정보(공공데이터포털) 우선 — 법인등록번호 또는 회사명
-        if gk:
-            if corp and len(corp) >= 11:
-                recs, _ = _fsc_company(gk, crno=corp, rows="5")
-                rec = (recs[0] if recs else None)
-            if rec is None and query:
-                recs, _ = _fsc_company(gk, corp_nm=query, rows="10")
-                rec = (recs[0] if recs else None)
-        crno = corp if (corp and len(corp) >= 11) else ""
-        if rec:
-            lb = _fsc_labeled(rec)
-            name = lb.get("상호") or query
-            if not bno and lb.get("_bno"):
-                bno = lb["_bno"]
-            if not crno and lb.get("_crno"):
-                crno = lb["_crno"]
-            labeled.update({k: v for k, v in lb.items() if not k.startswith("_")})
-        # 국세청 사업자상태(공공데이터포털)
-        if bno:
-            labeled.update(_nts_status(bno))
-            labeled.setdefault("사업자등록번호", _fmtbno_disp(bno))
-        # 재무: 금융위 요약재무제표(공공데이터포털) 우선 — 법인등록번호 기준
-        if gk and crno:
-            finance = _fsc_financials(gk, crno)
-        # DART 재무(선택 폴백) — 금융위 재무가 없고 DART 키가 유효할 때만
-        if finance is None and dk and (name or query):
+        st = {"t": _sec_clean_str(s.get("t"), 400)}
+        for k in ("when", "draft"):
+            if s.get(k):
+                st[k] = _sec_clean_str(s.get(k), 60)
+        if s.get("optional"):
+            st["optional"] = True
+        if isinstance(s.get("docs"), list):
+            st["docs"] = [_sec_clean_str(d, 80) for d in s["docs"][:10] if _sec_clean_str(d)]
+        dl = s.get("deadline")
+        if isinstance(dl, dict) and dl.get("ref"):
             try:
-                hit = _dart_find_corp(dk, name or query)
-                if hit:
-                    finance = _dart_financials(dk, hit[0])
-                    labeled.setdefault("공시(DART)",
-                                       f"https://dart.fss.or.kr/dsae001/main.do?corp_code={hit[0]}")
-            except Exception:
+                st["deadline"] = {"ref": _sec_clean_str(dl.get("ref"), 12),
+                                  "days": max(-365, min(365, int(dl.get("days") or 0)))}
+                if dl.get("label"):
+                    st["deadline"]["label"] = _sec_clean_str(dl.get("label"), 40)
+            except (TypeError, ValueError):
                 pass
-        if not name:
-            name = query or (_fmtbno_disp(bno) if bno else "(상호 미상)")
-        if not labeled and not finance:
-            return jsonify({"success": False,
-                            "error": "기업 정보를 찾지 못했습니다. "
-                                     "공공데이터에 등재된 회사명 또는 사업자등록번호를 확인하세요."})
-        # 필드 정렬(알려진 라벨 우선, 나머지는 원순서)
-        fields, seen = [], set()
-        for lab in _COMP_GRID_ORDER:
-            if lab in labeled and lab not in seen:
-                fields.append([lab, labeled[lab]]); seen.add(lab)
-        for lab, v in labeled.items():
-            if lab not in seen:
-                fields.append([lab, v]); seen.add(lab)
-        # 상단 요약 지표(실데이터만) — 매출액(전년비)·영업이익·사업자상태
-        stats = []
-        if finance:
-            sales = next((it for it in finance["items"] if it["name"] == "매출액"), None)
-            if sales and sales.get("cur") is not None:
-                sub = ""
-                if sales.get("prev"):
-                    rr = (sales["cur"] - sales["prev"]) / abs(sales["prev"]) * 100
-                    sub = f"전년비 {'+' if rr >= 0 else ''}{rr:.1f}%"
-                stats.append({"label": "최근 매출액", "value": _won_short(sales["cur"]), "sub": sub})
-            def _fin(nm):
-                return next((it for it in finance["items"] if it["name"] == nm), None)
-            op = _fin("영업이익")
-            if op and op.get("cur") is not None:
-                margin = ""
-                if sales and sales.get("cur"):
-                    margin = f"영업이익률 {op['cur']/sales['cur']*100:.1f}%"
-                stats.append({"label": "영업이익", "value": _won_short(op["cur"]),
-                              "sub": margin or f"{finance.get('year','')} {finance.get('fs','')}".strip()})
-            netp = _fin("당기순이익")
-            if netp and netp.get("cur") is not None:
-                stats.append({"label": "당기순이익", "value": _won_short(netp["cur"]),
-                              "sub": f"{finance.get('year','')} 기준"})
-            debt, cap = _fin("부채총계"), _fin("자본총계")
-            if debt and cap and cap.get("cur"):
-                stats.append({"label": "부채비율",
-                              "value": f"{debt['cur']/cap['cur']*100:.0f}%",
-                              "sub": "부채총계/자본총계"})
-        emp = labeled.get("종업원수")
-        if emp:
-            stats.append({"label": "종업원수", "value": (emp + "명") if emp.isdigit() else emp, "sub": ""})
-        nts = labeled.get("납세자 상태")
-        if nts:
-            stats.append({"label": "사업자상태", "value": nts, "sub": labeled.get("과세유형", "")})
-        skills = [labeled[k] for k in ("주요사업", "상장시장", "업종코드") if labeled.get(k)]
-        detail = {"name": name, "bno": bno, "fields": fields}
-        if finance:
-            detail["finance"] = finance
-        if stats:
-            detail["stats"] = stats
-        if skills:
-            detail["skills"] = skills
-        resp = {"success": True, "detail": detail}
-        if request.args.get("debug"):
-            resp["_debug"] = {"crno": crno, "fsc_matched": bool(rec),
-                              "finance_source": (finance or {}).get("source", ""),
-                              "field_count": len(fields)}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"상세 조회 실패: {e}"})
+        if s.get("basis"):
+            st["basis"] = _sec_ref_list(s.get("basis"))
+        if isinstance(s.get("form"), dict):
+            f = _sec_ref_list([s["form"]], 1)
+            if f:
+                st["form"] = f[0]
+        a = act(s.get("act"))
+        if a:
+            st["act"] = a
+        steps.append(st)
+    pitfalls = []
+    for pf in (p.get("pitfalls") or [])[:15]:
+        if isinstance(pf, str):
+            pf = {"t": pf}
+        if isinstance(pf, dict) and _sec_clean_str(pf.get("t")):
+            x = {"t": _sec_clean_str(pf.get("t"), 300)}
+            if pf.get("basis"):
+                x["basis"] = _sec_ref_list(pf.get("basis"), 3)
+            pitfalls.append(x)
+    return {
+        "id": pid, "title": title,
+        "icon": _sec_clean_str(p.get("icon"), 4) or "📌",
+        "category": _sec_clean_str(p.get("category"), 20) or "기타",
+        "summary": _sec_clean_str(p.get("summary"), 300),
+        "approval": _sec_clean_str(p.get("approval"), 200),
+        "triggers": [_sec_clean_str(t, 30) for t in (p.get("triggers") or [])[:40] if _sec_clean_str(t)],
+        "dates": [{"k": _sec_clean_str(d.get("k"), 12), "l": _sec_clean_str(d.get("l"), 30)}
+                  for d in (p.get("dates") or [])[:3] if isinstance(d, dict) and d.get("k")],
+        "steps": steps,
+        "forms": _sec_ref_list(p.get("forms"), 12),
+        "pitfalls": pitfalls,
+        "tips": [_sec_clean_str(t, 300) for t in (p.get("tips") or [])[:10] if _sec_clean_str(t)],
+    }
 
-@app.route("/api/assist/patent")
-def assist_patent():
-    """특허 조회 — KIPRIS Plus 특허·실용신안 검색(출원인·기간·상태 필터, 목록형).
 
-    쿼리 파라미터: applicant(출원인), query(자유검색어), status(등록상태 코드),
-    date_from/date_to(출원일 YYYY 또는 YYYYMMDD), page.
-    상태 코드(lastvalue): R 등록·A 공개·J 거절·F 소멸·C 취하·I 무효·G 포기(빈값=전체).
-    """
-    key = _assist_key("patent")
-    if not key:
-        return _assist_need_key("patent")
-    applicant = request.args.get("applicant", "").strip()
-    applicant_code = re.sub(r"\D", "", request.args.get("applicant_code", ""))
-    query = request.args.get("query", "").strip()
-    status = request.args.get("status", "").strip()
-    df = re.sub(r"\D", "", request.args.get("date_from", ""))
-    dt = re.sub(r"\D", "", request.args.get("date_to", ""))
-    page = re.sub(r"\D", "", request.args.get("page", "1")) or "1"
-    rows = re.sub(r"\D", "", request.args.get("rows", "30")) or "30"
-    rows = str(max(1, min(500, int(rows))))     # KIPRIS numOfRows 상한 보호
-    # 기간 기준일: application(출원일, 기본) | register(등록일).
-    # '최근 1년 등록 특허'처럼 등록일 기준 조회는 출원일로 거르면 대부분 누락된다
-    # (등록은 출원 후 수년 뒤에 이뤄지므로). 사용자가 선택하면 등록일로 필터한다.
-    date_field = "register" if request.args.get("date_field", "").strip().lower().startswith("reg") else "application"
-    if not applicant and not query:
-        return jsonify({"success": False, "error": "출원인 또는 검색어를 입력하세요."})
-    base = "http://plus.kipris.or.kr/kipo-api/kipi/patUtiModInfoSearchSevice"
-
-    # 출원일 범위(YYYY→YYYY0101/YYYY1231). KIPRIS 는 'YYYYMMDD~YYYYMMDD' 형식.
-    def _d(v, end=False):
-        if not v:
-            return ""
-        return v[:8] if len(v) >= 8 else v + ("1231" if end else "0101")
-    a, b = _d(df), _d(dt, True)
-
-    def _search(query_field, appl=None):
-        """query_field: 검색어 필드('inventionTitle' 정밀 / 'word' 자유). None=검색어 미사용.
-        appl: 출원인 검색값(특허고객번호 12자리 또는 출원인명)."""
-        params = {"ServiceKey": key, "numOfRows": rows, "pageNo": page,
-                  "patent": "true", "utility": "true",
-                  "sortSpec": ("RD" if date_field == "register" else "AD"), "descSort": "true"}
-        if appl:
-            params["applicant"] = appl
-        if query and query_field:
-            params[query_field] = query
-        if status:
-            params["lastvalue"] = status
-        if a or b:
-            rng = f"{a or '00000000'}~{b or '99991231'}"
-            params["registerDate" if date_field == "register" else "applicationDate"] = rng
-        r = _SESSION.get(f"{base}/getAdvancedSearch", params=params, timeout=20)
-        root = _xml_fromstring(r.content)
-        te = root.find(".//totalCount")
-        total = (te.text or "").strip() if te is not None else ""
-        items = []
-        for it in root.iter("item"):
-            def g(*tags):
-                for t in tags:
-                    el = it.find(t)
-                    if el is not None and (el.text or "").strip():
-                        return el.text.strip()
-                return ""
-            items.append({
-                "title": g("inventionTitle", "InventionName", "articleName") or "(제목 없음)",
-                "applicant": g("applicantName", "Applicant"),
-                "appno": g("applicationNumber", "ApplicationNumber"),
-                "appdate": g("applicationDate", "ApplicationDate"),
-                "regno": g("registerNumber", "RegistrationNumber"),
-                "regdate": g("registerDate", "RegistrationDate"),
-                "status": g("registerStatus", "RegistrationStatus", "lastValue"),
-                "ipc": g("ipcNumber", "InternationalpatentclassificationNumber")})
-        # F09: 외부 API 오류(인증·권한·쿼터·HTTP)를 '0건'과 구분한다.
-        err = None
-        if r.status_code != 200:
-            err = f"KIPRIS 응답 오류(HTTP {r.status_code})."
-        else:
-            sy = (root.findtext(".//successYN") or "").strip().upper()
-            rc = (root.findtext(".//resultCode") or "").strip()
-            msg = (root.findtext(".//resultMsg") or root.findtext(".//errMsg") or "").strip()
-            if sy == "N" or (rc and rc not in ("", "00", "0", "000")):
-                err = msg or "KIPRIS 조회 오류 — 서비스키 인증·활용신청·쿼터를 확인하세요."
-        return r, root, total, items, params, err
-
-    def _code_unreliable(items, name):
-        """특허고객번호 검색 결과가 신뢰 불가한지 판단.
-        0건이거나, 반환된 출원인명 다수가 기대 출원인명과 무관하면 True.
-        (일부 출원인은 KIPRIS가 12자리 고객번호 필터를 무시하고 전체를 반환하는데,
-         예: 경기도 → 9만여 건. 이때 결과 출원인명이 기대 출원인과 어긋난다.)"""
-        if not items:
-            return True
-        key = re.sub(r"\s+", "", name or "")
-        if not key:                               # 기대 이름 없음 → 판별 불가, 결과 유지
-            return False
-        matched = sum(1 for it in items
-                      if key in re.sub(r"\s+", "", it.get("applicant", "")))
-        return matched * 2 < len(items)           # 절반 미만 일치 → 필터 무시로 간주
-
-    try:
-        # 1차: 발명의 명칭(inventionTitle) 정밀 매칭 — 관련도 높은 결과 우선.
-        # 2차: 결과가 없고 검색어가 있으면 자유검색(word, 명칭+요약+청구항)으로 폴백.
-        #      (긴 제목 전체를 붙여넣는 경우 명칭 완전일치가 어려워 0건이 되던 문제 대응)
-        field = "inventionTitle" if query else None
-        # 출원인은 특허고객번호(applicant_code) 우선 검색 → 정확도 최상.
-        # 단, KIPRIS가 12자리 고객번호 필터를 무시하고 전체를 반환하는 출원인이 있어
-        # (예: 경기도), 반환된 출원인명이 기대 출원인과 어긋나거나(=필터 무시) 0건이면
-        # 출원인'명'으로 재검색해 폴백한다.
-        appl_primary = applicant_code or applicant
-        appl_used = appl_primary
-        r, root, total, items, params, err = _search(field, appl_primary)
-        if err:                                   # 인증/권한/쿼터/HTTP 오류 → 0건으로 위장하지 않음
-            resp = {"success": False, "error": err, "kind": "api"}
-            if request.args.get("debug"):
-                resp["_debug"] = {"http": r.status_code,
-                                  "snippet": r.content[:600].decode("utf-8", "replace")}
-            return jsonify(resp)
-        if applicant_code and applicant and _code_unreliable(items, applicant):
-            r2, root2, total2, items2, params2, err2 = _search(field, applicant)
-            if not err2:                          # 폴백 오류면 고객번호 결과 유지
-                r, root, total, items, params = r2, root2, total2, items2, params2
-                appl_used = applicant
-        fell_back = False
-        if query and not items:
-            r2, root2, total2, items2, params2, err2 = _search("word", appl_used)
-            if not err2 and items2:               # 폴백 오류면 정상 0건 유지
-                r, root, total, items, params = r2, root2, total2, items2, params2
-                fell_back = True
-        resp = {"success": True, "count": len(items),
-                "total": total or str(len(items)), "items": items,
-                "matchMode": ("word" if fell_back else ("title" if query else "all"))}
-        if request.args.get("debug"):         # 배포 진단: KIPRIS 응답 원문 요약
-            def _t(tag):
-                el = root.find(f".//{tag}")
-                return (el.text or "").strip() if el is not None else ""
-            resp["_debug"] = {"http": r.status_code, "totalCount": total,
-                              "item_count": len(items), "fell_back": fell_back,
-                              "successYN": _t("successYN") or _t("resultCode"),
-                              "resultMsg": _t("resultMsg") or _t("errMsg"),
-                              "sent": {k: ("<redacted>" if k == "ServiceKey" else v)
-                                       for k, v in params.items()},
-                              "snippet": r.content[:600].decode("utf-8", "replace")}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"조회 실패: {e}"})
-
-@app.route("/api/assist/patent/detail")
-def assist_patent_detail():
-    """특허 상세 — KIPRIS Plus 서지상세정보(출원번호 기준)."""
-    key = _assist_key("patent")
-    if not key:
-        return _assist_need_key("patent")
-    appno = re.sub(r"\D", "", request.args.get("appno", ""))
-    if not appno:
-        return jsonify({"success": False, "error": "출원번호가 필요합니다."})
-    base = "http://plus.kipris.or.kr/kipo-api/kipi/patUtiModInfoSearchSevice"
-    try:
-        r = _SESSION.get(f"{base}/getBibliographyDetailInfoSearch",
-                         params={"applicationNumber": appno, "ServiceKey": key}, timeout=20)
-        root = _xml_fromstring(r.content)
-
-        def first(*tags):
-            for t in tags:
-                el = root.find(f".//{t}")
-                if el is not None and (el.text or "").strip():
-                    return el.text.strip()
-            return ""
-
-        def joined(container_tag, name_tag):
-            # name_tag(예: 'name')는 출원인·발명자 배열에 공통으로 쓰이므로,
-            # 반드시 해당 컨테이너(applicantInfoArray/inventorInfoArray) 안에서만
-            # 수집해야 출원인과 발명자가 섞이지 않는다.
-            vals = []
-            for cont in root.iter(container_tag):
-                for el in cont.iter(name_tag):
-                    v = (el.text or "").strip()
-                    if v and v not in vals:
-                        vals.append(v)
-            return " · ".join(vals)
-
-        detail = {
-            "title": first("inventionTitle", "InventionName", "articleName"),
-            "appno": first("applicationNumber") or appno,
-            "appdate": first("applicationDate"),
-            "openno": first("openNumber", "publicationNumber"),
-            "opendate": first("openDate", "publicationDate"),
-            "regno": first("registerNumber", "registrationNumber"),
-            "regdate": first("registerDate", "registrationDate"),
-            "status": first("registerStatus", "lastValue", "registrationLastStatus"),
-            "applicant": joined("applicantInfoArray", "name") or first("applicantName"),
-            "inventor": joined("inventorInfoArray", "name") or first("inventorName"),
-            "agent": first("agentName"),
-            "ipc": joined("ipcInfoArray", "ipcNumber") or first("ipcNumber"),
-            "abstract": first("astrtCont", "abstractContent", "abstract"),
-        }
-        detail["url"] = ("https://www.kipris.or.kr/khome/search/searchResult.do"
-                         if not appno else
-                         f"https://www.kipris.or.kr/khome/main/base/BasePatentSearch.do")
-        if not any(v for k, v in detail.items() if k not in ("url",)):
-            return jsonify({"success": False, "error": "상세 정보를 찾지 못했습니다."})
-        return jsonify({"success": True, "detail": detail})
-    except Exception as e:
-        return jsonify({"success": False, "error": f"상세 조회 실패: {e}"})
-
-def _patreg_key() -> str:
-    """등록원부 실시간 조회(공공데이터포털) 서비스키.
-
-    전용 PATENT_REG_API_KEY 우선, 없으면 DATA_GO_KR_KEY로 폴백. data.go.kr은
-    Encoding/Decoding 두 형태를 발급하므로 퍼센트 인코딩이 보이면 Decoding으로 정규화한다.
-    """
-    k = (os.environ.get("PATENT_REG_API_KEY", "")
-         or os.environ.get("DATA_GO_KR_KEY", "") or "").strip()
-    if k and re.search(r"%[0-9A-Fa-f]{2}", k):
+def _sec_chunks():
+    global _SEC_CHUNKS, _SEC_ART_INDEX
+    if _SEC_CHUNKS is None:
         try:
-            return unquote(k)
-        except Exception:
-            return k
-    return k
+            import reg_chunks
+            _SEC_CHUNKS = [(c["title"], c["no"], c["art_title"], c["text"])
+                           for c in reg_chunks.iter_chunks(max_chars=4000) if not c["boiler"]]
+        except Exception as e:
+            print(f"[secretary] 조문 색인 실패: {e}")
+            _SEC_CHUNKS = []
+        _SEC_ART_INDEX = {}
+        for c in _SEC_CHUNKS:
+            _SEC_ART_INDEX.setdefault((_norm_key(c[0]), c[1]), c)
+    return _SEC_CHUNKS
 
-def _reg_walk_dicts(obj):
-    """중첩된 dict/list 구조 안의 모든 dict를 순회 yield(응답 래퍼 구조에 무관하게 파싱)."""
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _reg_walk_dicts(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _reg_walk_dicts(v)
 
-def _reg_scalar(obj, *keys):
-    """중첩 구조에서 주어진 키의 첫 비어있지 않은 스칼라 값(리스트면 첫 원소)."""
-    for d in _reg_walk_dicts(obj):
-        for k in keys:
-            if k in d:
-                v = d.get(k)
-                if isinstance(v, list):
-                    v = v[0] if v else ""
-                if isinstance(v, (str, int, float)):
-                    s = str(v).strip()
-                    if s:
-                        return s
-    return ""
+def _sec_art(title: str, no: str):
+    _sec_chunks()
+    return (_SEC_ART_INDEX or {}).get((_norm_key(title), no))
 
-def _reg_groups(obj, marker):
-    """marker 키(예: 'ownerName')를 가진 모든 dict를 반복그룹 항목으로 수집."""
+
+_SEC_REG_SUFFIX = re.compile(r"(규정|규칙|지침|요령|세칙|기준|매뉴얼|훈령|예규)$")
+
+
+def _sec_resolve_reg(name: str):
+    """절차의 규정명 → 우리 기관 manifest 항목. (항목, 방식) — 방식: alias|exact|prefix|approx.
+
+    다른 기관에 그대로 옮겨도 절차가 깨지지 않도록 단계적으로 찾는다.
+    approx(포함 관계·어간) 는 틀릴 수 있으므로 호환성 점검에서 '확인 필요'로 표시한다.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None, ""
+    cfg = _sec_config()
+    aliases = {_norm_key(k): v for k, v in (cfg.get("reg_aliases") or {}).items() if v}
+    via = ""
+    if _norm_key(name) in aliases:
+        name, via = aliases[_norm_key(name)], "alias"
+    m = _find_reg_exact(name)
+    if m:
+        return m, via or "exact"
+    org = cfg.get("org") or {}
+    for pre in (org.get("name"), org.get("short"), org.get("abbr")):   # "○○공사 여비규정" ↔ "여비규정"
+        if not pre:
+            continue
+        if name.startswith(pre):
+            m = _find_reg_exact(name[len(pre):].strip())
+        else:
+            m = _find_reg_exact(f"{pre} {name}") or _find_reg_exact(f"{pre}{name}")
+        if m:
+            return m, via or "prefix"
+    m = _find_reg_original(name)                       # 포함 관계(가장 가까운 제목)
+    if m:
+        return m, via or "approx"
+    stem = _SEC_REG_SUFFIX.sub("", _norm_key(name))    # "여비규정" ↔ "여비 지급 지침"
+    if len(stem) >= 2:
+        def _st(x):
+            return _SEC_REG_SUFFIX.sub("", _norm_key(x.get("title", "")))
+        cands = [x for x in _load_reg_manifest()
+                 if len(_st(x)) >= 2 and (_st(x).startswith(stem) or stem.startswith(_st(x)))]
+        if cands:
+            return min(cands, key=lambda x: (abs(len(_st(x)) - len(stem)), len(x.get("title", "")))), via or "approx"
+    return None, ""
+
+
+def _sec_reg_text(title: str) -> str:
+    m, _ = _sec_resolve_reg(title)
+    slug = (m or {}).get("slug") or title.replace(" ", "_")
+    path = os.path.join(REG_DIR, slug, "index.html")
+    try:
+        import reg_chunks
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return reg_chunks.html_to_text(f.read())
+    except Exception:
+        return ""
+
+
+def _sec_forms_set():
+    return {(_norm_key(f["reg"]), _norm_key(f["label"])) for f in _reg_forms_index()}
+
+
+def _sec_proc_refs(p: dict):
+    """절차가 참조하는 (종류, ref) 목록 — 근거·서식."""
     out = []
-    for d in _reg_walk_dicts(obj):
-        if isinstance(d, dict) and marker in d:
-            v = d.get(marker)
-            if isinstance(v, (str, int, float)) and str(v).strip():
-                out.append(d)
+    for s in p.get("steps") or []:
+        out += [("basis", b) for b in s.get("basis") or []]
+        if s.get("form"):
+            out.append(("form", s["form"]))
+    out += [("form", f) for f in p.get("forms") or []]
+    for pf in p.get("pitfalls") or []:
+        out += [("basis", b) for b in (pf.get("basis") or [])]
     return out
 
-def _reg_s(d, *keys):
-    for k in keys:
-        v = d.get(k)
-        if isinstance(v, list):
-            v = v[0] if v else ""
-        if isinstance(v, (str, int, float)) and str(v).strip():
-            return str(v).strip()
-    return ""
 
-@app.route("/api/assist/patent/register")
-def assist_patent_register():
-    """특허 등록원부 실시간 이력조회 — 공공데이터포털 PttRgstRtInfoInqSvc/getPatentRegisterHistory.
-
-    등록번호(rgstNo, 13자리) 기준으로 기본정보·연차·출원인·발명자·권리자·권리변동·
-    대리인·우선권·실시권 이력을 제공한다. 응답 래퍼 구조가 유동적이라 필드는 재귀 수집한다.
-    """
-    key = _patreg_key()
-    if not key:
-        return jsonify({"success": False, "need_key": True,
-                        "provider": "공공데이터포털(지식재산처 등록원부)",
-                        "apply_url": "https://www.data.go.kr/data/15124946/openapi.do",
-                        "message": "등록원부 조회 서비스키(PATENT_REG_API_KEY)가 설정되지 않았습니다."})
-    rgst = re.sub(r"\D", "", request.args.get("rgstNo", "") or request.args.get("regno", ""))
-    if not rgst:
-        return jsonify({"success": False, "error": "등록번호가 필요합니다."})
-    base = "https://apis.data.go.kr/1430000/PttRgstRtInfoInqSvc/getPatentRegisterHistory"
-    try:
-        r = _SESSION.get(base, params={"serviceKey": key, "type": "json", "rgstNo": rgst},
-                         timeout=20)
-        raw = r.content.decode("utf-8", "replace")
-        try:
-            data = r.json()
-        except Exception:
-            data = None
-        if data is None:                          # JSON 아님 → 대개 인증/쿼터 오류 XML
-            m = (re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>", raw)
-                 or re.search(r"<errMsg>(.*?)</errMsg>", raw)
-                 or re.search(r"<resultMsg>(.*?)</resultMsg>", raw))
-            msg = m.group(1) if m else "응답을 해석할 수 없습니다(비 JSON)."
-            out = {"success": False, "kind": "api",
-                   "error": f"등록원부 응답 오류: {msg} (HTTP {r.status_code}). "
-                            f"PATENT_REG_API_KEY의 활용신청·Decoding 키 여부를 확인하세요."}
-            if request.args.get("debug"):
-                out["_debug"] = {"http": r.status_code, "snippet": raw[:800]}
-            return jsonify(out)
-        code = _reg_scalar(data, "resultCode")
-        msg = _reg_scalar(data, "resultMsg")
-        ok = (code in ("", "000", "00", "0")) or ("SUCC" in msg.upper())
-        record = None
-        for d in _reg_walk_dicts(data):           # 본문 레코드 = rgstNo + 기본항목을 가진 dict
-            if "rgstNo" in d and any(k in d for k in
-                                     ("title", "rgstDate", "lastDspst", "cndrtExptnDate", "applNo")):
-                record = d
-                break
-        if record is None and not ok:
-            out = {"success": False, "kind": "api",
-                   "error": f"등록원부 조회 오류: {msg or code or '실패'}"}
-            if request.args.get("debug"):
-                out["_debug"] = {"http": r.status_code, "code": code, "msg": msg, "snippet": raw[:900]}
-            return jsonify(out)
-        if record is None:                        # 성공이지만 해당 등록번호 데이터 없음
-            resp = {"success": True, "register": None, "empty": True}
-            if request.args.get("debug"):
-                resp["_debug"] = {"http": r.status_code, "code": code, "msg": msg, "snippet": raw[:900]}
-            return jsonify(resp)
-
-        def _people(marker, name_key, addr_key=None, natl_key=None):
-            out = []
-            for d in _reg_groups(data, name_key):
-                out.append({"name": _reg_s(d, name_key),
-                            "addr": _reg_s(d, addr_key) if addr_key else "",
-                            "natl": _reg_s(d, natl_key) if natl_key else ""})
-            return out
-
-        owners = []
-        for d in _reg_groups(data, "ownerName"):
-            owners.append({"name": _reg_s(d, "ownerName"), "addr": _reg_s(d, "ownerAddr"),
-                           "natl": _reg_s(d, "ownerNatl"),
-                           "final": _reg_s(d, "finalOwnerYn").upper() == "Y",
-                           "csName": _reg_s(d, "ownerRgstCsName"),
-                           "csReason": _reg_s(d, "ownerRgstCsReason"),
-                           "csDate": _reg_s(d, "ownerRgstCsDate")})
-        pays = []
-        for d in _reg_groups(data, "payDate"):
-            pays.append({"start": _reg_s(d, "statAnnl"), "last": _reg_s(d, "lastAnnl"),
-                         "date": _reg_s(d, "payDate"), "amount": _reg_s(d, "payAmount")})
-        rights = []
-        for d in _reg_groups(data, "rgstCsName"):
-            rights.append({"name": _reg_s(d, "rgstCsName"), "date": _reg_s(d, "rgstCsDate"),
-                           "reason": _reg_s(d, "rgstCsReason"), "purpose": _reg_s(d, "rgstCsPupos")})
-        priorities = []
-        for d in _reg_groups(data, "cofprDate"):
-            priorities.append({"natl": _reg_s(d, "cofprNatl"), "date": _reg_s(d, "cofprDate"),
-                               "applno": _reg_s(d, "cofprApplno")})
-
-        def _lcns(name_key, pfx):
-            out = []
-            for d in _reg_groups(data, name_key):
-                out.append({"name": _reg_s(d, name_key), "reason": _reg_s(d, pfx + "RgstCsNm"),
-                            "region": _reg_s(d, pfx + "RgnLcns"), "content": _reg_s(d, pfx + "ContLcns"),
-                            "start": _reg_s(d, pfx + "StartDate"), "end": _reg_s(d, pfx + "EndDate")})
-            return out
-
-        reg = {
-            "rgstNo": rgst,
-            "rgstDate": _reg_scalar(data, "rgstDate"),
-            "applNo": _reg_scalar(data, "applNo"),
-            "applDate": _reg_scalar(data, "applDate"),
-            "title": _reg_scalar(data, "title"),
-            "cndrtExptnDate": _reg_scalar(data, "cndrtExptnDate"),
-            "lastDspst": _reg_scalar(data, "lastDspst"),
-            "applTpcd": _reg_scalar(data, "applTpcd"),
-            "claimCount": _reg_scalar(data, "claimCount"),
-            "owners": owners,
-            "applicants": _people("applicant", "applicantName", "applicantAddr", "applicantNatl"),
-            "inventors": _people("inventor", "inventorName", "inventorAddr", "inventorNatl"),
-            "pays": pays,
-            "rights": rights,
-            "priorities": priorities,
-            "applAgents": _people("applAgent", "applAgentName", "applAgentAddr", "applAgentNatl"),
-            "rgstAgents": _people("rgstAgent", "rgstAgentName", "rgstAgentAddr", "rgstAgentNatl"),
-            "elsLcns": _lcns("elsLcnsPsnNm", "elsLcns"),
-            "noelsLcns": _lcns("noelsLcnsPsnNm", "noelsLcns"),
-        }
-        resp = {"success": True, "register": reg}
-        if request.args.get("debug"):
-            resp["_debug"] = {"http": r.status_code, "code": code, "msg": msg, "snippet": raw[:1200]}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"등록원부 조회 실패: {e}"})
-
-def _pick_dates(s):
-    """문자열에서 날짜(YYYYMMDD·YYYY-MM-DD·YYYY.MM.DD 등)를 모두 추출."""
-    return [m.group(1) + m.group(2) + m.group(3)
-            for m in re.finditer(r"(20\d{2})\D?(\d{2})\D?(\d{2})", str(s or ""))]
-
-def _won_short(v):
-    """숫자(원) → '8억 4,000만원' 식 축약. 숫자 아니면 ''."""
-    digits = re.sub(r"[^\d]", "", str(v or ""))
-    if not digits:
-        return ""
-    n = int(digits)
-    jo, n2 = divmod(n, 10 ** 12)
-    eok, n3 = divmod(n2, 10 ** 8)
-    man = n3 // 10 ** 4
-    parts = []
-    if jo:
-        parts.append(f"{jo}조")
-    if eok:
-        parts.append(f"{eok:,}억")
-    if man and not jo:
-        parts.append(f"{man:,}만")
-    return (" ".join(parts) + "원") if parts else f"{n:,}원"
-
-@app.route("/api/assist/support")
-def assist_support():
-    """지원사업 조회 — 창업진흥원 K-Startup 지원사업 공고(공공데이터포털, DATA_GO_KR_KEY).
-
-    apis.data.go.kr/B552735/kisedKstartupService01/getAnnouncementInformation01.
-    키워드(query)는 응답을 받아 제목·내용·분야·대상에서 부분일치로 걸러낸다.
-    """
-    key = _assist_key("support")
-    if not key:
-        return _assist_need_key("support")
-    query = request.args.get("query", "").strip()
-    base = os.environ.get("SUPPORT_API_URL", "").strip() or \
-        "https://apis.data.go.kr/B552735/kisedKstartupService01/getAnnouncementInformation01"
-    try:
-        r = _SESSION.get(base, params={"serviceKey": key, "page": "1",
-                                       "perPage": "200", "returnType": "json"}, timeout=15)
-        try:
-            d = r.json() or {}
-        except Exception:
-            body_txt = r.content[:600].decode("utf-8", "replace")
-            cm = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>", body_txt) or \
-                 re.search(r"<errMsg>(.*?)</errMsg>", body_txt) or \
-                 re.search(r"<resultMsg>(.*?)</resultMsg>", body_txt)
-            msg = cm.group(1) if cm else "응답을 해석할 수 없습니다(비 JSON)."
-            out = {"success": False,
-                   "error": f"K-Startup 응답 오류: {msg} (HTTP {r.status_code}). "
-                            f"DATA_GO_KR_KEY의 'K-Startup 조회서비스'(15125364) 활용신청·"
-                            f"Decoding 키 여부를 확인하세요."}
-            if request.args.get("debug"):
-                out["_debug"] = {"http": r.status_code, "base": base, "snippet": body_txt}
-            return jsonify(out)
-        import html as _html
-        def _rows(dd):
-            a = dd.get("data")
-            if a is None:                         # 혹시 표준 data.go.kr 래핑이면
-                body = (dd.get("response") or {}).get("body") or {}
-                a = body.get("items") or []
-                if isinstance(a, dict):
-                    a = a.get("item") or []
-            return a if isinstance(a, list) else ([a] if a else [])
-        try:
-            src_total = int(d.get("totalCount") or d.get("matchCount") or 0)
-        except Exception:
-            src_total = 0
-        all_rows = _rows(d)
-        scanned = len(all_rows)
-        # F10: 검색어가 있으면 원천을 여러 페이지 스캔(상한 내)해 첫 페이지 밖 공고도 검색.
-        MAXPAGES, page = 8, 1
-        if query and src_total and scanned < src_total:
-            while page < MAXPAGES and scanned < src_total:
-                page += 1
-                try:
-                    dd = _SESSION.get(base, params={"serviceKey": key, "page": str(page),
-                                      "perPage": "200", "returnType": "json"}, timeout=15).json() or {}
-                except Exception:
-                    break
-                rws = _rows(dd)
-                if not rws:
-                    break
-                all_rows += rws; scanned += len(rws)
-        ql = query.lower()
-        items, matched = [], 0
-        for row in all_rows:
-            title = _html.unescape((row.get("biz_pbanc_nm") or row.get("intg_pbanc_biz_nm") or "").strip())
-            content = (row.get("pbanc_ctnt") or "").strip()
-            field = _html.unescape((row.get("supt_biz_clsfc") or "").strip())
-            target = _html.unescape((row.get("aply_trgt_ctnt") or row.get("aply_trgt") or "").strip())
-            region = _html.unescape((row.get("supt_regin") or "").strip())
-            org = _html.unescape((row.get("pbanc_ntrp_nm") or "").strip())
-            if ql and ql not in " ".join([title, content, field, target, region, org]).lower():
-                continue
-            matched += 1
-            if len(items) >= 60:                  # 표시는 60개까지, matched는 계속 집계
-                continue
-            bgn = re.sub(r"\D", "", str(row.get("pbanc_rcpt_bgng_dt") or ""))[:8]
-            end = re.sub(r"\D", "", str(row.get("pbanc_rcpt_end_dt") or ""))[:8]
-            url = (row.get("detl_pg_url") or "").strip()
-            period = (f"{bgn} ~ {end}" if (bgn or end) else "")
-            taglist = [t for t in (field, region) if t][:5]
-            items.append({
-                "title": title or "(공고명 없음)",
-                "subtitle": org,
-                "begin": bgn, "end": end, "endText": period,
-                "field": field, "target": target, "tags": taglist,
-                "applyUrl": url,
-                "meta": [["신청기간", period or "-"], ["분야", field or "-"],
-                         ["지원대상", target or "-"], ["지원지역", region or "-"]],
-                "url": url})
-        resp = {"success": True, "count": len(items), "items": items,
-                "total": str(src_total or matched), "matched": matched,
-                "scanned": scanned,
-                "truncated": bool(matched > len(items) or (query and src_total and scanned < src_total)),
-                "has_more": bool(query and src_total and scanned < src_total)}
-        if request.args.get("debug"):
-            resp["_debug"] = {"http": r.status_code, "scanned": scanned,
-                              "src_total": src_total, "matched": matched, "base": base}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"조회 실패: {e}"})
-
-_NARA_BASE = {}   # {op: 동작 확인된 base URL} — 후보 탐색 결과 캐시
-
-@app.route("/api/assist/procurement")
-def assist_procurement():
-    """조달공고 조회 — 조달청 나라장터 입찰공고정보(최근 30일)."""
-    key = _assist_key("procurement")
-    if not key:
-        return _assist_need_key("procurement")
-    query = request.args.get("query", "").strip()
-    # 공고 유형 → 나라장터 오퍼레이션(용역·물품·공사·외자)
-    _OPS = {"servc": "getBidPblancListInfoServc", "thng": "getBidPblancListInfoThng",
-            "cnstwk": "getBidPblancListInfoCnstwk", "frgcpt": "getBidPblancListInfoFrgcpt"}
-    _TYPE_LABEL = {"servc": "용역", "thng": "물품", "cnstwk": "공사", "frgcpt": "외자"}
-    btype = request.args.get("type", "servc").strip().lower()
-    if btype not in _OPS:
-        btype = "servc"
-    op = _OPS[btype]
-    end = time.strftime("%Y%m%d")
-    start = time.strftime("%Y%m%d", time.localtime(time.time() - 30 * 86400))
-    try:
-        params = {"serviceKey": key, "pageNo": "1", "numOfRows": "50", "type": "json",
-                  "inqryDiv": "1", "inqryBgnDt": start + "0000", "inqryEndDt": end + "2359"}
-        if query:
-            params["bidNtceNm"] = query
-        # 후보 엔드포인트를 순서대로 시도(https 우선). data.go.kr은 http 거부(403)·
-        # 서비스 경로 버전이 갈려서, JSON 본문(response.body)이 오는 첫 URL을 채택·캐시.
-        override = os.environ.get("PROCUREMENT_API_URL", "").strip()
-        if override:
-            bases = [override if override.rstrip("/").endswith(op)
-                     else override.rstrip("/") + "/" + op]
-        elif _NARA_BASE.get(op):
-            bases = [_NARA_BASE[op]]
-        else:
-            bases = [f"https://apis.data.go.kr/1230000/ad/BidPublicInfoService/{op}",
-                     f"https://apis.data.go.kr/1230000/BidPublicInfoService04/{op}",
-                     f"https://apis.data.go.kr/1230000/BidPublicInfoService/{op}",
-                     f"http://apis.data.go.kr/1230000/ad/BidPublicInfoService/{op}"]
-        j, chosen, attempts, r = None, "", [], None
-        for b in bases:
-            try:
-                r = _SESSION.get(b, params=params, timeout=15)
-                try:
-                    jj = r.json()
-                except Exception:
-                    jj, snip = None, r.content[:200].decode("utf-8", "replace")
-                    attempts.append({"base": b, "http": r.status_code, "json": False, "snippet": snip})
-                    continue
-                has_body = isinstance((jj.get("response") or {}).get("body"), dict)
-                attempts.append({"base": b, "http": r.status_code, "json": True, "body": has_body})
-                if has_body:
-                    j, chosen = jj, b
-                    break
-            except Exception as e:
-                attempts.append({"base": b, "err": f"{type(e).__name__}: {e}"})
-        if j is None:
-            out = {"success": False,
-                   "error": "나라장터 응답 오류: 등록된 엔드포인트에서 데이터를 받지 못했습니다. "
-                            "DATA_GO_KR_KEY의 '나라장터 입찰공고정보서비스'(15129394) 활용신청·"
-                            "Decoding 키 여부를 확인하세요."}
-            if request.args.get("debug"):
-                out["_debug"] = {"op": op, "attempts": attempts}
-            return jsonify(out)
-        if not override:
-            _NARA_BASE[op] = chosen         # 성공 URL 캐시(다음부터 바로 사용)
-        header = ((j.get("response") or {}).get("header") or {})
-        body = ((j.get("response") or {}).get("body") or {})
-        arr = body.get("items") or []
-        if isinstance(arr, dict):
-            arr = arr.get("item") or []
-        items = []
-        for row in (arr if isinstance(arr, list) else [arr])[:50]:
-            clse = row.get("bidClseDt") or ""
-            ntce = row.get("bidNtceDt") or ""
-            openg = row.get("opengDt") or ""
-            est = row.get("presmptPrce") or row.get("presmptPrceMoney") or ""
-            budget = row.get("asignBdgtAmt") or row.get("asignBdgtAmtMoney") or ""
-            method = (row.get("cntrctCnclsMthdNm") or row.get("bidMethdNm") or "").strip()
-            items.append({
-                "title": row.get("bidNtceNm") or "(공고명 없음)",
-                "subtitle": row.get("ntceInsttNm") or row.get("dminsttNm") or "",
-                "begin": (_pick_dates(ntce) or [""])[0], "end": (_pick_dates(clse) or [""])[0],
-                "endText": clse, "bidNo": row.get("bidNtceNo") or "",
-                "type": _TYPE_LABEL.get(btype, ""), "method": method,
-                "est": _won_short(est), "budget": _won_short(budget), "openDt": openg,
-                "meta": [["공고번호", row.get("bidNtceNo") or "-"],
-                         ["개찰일시", openg or "-"],
-                         ["입찰마감", clse or "-"]],
-                "url": row.get("bidNtceDtlUrl") or row.get("bidNtceUrl") or ""})
-        resp = {"success": True, "count": len(items), "items": items}
-        if request.args.get("debug"):         # 배포 진단: 나라장터 응답 상태
-            resp["_debug"] = {"chosen": chosen, "op": op, "attempts": attempts,
-                              "resultCode": header.get("resultCode", ""),
-                              "resultMsg": header.get("resultMsg", ""),
-                              "totalCount": body.get("totalCount", ""),
-                              "item_count": len(items)}
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"조회 실패: {e}"})
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 지출결의서 본문 → 한글(.hwpx) 표 생성
-# 실제 내규 hwpx를 서식 베이스로 재사용(header/스타일 유지)하고 section0만 교체.
-# ══════════════════════════════════════════════════════════════════════════
-def _hwpx_base_bytes():
-    """HWPX 서식 베이스 바이트. 임베드 모듈 우선(서버리스 대응), 실패 시 내규 원본."""
-    try:
-        import base64 as _b64, hwpx_base
-        return _b64.b64decode(hwpx_base.BASE_HWPX_B64)
-    except Exception:
-        pass
-    import glob as _glob
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in ([os.path.join(here, "regulations", "보직관리기준", "original.hwpx")]
-                 + sorted(_glob.glob(os.path.join(here, "regulations", "*", "original.hwpx")))):
-        if os.path.exists(cand):
-            with open(cand, "rb") as f:
-                return f.read()
-    return None
-
-def _hwpx_full_border(header_xml):
-    """4면 모두 선이 있는 borderFill id를 찾는다(표 테두리용). 없으면 '3'."""
-    for blk in re.findall(r'<hh:borderFill\b.*?</hh:borderFill>', header_xml, re.S):
-        idm = re.match(r'<hh:borderFill id="([0-9]+)"', blk)
-        if not idm:
+def _sec_proc_status(p: dict, forms=None) -> dict:
+    """호환성 점검 — 연결 안 된 근거·서식(missing), 근사 연결(approx), 근거 규정 개정(stale)."""
+    forms = forms if forms is not None else _sec_forms_set()
+    missing, approx, seen = [], [], set()
+    resolved = {}
+    for kind, r in _sec_proc_refs(p):
+        reg = r.get("reg", "")
+        if reg not in resolved:
+            resolved[reg] = _sec_resolve_reg(reg)
+        m, via = resolved[reg]
+        key = (kind, reg, r.get("art", ""), r.get("label", ""))
+        if key in seen:
             continue
-        ok = 0
-        for side in ("leftBorder", "rightBorder", "topBorder", "bottomBorder"):
-            m = re.search(r'<hh:' + side + r'\b[^>]*type="([^"]+)"', blk)
-            if m and m.group(1) != "NONE":
-                ok += 1
-        if ok == 4:
-            return idm.group(1)
-    return "3"
+        seen.add(key)
+        if not m:
+            missing.append({"kind": kind, "reg": reg, "why": "규정 없음", **{k: r[k] for k in ("art", "label") if r.get(k)}})
+            continue
+        if via == "approx" and not any(a["reg"] == reg for a in approx):
+            approx.append({"reg": reg, "matched": m.get("title", "")})
+        if kind == "basis" and r.get("art") and not _sec_art(m["title"], r["art"]):
+            missing.append({"kind": kind, "reg": reg, "art": r["art"], "why": "조문 없음"})
+        if kind == "form" and (_norm_key(m["title"]), _norm_key(r.get("label", ""))) not in forms:
+            missing.append({"kind": kind, "reg": reg, "label": r.get("label", ""), "why": "서식 없음"})
+    # verified: {절차의 규정명: 개정} 또는 {절차의 규정명: {"title": 확인한 규정, "revision": 개정}}
+    #   같은 규정인데 개정이 다르면 stale(재확인 필요), 다른 규정(다른 기관·매핑)이면 unverified(우리 규정으로 확인 전)
+    stale, unverified = [], []
+    for reg, v in (p.get("verified") or {}).items():
+        m, via = resolved.get(reg) or _sec_resolve_reg(reg)
+        if not m or via == "approx":
+            continue
+        vt, vr = (v.get("title") or reg, v.get("revision", "")) if isinstance(v, dict) else (reg, v)
+        cur = m.get("revision", "")
+        if _norm_key(vt) != _norm_key(m.get("title", "")):
+            unverified.append({"reg": reg, "verified_title": vt, "matched": m.get("title", "")})
+        elif vr and cur and _norm_key(cur) != _norm_key(vr):
+            stale.append({"reg": reg, "verified": vr, "current": cur})
+    return {"ok": not missing and not stale, "missing": missing, "approx": approx,
+            "stale": stale, "unverified": unverified}
 
-def _xesc(s):
-    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
 
-def _hwpx_cell(text, col, row, cspan, width, height, bf, align):
-    para_h = "PARA_ALIGN_CENTER" if align == "center" else "PARA_ALIGN_LEFT"
-    return (
-        f'<hp:tc name="" header="0" hasMargin="1" protect="0" editable="0" dirty="0" borderFillIDRef="{bf}">'
-        f'<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" '
-        f'linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">'
-        f'<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
-        f'<hp:run charPrIDRef="0"><hp:t>{_xesc(text)}</hp:t></hp:run>'
-        f'<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" '
-        f'baseline="850" spacing="600" horzpos="0" horzsize="{width}" flags="393216"/></hp:linesegarray>'
-        f'</hp:p></hp:subList>'
-        f'<hp:cellAddr colAddr="{col}" rowAddr="{row}"/>'
-        f'<hp:cellSpan colSpan="{cspan}" rowSpan="1"/>'
-        f'<hp:cellSz width="{width}" height="{height}"/>'
-        f'<hp:cellMargin left="141" right="141" top="141" bottom="141"/></hp:tc>')
+def _sec_stamp(p: dict) -> dict:
+    """절차가 근거로 삼은 규정의 현재 개정 정보를 기록(이후 개정되면 '재확인 필요'로 감지)."""
+    ver = {}
+    for _, r in _sec_proc_refs(p):
+        m, _v = _sec_resolve_reg(r.get("reg", ""))
+        if m and m.get("revision"):
+            same = _norm_key(m.get("title", "")) == _norm_key(r["reg"])
+            ver[r["reg"]] = m["revision"] if same else {"title": m["title"], "revision": m["revision"]}
+    if ver:
+        p["verified"] = dict(sorted(ver.items()))
+    return p
 
-def _hwpx_table(payload, bf):
-    col_w = payload.get("colWidths") or []
-    col_cnt = int(payload.get("colCnt") or (len(col_w) or 1))
-    rows = payload.get("rows") or []
-    rh = 1848
-    total_w = sum(col_w) if col_w else 47628
-    trs = []
-    for r, cells in enumerate(rows):
-        col = 0
-        tcs = []
-        for c in cells:
-            cs = int(c.get("cs") or 1)
-            w = sum(col_w[col:col + cs]) if col_w else int(total_w / max(1, col_cnt)) * cs
-            align = c.get("align") or ("center" if c.get("hd") else "left")
-            tcs.append(_hwpx_cell(c.get("t", ""), col, r, cs, w, rh, bf, align))
-            col += cs
-        trs.append("<hp:tr>" + "".join(tcs) + "</hp:tr>")
-    tbl = (
-        f'<hp:tbl id="0" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" '
-        f'lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="0" rowCnt="{len(rows)}" colCnt="{col_cnt}" '
-        f'cellSpacing="0" borderFillIDRef="{bf}" noAdjust="0">'
-        f'<hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{rh*len(rows)}" heightRelTo="ABSOLUTE" protect="0"/>'
-        f'<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" '
-        f'vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>'
-        f'<hp:outMargin left="283" right="283" top="283" bottom="283"/>'
-        f'<hp:inMargin left="510" right="510" top="141" bottom="141"/>'
-        + "".join(trs) + '</hp:tbl>')
-    return (
-        '<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
-        f'<hp:run charPrIDRef="0">{tbl}</hp:run>'
-        '<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" '
-        'baseline="850" spacing="600" horzpos="0" horzsize="47628" flags="393216"/></hp:linesegarray></hp:p>')
 
-def _hwpx_empty_para():
-    return ('<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
-            '<hp:run charPrIDRef="0"></hp:run>'
-            '<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" '
-            'baseline="850" spacing="600" horzpos="0" horzsize="47628" flags="393216"/></hp:linesegarray></hp:p>')
+def _sec_holidays(cfg: dict) -> dict:
+    base = (_sec_read_json(SEC_HOLIDAYS_PATH, {}) or {}).get("dates") or {}
+    h = dict(base)
+    hc = cfg.get("holidays") or {}
+    for d in hc.get("extra") or []:
+        if isinstance(d, dict) and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d.get("date", ""))):
+            h[d["date"]] = _sec_clean_str(d.get("name"), 30) or "기관 휴일"
+    for d in hc.get("exclude") or []:
+        h.pop(str(d), None)
+    return h
 
-def _hwpx_build_section(base_sec, payload, bf):
-    m = re.search(r'<hs:sec\b[^>]*>', base_sec)
-    if not m:
-        raise ValueError("section root not found")
-    prefix = base_sec[:m.end()]                 # xml 선언 + <hs:sec ...>
-    body = base_sec[m.end():]
-    pi = body.find('<hp:p')
-    pj = body.find('</hp:p>', pi) + len('</hp:p>')
-    first_para = body[pi:pj]                     # secPr 문단(페이지 설정)
-    first_para = re.sub(r'<hp:t>.*?</hp:t>', '<hp:t></hp:t>', first_para, flags=re.S)
-    title = payload.get("title")
-    title_para = ""
-    if title:
-        title_para = (
-            '<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
-            f'<hp:run charPrIDRef="0"><hp:t>{_xesc(title)}</hp:t></hp:run>'
-            '<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1200" textheight="1200" '
-            'baseline="1020" spacing="600" horzpos="0" horzsize="47628" flags="393216"/></hp:linesegarray></hp:p>')
-    return (prefix + first_para + title_para + _hwpx_table(payload, bf)
-            + _hwpx_empty_para() + '</hs:sec>')
 
-@app.route("/api/expense/hwpx", methods=["POST"])
-def expense_hwpx():
-    """지출결의서 본문 표를 한글(.hwpx) 파일로 생성. 서식 베이스는 내규 hwpx 재사용."""
-    data = request.get_json(silent=True) or {}
-    if not (data.get("rows")):
-        return jsonify({"success": False, "error": "표 데이터가 없습니다."}), 400
-    base = _hwpx_base_bytes()
-    if not base:
-        return jsonify({"success": False, "error": "HWPX 기본 서식을 찾을 수 없습니다."}), 500
+def _sec_public_config(cfg: dict) -> dict:
+    return {"org": cfg.get("org", {}), "service": cfg.get("service", {}), "terms": cfg.get("terms", {}),
+            "reg_aliases": cfg.get("reg_aliases", {}), "holidays": cfg.get("holidays", {}),
+            "updated": cfg.get("updated", "")}
+
+
+@app.route("/api/secretary/config")
+def secretary_config():
+    """기관 설정(브랜드·명칭·매핑·휴일). 업로드 화면 등 다른 페이지도 이 값을 쓴다."""
+    cfg = _sec_config(force=request.args.get("fresh") == "1")
+    return jsonify({"success": True, "config": _sec_public_config(cfg), "holidays": _sec_holidays(cfg)})
+
+
+@app.route("/api/secretary/procedures")
+def secretary_procedures():
+    """서무비서 절차 — 공통 층 + 기관 층(+각 절차의 호환성 상태). 개인 층은 브라우저가 합친다."""
+    fresh = request.args.get("fresh") == "1"
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": [], "drafts": {}})
+    org = _sec_org_load(force=fresh)
+    cfg = _sec_config(force=fresh)
+    forms = _sec_forms_set()
+    status = {}
+    for layer, procs in (("common", common.get("procedures", [])), ("org", org.get("procedures", []))):
+        for p in procs:
+            if not p.get("hidden"):
+                status[f"{layer}:{p['id']}"] = _sec_proc_status(p, forms)
+    return jsonify({
+        "success": True,
+        "common": {"procedures": common.get("procedures", []), "drafts": common.get("drafts", {}),
+                   "updated": common.get("updated", "")},
+        "org": {"procedures": org.get("procedures", []), "drafts": org.get("drafts", {}),
+                "updated": org.get("updated", ""), "updated_by": org.get("updated_by", "")},
+        "status": status,
+        "config": _sec_public_config(cfg),
+        "holidays": _sec_holidays(cfg),
+        "regs": len(_load_reg_manifest()),
+        "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
+                  "github": _gh_enabled()},
+    })
+
+
+@app.route("/api/secretary/check", methods=["POST"])
+def secretary_check():
+    """절차 목록(개인 절차·가져올 절차 팩)의 호환성 점검 — 저장하지 않는다."""
+    body = request.get_json(silent=True) or {}
+    procs = body.get("procedures")
+    if not isinstance(procs, list) or len(procs) > 300:
+        return jsonify({"success": False, "error": "procedures 목록(최대 300건)이 필요합니다."}), 400
+    forms = _sec_forms_set()
+    out = {}
+    for p in procs:
+        c = _sec_clean_proc(p)
+        if c and not c.get("hidden"):
+            if isinstance(p.get("verified"), dict):
+                c["verified"] = {str(k)[:80]: ({"title": _sec_clean_str(v.get("title"), 80), "revision": _sec_clean_str(v.get("revision"), 60)}
+                                               if isinstance(v, dict) else _sec_clean_str(v, 60))
+                                 for k, v in list(p["verified"].items())[:40]}
+            out[c["id"]] = _sec_proc_status(c, forms)
+    return jsonify({"success": True, "status": out})
+
+
+@app.route("/api/secretary/regs")
+def secretary_regs():
+    """규정명 매핑용 — 우리 기관 규정 목록과, 절차들이 참조하는 규정명이 어디에 연결되는지."""
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": []})
+    org = _sec_org_load()
+    names = set()
+    for p in common.get("procedures", []) + org.get("procedures", []):
+        names |= {r.get("reg", "") for _, r in _sec_proc_refs(p)}
+    refs = []
+    for n in sorted(x for x in names if x):
+        m, via = _sec_resolve_reg(n)
+        refs.append({"name": n, "matched": (m or {}).get("title", ""), "via": via})
+    regs = [{"title": m.get("title", ""), "category": m.get("category", ""), "revision": m.get("revision", "")}
+            for m in _load_reg_manifest()]
+    return jsonify({"success": True, "refs": refs, "regs": regs})
+
+
+@app.route("/api/secretary/basis")
+def secretary_basis():
+    """근거 조문 본문. reg+art 이면 해당 조문, reg+q 이면 규정 안에서 q 가 들어간 단락."""
+    reg = (request.args.get("reg") or "").strip()
+    art = (request.args.get("art") or "").strip().replace("제", "").replace("조", "")
+    q = (request.args.get("q") or "").strip()
+    if not reg or not (art or q):
+        return jsonify({"error": "reg 와 art 또는 q 가 필요합니다."}), 400
+    meta, via = _sec_resolve_reg(reg)
+    if not meta:
+        return jsonify({"success": False, "error": f"「{reg}」 규정이 등록되어 있지 않습니다. "
+                                                   "관리자에게 규정 업로드나 규정명 매핑을 요청하세요."})
+    title = meta.get("title") or reg
+    extra = {"revision": meta.get("revision", ""), "via": via,
+             **({"requested": reg} if _norm_key(reg) != _norm_key(title) else {})}
+    if art:
+        hit = _sec_art(title, art)
+        if hit:
+            t, no, at, text = hit
+            return jsonify({"success": True, "reg": t, "art": no, "art_title": at, "text": text, **extra})
+        return jsonify({"success": False, "error": f"「{title}」 제{art}조를 찾지 못했습니다.", **extra})
+    text = _sec_reg_text(title)
+    if not text:
+        return jsonify({"success": False, "error": f"「{title}」 원문을 찾지 못했습니다."})
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.split("\n")]
+    lines = [ln for ln in lines if ln]
+    ql = _norm_key(q)
+    picks, used = [], set()
+    for i, ln in enumerate(lines):
+        if ql in _norm_key(ln) and i not in used:
+            seg = [j for j in range(i, min(i + 4, len(lines))) if j not in used]
+            used.update(seg)
+            picks.append("\n".join(lines[j] for j in seg))
+        if len(picks) >= 3:
+            break
+    if not picks:
+        return jsonify({"success": False, "error": f"「{title}」에서 '{q}'를 찾지 못했습니다.", **extra})
+    snippet = "\n…\n".join(picks)[:1800]
+    return jsonify({"success": True, "reg": title, "q": q, "text": snippet, **extra})
+
+
+@app.route("/api/secretary/related")
+def secretary_related():
+    """등록된 절차가 없을 때 — 상황 문장과 관련 있는 내규 조문(키워드 + 가능하면 의미 검색)."""
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"success": True, "items": []})
+    words = [w for w in re.split(r"[\s,.!?~·]+", q) if len(w) >= 2]
+    # 조사·어미를 대충 떼어 낸 어간도 함께 본다("정산해야" → "정산")
+    stems = set()
+    for w in words:
+        stems.add(w)
+        s = re.sub(r"(해야|하려면|하고|해서|했는데|하는|할|해요|합니다|에서|으로|에게|까지|부터|이랑|를|을|이|가|은|는|에|로|와|과|도|만)$", "", w)
+        if len(s) >= 2:
+            stems.add(s)
+    scored = []
+    for t, no, at, text in _sec_chunks():
+        head = (t + " " + (at or ""))
+        sc = 0
+        for s in stems:
+            if s in head:
+                sc += 3
+            c = text.count(s)
+            if c:
+                sc += min(c, 4)
+        if sc:
+            scored.append((sc, t, no, at, text))
+    scored.sort(key=lambda x: -x[0])
+    items, seen = [], set()
+    for sc, t, no, at, text in scored[:40]:
+        k = (t, no)
+        if k in seen:
+            continue
+        seen.add(k)
+        items.append({"reg": t, "art": no, "art_title": at, "preview": text[:220], "score": sc, "src": "keyword"})
+        if len(items) >= 8:
+            break
+    for h in _semantic_for_search(q, top_k=6):
+        k = (h["title"], h["no"])
+        if k in seen:
+            continue
+        seen.add(k)
+        items.append({"reg": h["title"], "art": h["no"], "art_title": h["art_title"],
+                      "preview": h["preview"][:220], "score": h["score"], "src": "semantic"})
+    return jsonify({"success": True, "items": items[:12]})
+
+
+def _sec_save_repo_file(repo_path: str, local_path: str, payload: str, message: str) -> str:
+    """기관 층·설정 저장 — GitHub 연동 시 커밋, 아니면 로컬 파일. 안내 문구를 돌려준다."""
+    if _gh_enabled():
+        sha = _gh_commit_files({repo_path: payload}, message)
+        return f"저장소에 커밋했습니다({sha[:7]}). 배포가 끝나면 모든 사용자에게 반영됩니다."
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp = local_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(tmp, local_path)
+    return "서버에 저장했습니다."
+
+
+_SEC_READONLY_MSG = ("이 서버는 파일을 쓸 수 없습니다(읽기 전용 배포). "
+                     "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다.")
+
+
+@app.route("/api/secretary/org", methods=["POST"])
+def secretary_org_save():
+    """기관 층 저장(관리자). 내규 업로드와 같은 토큰을 쓰고, GitHub 연동 시 저장소에 커밋한다."""
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    body = request.get_json(silent=True) or {}
+    raw = body.get("procedures")
+    if not isinstance(raw, list) or len(raw) > 200:
+        return jsonify({"success": False, "error": "procedures 목록(최대 200건)이 필요합니다."}), 400
+    procs = [_sec_clean_proc(x) for x in raw]
+    if any(p is None for p in procs):
+        # 잘못된 항목을 조용히 버리고 저장하면 기존 기관 절차가 유실될 수 있으므로 거부한다
+        return jsonify({"success": False, "error": "id(영문 소문자·숫자·하이픈)나 제목이 올바르지 않은 절차가 있습니다."}), 400
+    ids = [p["id"] for p in procs]
+    if len(ids) != len(set(ids)):
+        return jsonify({"success": False, "error": "같은 id 의 절차가 두 번 들어 있습니다."}), 400
+    procs = [p if p.get("hidden") else _sec_stamp(p) for p in procs]   # 저장 시점의 근거 개정 기록
+    drafts = {}
+    for k, d in (body.get("drafts") or {}).items():
+        k = _sec_clean_str(k, 48).lower()
+        if not _SEC_ID_RE.match(k) or not isinstance(d, dict) or not d.get("template"):
+            continue
+        drafts[k] = {"title": _sec_clean_str(d.get("title"), 60) or k,
+                     "template": _sec_clean_str(d.get("template"), 4000),
+                     "fields": [{"k": _sec_clean_str(f.get("k"), 24), "l": _sec_clean_str(f.get("l"), 40),
+                                 "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {})}
+                                for f in (d.get("fields") or [])[:20] if isinstance(f, dict) and f.get("k")]}
+    data = {"version": 1, "layer": "org", "updated": _now_kst(),
+            "updated_by": _sec_clean_str(body.get("editor"), 40),
+            "procedures": procs, "drafts": drafts}
+    payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
     try:
-        zin = zipfile.ZipFile(_io.BytesIO(base), "r")
-        header = zin.read("Contents/header.xml").decode("utf-8", "ignore")
-        base_sec = zin.read("Contents/section0.xml").decode("utf-8", "ignore")
-        bf = _hwpx_full_border(header)
-        new_sec = _hwpx_build_section(base_sec, data, bf)
-        out = _io.BytesIO()
-        zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
-        zi = zipfile.ZipInfo("mimetype")
-        zout.writestr(zi, "application/hwp+zip", compress_type=zipfile.ZIP_STORED)
-        for n in zin.namelist():
-            if n in ("mimetype", "Preview/PrvImage.png"):
-                continue
-            if n == "Contents/section0.xml":
-                zout.writestr(n, new_sec.encode("utf-8"))
-            else:
-                zout.writestr(n, zin.read(n))
-        zout.close(); zin.close()
-        fname = (data.get("filename") or "지출결의서") + ".hwpx"
-        from urllib.parse import quote as _q
-        return Response(out.getvalue(), mimetype="application/hwp+zip",
-                        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + _q(fname)})
+        where = _sec_save_repo_file(SEC_ORG_REPO_PATH, SEC_ORG_PATH, payload,
+                                    f"서무비서 기관 절차 갱신: {len(procs)}건")
+    except OSError:
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
     except Exception as e:
-        return jsonify({"success": False, "error": f"HWPX 생성 실패: {e}"}), 500
+        return jsonify({"success": False, "error": str(e)}), 502
+    _SEC_ORG_CACHE.update({"ts": time.time(), "data": data})
+    return jsonify({"success": True, "count": len(procs), "message": where, "org": data})
+
+
+_SEC_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+@app.route("/api/secretary/config", methods=["POST"])
+def secretary_config_save():
+    """기관 설정 저장(관리자) — 기관명·서비스 이름·색·명칭·규정명 매핑·기관 휴일."""
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    body = (request.get_json(silent=True) or {}).get("config") or {}
+    if not isinstance(body, dict):
+        return jsonify({"success": False, "error": "config 객체가 필요합니다."}), 400
+    org = body.get("org") or {}
+    svc = body.get("service") or {}
+    if not _sec_clean_str(org.get("name"), 60):
+        return jsonify({"success": False, "error": "기관명을 입력하세요."}), 400
+    primary = _sec_clean_str(svc.get("primary"), 7)
+    cfg = {
+        "schema_version": 1,
+        "org": {k: _sec_clean_str(org.get(k), 60) for k in ("name", "short", "abbr")},
+        "service": {"title": _sec_clean_str(svc.get("title"), 30) or "서무비서",
+                    "icon": _sec_clean_str(svc.get("icon"), 4) or "🗂",
+                    "primary": primary if _SEC_HEX.match(primary) else "#256ef4",
+                    "tagline": _sec_clean_str(svc.get("tagline"), 120),
+                    "footer": _sec_clean_str(svc.get("footer"), 300)},
+        "terms": {k: _sec_clean_str((body.get("terms") or {}).get(k), 30) or _SEC_CFG_DEFAULT["terms"][k]
+                  for k in _SEC_TERM_KEYS},
+        "reg_aliases": {_sec_clean_str(k, 80): _sec_clean_str(v, 80)
+                        for k, v in list((body.get("reg_aliases") or {}).items())[:300]
+                        if _sec_clean_str(k, 80) and _sec_clean_str(v, 80)},
+        "holidays": {
+            "extra": [{"date": d["date"], "name": _sec_clean_str(d.get("name"), 30) or "기관 휴일"}
+                      for d in ((body.get("holidays") or {}).get("extra") or [])[:100]
+                      if isinstance(d, dict) and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d.get("date", "")))],
+            "exclude": [str(d) for d in ((body.get("holidays") or {}).get("exclude") or [])[:100]
+                        if re.match(r"^\d{4}-\d{2}-\d{2}$", str(d))],
+        },
+        "updated": _now_kst(),
+        "updated_by": _sec_clean_str((request.get_json(silent=True) or {}).get("editor"), 40),
+    }
+    payload = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
+    try:
+        where = _sec_save_repo_file(SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, payload,
+                                    f"서무비서 기관 설정 갱신: {cfg['org']['name']}")
+    except OSError:
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    _SEC_CFG_CACHE.update({"ts": time.time(), "data": cfg})
+    return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config())})
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
@@ -6259,7 +2210,7 @@ PORT = int(os.environ.get("PORT", 5100))
 if __name__ == "__main__":
     url = f"http://localhost:{PORT}"
     print("=" * 50)
-    print("  🌾  KOAT 내규&국가법령 종합 검색 서비스")
+    print("  🗂  KOAT 서무비서")
     print(f"  🔗  {url}")
     print("  종료: Ctrl+C")
     print("=" * 50)

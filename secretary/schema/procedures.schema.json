@@ -1,0 +1,89 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://koat-secretary/schema/procedures.schema.json",
+ "title": "서무비서 절차 파일·절차 팩",
+ "description": "secretary/procedures.json(공통), secretary/org.json(기관), 절차 팩(kind=secretary-pack) 공용 형식. 규정은 이름으로 참조하며 기관 설정의 reg_aliases 로 각 기관 규정에 연결된다. 문장 속 [[erp]]·[[portal]]·[[accounting]]·[[approval]]·[[org]]·[[abbr]] 은 기관 설정의 명칭으로 바뀐다.",
+ "type": "object",
+ "required": ["procedures"],
+ "properties": {
+  "kind": {"const": "secretary-pack", "description": "절차 팩일 때만"},
+  "schema_version": {"type": "integer", "minimum": 1},
+  "version": {"type": "integer"},
+  "layer": {"enum": ["common", "org"]},
+  "name": {"type": "string"},
+  "source_org": {"type": "string"},
+  "exported": {"type": "string"},
+  "updated": {"type": "string"},
+  "updated_by": {"type": "string"},
+  "note": {"type": "string"},
+  "procedures": {"type": "array", "maxItems": 300, "items": {"$ref": "#/$defs/procedure"}},
+  "drafts": {"type": "object", "additionalProperties": {"$ref": "#/$defs/draft"}},
+  "regs": {"type": "array", "description": "팩이 참조하는 규정명과 원 기관의 개정 정보",
+           "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}, "revision": {"type": "string"}}}}
+ },
+ "$defs": {
+  "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9\\-]{1,47}$"},
+  "regRef": {
+   "type": "object", "required": ["reg"],
+   "description": "근거: reg + art(조번호, 예 \"8\"·\"3의2\") 또는 reg + q(조문 번호가 없는 지침에서 찾을 말). 서식: reg + label(예 \"별지 제5호 서식\")",
+   "properties": {"reg": {"type": "string", "maxLength": 80}, "art": {"type": "string", "pattern": "^\\d+(의\\d+)?$"},
+                  "q": {"type": "string", "maxLength": 60}, "label": {"type": "string", "maxLength": 60}, "title": {"type": "string", "maxLength": 60}},
+   "additionalProperties": false
+  },
+  "step": {
+   "type": "object", "required": ["t"],
+   "properties": {
+    "t": {"type": "string", "maxLength": 400, "description": "할 일"},
+    "when": {"type": "string", "maxLength": 60, "description": "시점 안내(예: 마친 날 다음 날부터 14일 이내)"},
+    "optional": {"type": "boolean"},
+    "deadline": {"type": "object", "required": ["ref", "days"],
+                 "description": "기준일(dates[].k) + days 일. 음수는 그 전(예: 출국 10일 전 = -10)",
+                 "properties": {"ref": {"type": "string"}, "days": {"type": "integer", "minimum": -365, "maximum": 365}, "label": {"type": "string"}},
+                 "additionalProperties": false},
+    "docs": {"type": "array", "items": {"type": "string", "maxLength": 80}, "maxItems": 10},
+    "basis": {"type": "array", "items": {"$ref": "#/$defs/regRef"}, "maxItems": 6},
+    "form": {"$ref": "#/$defs/regRef"},
+    "draft": {"type": "string", "description": "drafts 의 키"},
+    "act": {"type": "object", "required": ["k", "id"], "description": "다른 절차로 이동",
+            "properties": {"k": {"const": "proc"}, "id": {"$ref": "#/$defs/id"}, "l": {"type": "string"}}, "additionalProperties": false}
+   },
+   "additionalProperties": false
+  },
+  "procedure": {
+   "type": "object", "required": ["id", "title"],
+   "properties": {
+    "id": {"$ref": "#/$defs/id"},
+    "title": {"type": "string", "maxLength": 80},
+    "hidden": {"type": "boolean", "description": "true 면 같은 id 의 아래 층 절차를 숨긴다"},
+    "icon": {"type": "string", "maxLength": 4},
+    "category": {"type": "string", "maxLength": 20},
+    "summary": {"type": "string", "maxLength": 300},
+    "approval": {"type": "string", "maxLength": 200, "description": "결재선 안내"},
+    "triggers": {"type": "array", "items": {"type": "string", "maxLength": 30}, "maxItems": 40, "description": "이 말이 들어간 상황 문장에 반응"},
+    "dates": {"type": "array", "maxItems": 3, "items": {"type": "object", "required": ["k", "l"],
+              "properties": {"k": {"type": "string"}, "l": {"type": "string"}}, "additionalProperties": false}},
+    "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}, "maxItems": 20},
+    "forms": {"type": "array", "items": {"$ref": "#/$defs/regRef"}, "maxItems": 12},
+    "pitfalls": {"type": "array", "maxItems": 15, "description": "제출 전 반려 점검 항목",
+                 "items": {"type": "object", "required": ["t"], "properties": {"t": {"type": "string", "maxLength": 300},
+                           "basis": {"type": "array", "items": {"$ref": "#/$defs/regRef"}, "maxItems": 3}}, "additionalProperties": false}},
+    "tips": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 10},
+    "verified": {"type": "object", "description": "근거 규정의 확인 당시 개정. 값이 문자열이면 같은 이름의 규정, 객체면 실제로 대조한 규정(title)과 개정",
+                 "additionalProperties": {"oneOf": [{"type": "string"},
+                   {"type": "object", "required": ["title", "revision"], "properties": {"title": {"type": "string"}, "revision": {"type": "string"}}}]}}
+   },
+   "additionalProperties": false
+  },
+  "draft": {
+   "type": "object", "required": ["title", "template"],
+   "properties": {
+    "title": {"type": "string"},
+    "template": {"type": "string", "description": "{{키}} · {{키|list}} · {{키|list|기본값}} · {{키|text|기본값}}"},
+    "fields": {"type": "array", "items": {"type": "object", "required": ["k", "l"],
+               "properties": {"k": {"type": "string"}, "l": {"type": "string"}, "ph": {"type": "string"}, "multi": {"type": "boolean"},
+                              "auto": {"enum": ["period", "start", "history"]}}, "additionalProperties": false}}
+   },
+   "additionalProperties": false
+  }
+ }
+}

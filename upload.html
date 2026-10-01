@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>개정 내규 업로드 · KOAT 내규&국가법령 종합 검색</title>
+<title>개정 내규 업로드 · KOAT 서무비서</title>
 <style>
 :root{
   --bg:#f6f7f9; --sf:#fff; --tx:#1a1d21; --mu:#5b6472; --ht:#8b95a5;
@@ -272,7 +272,7 @@ body.dark .result.ok{border-color:#065f46;}
       <div class="hd-s">개정된 사규(내규)를 올리면 내규 조회 및 전문 화면에 최신본으로 반영됩니다</div>
     </div>
     <div class="hd-actions">
-      <a class="tbtn" href="/">&#x2190; 검색으로</a>
+      <a class="tbtn" href="/">&#x2190; 서무비서로</a>
       <button class="tbtn" id="darkBtn" onclick="toggleDark()">&#x1F319;</button>
     </div>
   </div>
@@ -460,7 +460,7 @@ body.dark .result.ok{border-color:#065f46;}
     <div class="dialog" id="confirmDialog"></div>
   </div>
 
-  <div class="foot">KOAT 내규&amp;국가법령 종합 검색 서비스 &middot; 개정 내규 업로드</div>
+  <div class="foot">KOAT 서무비서 &middot; 개정 내규 업로드</div>
 </div>
 
 <script>
@@ -901,7 +901,7 @@ function renderManagement(){
       +'<td data-label="업로드 일시"><span class="mgmt-date">'+esc(u.uploaded_at||'-')+'</span></td>'
       +'<td data-label="작업"><div class="mgmt-acts">'
       +'<a href="'+esc(u.html||'#')+'" target="_blank">전문보기</a>'
-      +'<a href="/?q='+encodeURIComponent(u.title)+'">검색</a>'
+      +'<a href="/?reg='+encodeURIComponent(u.title)+'">원문</a>'
       +'<button onclick="removeUpload(\''+slugEnc+'\',\''+esc(u.title).replace(/'/g,"\\'")+'\')">되돌리기</button>'
       +'</div></td></tr>';
   }).join('');
@@ -1046,5 +1046,9 @@ function showMgmtResult(ok,html){
 initTab();
 loadStatus();
 </script>
+<script>/* 기관 설정(이름·색)을 업로드 화면에도 적용 */
+fetch('/api/secretary/config').then(function(r){return r.json();}).then(function(d){ var c=(d&&d.config)||{}, o=c.org||{}, v=c.service||{};
+  var t=[o.short||o.name, v.title||'서무비서'].filter(Boolean).join(' '); document.title='개정 내규 업로드 · '+t;
+  var f=document.querySelector('.foot'); if(f) f.textContent=t+' · 개정 내규 업로드'; }).catch(function(){});</script>
 </body>
 </html>
