@@ -1963,6 +1963,7 @@ def secretary_procedures():
         "config": _sec_public_config(cfg),
         "holidays": _sec_holidays(cfg),
         "regs": len(_load_reg_manifest()),
+        "ai": _sec_ai_status(),
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
                   "github": _gh_enabled()},
     })
@@ -2202,6 +2203,360 @@ def secretary_config_save():
         return jsonify({"success": False, "error": str(e)}), 502
     _SEC_CFG_CACHE.update({"ts": time.time(), "data": cfg})
     return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config())})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 서무비서 AI — 영수증 인식 · 상황 이해 (기관이 키를 설정한 경우에만)
+#   ANTHROPIC_API_KEY 가 있으면 Claude, 없고 GEMINI_API_KEY 가 있으면 Gemini 를 쓴다
+#   (SECRETARY_AI_PROVIDER=claude|gemini 로 고정 가능). 키가 없으면 화면은 수동 입력으로 동작한다.
+#   AI 는 절차를 '고르기'와 영수증 '읽기'에만 쓰고, 규정 내용을 만들어 내게 하지 않는다.
+# ══════════════════════════════════════════════════════════════════════════
+SEC_AI_MAX_IMAGE = 5 * 1024 * 1024          # 영수증 이미지 최대 크기(바이트, 디코딩 후)
+_SEC_AI_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_SEC_AI_HITS: dict = {}                      # IP → [시각] — 기관 키 남용을 막는 간단한 속도 제한
+_SEC_AI_LIMIT = int(os.environ.get("SECRETARY_AI_RATE", "40") or 40)   # IP 당 10분에 허용할 요청 수
+
+
+def _sec_ai_provider() -> str:
+    p = (os.environ.get("SECRETARY_AI_PROVIDER") or "").strip().lower()
+    if p in ("claude", "gemini"):
+        return p if _sec_ai_key(p) else ""
+    if _sec_ai_key("claude"):
+        return "claude"
+    if _sec_ai_key("gemini"):
+        return "gemini"
+    return ""
+
+
+def _sec_ai_key(provider: str) -> str:
+    return _env_clean("ANTHROPIC_API_KEY" if provider == "claude" else "GEMINI_API_KEY")
+
+
+def _sec_ai_model(provider: str) -> str:
+    m = _env_clean("SECRETARY_AI_MODEL")
+    if m:
+        return m
+    return "claude-opus-5-5" if provider == "claude" else (_env_clean("GEMINI_MODEL") or "gemini-2.5-flash")
+
+
+def _sec_ai_status() -> dict:
+    p = _sec_ai_provider()
+    return {"available": bool(p), "provider": p, "model": _sec_ai_model(p) if p else ""}
+
+
+def _sec_ai_rate_ok() -> bool:
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    hits = [t for t in _SEC_AI_HITS.get(ip, []) if now - t < 600]
+    if len(hits) >= _SEC_AI_LIMIT:
+        _SEC_AI_HITS[ip] = hits
+        return False
+    hits.append(now)
+    _SEC_AI_HITS[ip] = hits
+    if len(_SEC_AI_HITS) > 5000:             # 메모리 보호
+        _SEC_AI_HITS.clear()
+    return True
+
+
+class _SecAIError(Exception):
+    pass
+
+
+def _sec_ai_json(system: str, text: str, schema: dict, image=None) -> dict:
+    """AI 에 구조화된 JSON 응답을 요청한다. image=(media_type, base64 문자열)."""
+    provider = _sec_ai_provider()
+    if not provider:
+        raise _SecAIError("AI 키가 설정되어 있지 않습니다.")
+    model = _sec_ai_model(provider)
+    if provider == "claude":
+        try:
+            import anthropic
+        except ImportError:
+            raise _SecAIError("서버에 anthropic 패키지가 설치되어 있지 않습니다.")
+        content = []
+        if image:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": image[0], "data": image[1]}})
+        content.append({"type": "text", "text": text})
+        client = anthropic.Anthropic(api_key=_sec_ai_key("claude"), timeout=60.0, max_retries=2)
+        try:
+            resp = client.beta.messages.create(
+                model=model,
+                max_tokens=16000,
+                system=system,
+                messages=[{"role": "user", "content": content}],
+                # 단순 추출·분류 작업이라 노력 수준은 낮게. 응답은 스키마로 고정한다.
+                output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+                # 안전 분류기가 거절하면 서버가 권장 모델로 다시 실행한다
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+            )
+        except anthropic.AuthenticationError:
+            raise _SecAIError("AI 키(ANTHROPIC_API_KEY)가 올바르지 않습니다.")
+        except anthropic.RateLimitError:
+            raise _SecAIError("AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도하세요.")
+        except anthropic.BadRequestError as e:
+            raise _SecAIError(f"AI 요청 오류: {e.message}")
+        except anthropic.APIStatusError as e:
+            raise _SecAIError(f"AI 서버 오류({e.status_code}). 잠시 후 다시 시도하세요.")
+        except anthropic.APIConnectionError:
+            raise _SecAIError("AI 서버에 연결하지 못했습니다.")
+        if resp.stop_reason == "refusal":
+            raise _SecAIError("AI 가 이 요청을 처리하지 않았습니다.")
+        if resp.stop_reason == "max_tokens":
+            raise _SecAIError("AI 응답이 너무 길어 끊겼습니다.")
+        out = next((b.text for b in resp.content if b.type == "text"), "")
+    else:
+        parts = []
+        if image:
+            parts.append({"inline_data": {"mime_type": image[0], "data": image[1]}})
+        parts.append({"text": text + "\n\n다음 JSON 스키마를 따르는 JSON 하나만 출력:\n"
+                      + json.dumps(schema, ensure_ascii=False)})
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent"
+        try:
+            r = _SESSION.post(url, params={"key": _sec_ai_key("gemini")}, timeout=60, json={
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0}})
+        except req_lib.RequestException:
+            raise _SecAIError("AI 서버에 연결하지 못했습니다.")
+        if r.status_code >= 400:
+            raise _SecAIError(f"AI 서버 오류({r.status_code}).")
+        try:
+            out = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            raise _SecAIError("AI 응답을 읽지 못했습니다.")
+    try:
+        data = json.loads(out)
+    except Exception:
+        m = re.search(r"\{.*\}", out or "", re.S)
+        if not m:
+            raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
+        data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
+    return data
+
+
+_SEC_RECEIPT_KINDS = ["운임", "숙박", "식비", "회의비", "물품", "기타"]
+_SEC_RECEIPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "date": {"type": "string", "description": "거래(이용) 날짜 YYYY-MM-DD. 모르면 빈 문자열"},
+        "end_date": {"type": "string", "description": "숙박 체크아웃·이용 종료일 YYYY-MM-DD. 없으면 빈 문자열"},
+        "amount": {"type": "integer", "description": "총 결제 금액(부가세 포함, 원). 모르면 0"},
+        "vendor": {"type": "string", "description": "가맹점·상호(예: 코레일, ○○호텔)"},
+        "kind": {"type": "string", "enum": _SEC_RECEIPT_KINDS},
+        "payment": {"type": "string", "enum": ["법인카드", "개인카드", "현금", "기타", "알수없음"]},
+        "nights": {"type": "integer", "description": "숙박이면 박 수, 아니면 0"},
+        "route": {"type": "string", "description": "운임이면 구간(예: 서울→오송), 아니면 빈 문자열"},
+        "items": {"type": "string", "description": "주요 품목·내역을 짧게"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "note": {"type": "string", "description": "흐림·잘림 등 확인이 필요한 점. 없으면 빈 문자열"},
+    },
+    "required": ["date", "end_date", "amount", "vendor", "kind", "payment", "nights", "route", "items",
+                 "confidence", "note"],
+    "additionalProperties": False,
+}
+_SEC_RECEIPT_SYSTEM = (
+    "당신은 한국 공공기관의 경비 정산을 돕는 서무 비서입니다. 영수증·승차권·숙박 영수증·카드 매출전표 이미지에서 "
+    "정산에 필요한 항목만 정확히 읽습니다. 이미지에 실제로 보이는 값만 쓰고, 보이지 않거나 흐린 값은 추측하지 말고 "
+    "빈 문자열이나 0으로 두세요. 카드번호·전화번호·주민등록번호 같은 개인정보는 어떤 칸에도 옮겨 적지 마세요. "
+    "금액은 총 결제액(부가세 포함)을 원 단위 정수로 씁니다. kind 는 철도·버스·항공·택시·통행료·주차는 '운임', "
+    "숙박업소는 '숙박', 음식점은 '식비', 다과·회의 장소는 '회의비', 물품 구입은 '물품', 그 밖은 '기타'로 고릅니다."
+)
+
+
+@app.route("/api/secretary/ai/status")
+def secretary_ai_status():
+    return jsonify({"success": True, **_sec_ai_status()})
+
+
+@app.route("/api/secretary/ai/receipt", methods=["POST"])
+def secretary_ai_receipt():
+    """영수증 이미지 → 날짜·금액·가맹점·종류. 이미지는 저장하지 않고 AI 분석에만 쓴다."""
+    if not _sec_ai_provider():
+        return jsonify({"success": False, "need_key": True,
+                        "error": "AI 영수증 인식이 설정되어 있지 않습니다. 날짜·금액을 직접 입력하세요."}), 503
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요."}), 429
+    body = request.get_json(silent=True) or {}
+    m = re.match(r"^data:(image/[a-z+.-]+);base64,(.+)$", str(body.get("image") or ""), re.S)
+    if not m or m.group(1) not in _SEC_AI_IMAGE_TYPES:
+        return jsonify({"success": False, "error": "JPG·PNG·WEBP 이미지만 올릴 수 있습니다."}), 400
+    b64 = re.sub(r"\s+", "", m.group(2))
+    try:
+        size = len(base64.b64decode(b64, validate=True))
+    except Exception:
+        return jsonify({"success": False, "error": "이미지를 읽지 못했습니다."}), 400
+    if size > SEC_AI_MAX_IMAGE:
+        return jsonify({"success": False, "error": "이미지가 너무 큽니다(최대 5MB)."}), 413
+    ctx = _sec_clean_str(body.get("context"), 120)
+    year = _sec_clean_str(body.get("year"), 4)
+    prompt = ("이 증빙 이미지를 읽어 주세요."
+              + (f" 처리 중인 업무: {ctx}." if ctx else "")
+              + (f" 연도가 인쇄되지 않았으면 {year}년으로 봅니다." if re.match(r"^\d{4}$", year or "") else ""))
+    try:
+        data = _sec_ai_json(_SEC_RECEIPT_SYSTEM, prompt, _SEC_RECEIPT_SCHEMA, image=(m.group(1), b64))
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    # 응답 정리: 날짜 형식·금액 범위·열거값을 다시 확인한다(AI 출력은 데이터로만 다룬다)
+    def _d(v):
+        v = str(v or "").strip()
+        return v if re.match(r"^\d{4}-\d{2}-\d{2}$", v) else ""
+    def _i(v, hi):
+        try:
+            return max(0, min(hi, int(v)))
+        except (TypeError, ValueError):
+            return 0
+    rc = {
+        "date": _d(data.get("date")), "end_date": _d(data.get("end_date")),
+        "amount": _i(data.get("amount"), 100_000_000), "nights": _i(data.get("nights"), 60),
+        "vendor": _sec_clean_str(data.get("vendor"), 60), "route": _sec_clean_str(data.get("route"), 60),
+        "items": _sec_clean_str(data.get("items"), 120), "note": _sec_clean_str(data.get("note"), 160),
+        "kind": data.get("kind") if data.get("kind") in _SEC_RECEIPT_KINDS else "기타",
+        "payment": data.get("payment") if data.get("payment") in ("법인카드", "개인카드", "현금", "기타") else "알수없음",
+        "confidence": data.get("confidence") if data.get("confidence") in ("high", "medium", "low") else "low",
+    }
+    return jsonify({"success": True, "receipt": rc, "provider": _sec_ai_provider()})
+
+
+_SEC_UNDERSTAND_SYSTEM = (
+    "당신은 한국 공공기관 서무 담당자를 돕는 비서입니다. 사용자가 말한 업무 상황을 읽고, 주어진 '절차 목록'에서 "
+    "이 상황에 필요한 절차를 고릅니다. 여러 업무가 섞여 있으면 실제로 처리할 순서대로 모두 고르세요(최대 4개). "
+    "목록에 없는 절차를 지어내거나 규정·기한을 추측해 쓰지 마세요. 맞는 절차가 없으면 빈 목록을 돌려주세요. "
+    "summary 에는 상황을 어떻게 이해했는지 한두 문장으로, uncovered 에는 목록으로 처리되지 않는 부분을 적습니다."
+)
+
+
+@app.route("/api/secretary/ai/understand", methods=["POST"])
+def secretary_ai_understand():
+    """상황 문장 → 해당 절차(복수 가능). 절차 목록 안에서만 고르게 해 근거 없는 안내를 막는다."""
+    if not _sec_ai_provider():
+        return jsonify({"success": False, "need_key": True, "error": "AI 상황 이해가 설정되어 있지 않습니다."}), 503
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요."}), 429
+    body = request.get_json(silent=True) or {}
+    q = _sec_clean_str(body.get("q"), 400)
+    if len(q) < 2:
+        return jsonify({"success": False, "error": "상황을 입력하세요."}), 400
+    procs = []
+    for p in (body.get("procedures") or [])[:80]:
+        if not isinstance(p, dict):
+            continue
+        pid = _sec_clean_str(p.get("id"), 48).lower()
+        if _SEC_ID_RE.match(pid):
+            procs.append({"id": pid, "title": _sec_clean_str(p.get("title"), 80),
+                          "summary": _sec_clean_str(p.get("summary"), 200),
+                          "keywords": [_sec_clean_str(t, 20) for t in (p.get("triggers") or [])[:15]]})
+    if not procs:
+        return jsonify({"success": False, "error": "절차 목록이 비어 있습니다."}), 400
+    ids = [p["id"] for p in procs]
+    schema = {
+        "type": "object",
+        "properties": {
+            "procedure_ids": {"type": "array", "items": {"type": "string", "enum": ids}},
+            "summary": {"type": "string"},
+            "uncovered": {"type": "string"},
+        },
+        "required": ["procedure_ids", "summary", "uncovered"],
+        "additionalProperties": False,
+    }
+    text = ("절차 목록(JSON):\n" + json.dumps(procs, ensure_ascii=False)
+            + "\n\n사용자 상황:\n" + q)
+    try:
+        data = _sec_ai_json(_SEC_UNDERSTAND_SYSTEM, text, schema)
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    seen, pick = set(), []
+    for i in data.get("procedure_ids") or []:
+        if i in ids and i not in seen:
+            seen.add(i); pick.append(i)
+    return jsonify({"success": True, "procedure_ids": pick[:4],
+                    "summary": _sec_clean_str(data.get("summary"), 300),
+                    "uncovered": _sec_clean_str(data.get("uncovered"), 200),
+                    "provider": _sec_ai_provider()})
+
+
+# ── 문서 초안 → 한글(.hwpx) ────────────────────────────────────────────────
+# 기관 서식이 있으면 secretary/template.hwpx(첫 문단의 쪽 설정·글꼴을 그대로 씀), 없으면 내장 최소 서식.
+SEC_HWPX_TEMPLATE = os.path.join(SEC_DIR, "template.hwpx")
+
+
+def _sec_hwpx_base() -> bytes | None:
+    if os.path.exists(SEC_HWPX_TEMPLATE):
+        with open(SEC_HWPX_TEMPLATE, "rb") as f:
+            return f.read()
+    try:
+        import hwpx_base
+        return base64.b64decode(hwpx_base.BASE_HWPX_B64)
+    except Exception:
+        return None
+
+
+def _sec_xesc(s) -> str:
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _sec_hwpx_para(text: str, char_pr: str = "0", size: int = 1000) -> str:
+    run = f'<hp:run charPrIDRef="{char_pr}">' + (f"<hp:t>{_sec_xesc(text)}</hp:t>" if text else "") + "</hp:run>"
+    return ('<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">' + run +
+            f'<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="{size}" textheight="{size}" '
+            f'baseline="{int(size * 0.85)}" spacing="600" horzpos="0" horzsize="47628" flags="393216"/>'
+            '</hp:linesegarray></hp:p>')
+
+
+def _sec_hwpx_build(title: str, text: str) -> bytes:
+    base = _sec_hwpx_base()
+    if not base:
+        raise RuntimeError("HWPX 기본 서식을 찾을 수 없습니다.")
+    zin = zipfile.ZipFile(_io.BytesIO(base), "r")
+    sec = zin.read("Contents/section0.xml").decode("utf-8", "ignore")
+    m = re.search(r"<hs:sec\b[^>]*>", sec)
+    if not m:
+        raise RuntimeError("HWPX 서식의 본문 구조를 읽지 못했습니다.")
+    body = sec[m.end():]
+    pi = body.find("<hp:p")
+    pj = body.find("</hp:p>", pi) + len("</hp:p>")
+    first = re.sub(r"<hp:t>.*?</hp:t>", "<hp:t></hp:t>", body[pi:pj], flags=re.S)   # 쪽 설정(secPr) 문단만 유지
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    if title and lines and lines[0].strip() == title.strip():
+        lines = lines[1:]
+    paras = ([_sec_hwpx_para(title, "3", 1300), _sec_hwpx_para("")] if title else [])
+    paras += [_sec_hwpx_para(ln.rstrip()) for ln in lines]
+    new_sec = sec[:m.end()] + first + "".join(paras) + "</hs:sec>"
+    out = _io.BytesIO()
+    zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    zout.writestr(zipfile.ZipInfo("mimetype"), "application/hwp+zip", compress_type=zipfile.ZIP_STORED)
+    for n in zin.namelist():
+        if n in ("mimetype", "Preview/PrvImage.png"):
+            continue
+        if n == "Contents/section0.xml":
+            zout.writestr(n, new_sec.encode("utf-8"))
+        elif n == "Preview/PrvText.txt":
+            zout.writestr(n, (title + "\n" + text)[:1000].encode("utf-8"))
+        else:
+            zout.writestr(n, zin.read(n))
+    zout.close(); zin.close()
+    return out.getvalue()
+
+
+@app.route("/api/secretary/draft/hwpx", methods=["POST"])
+def secretary_draft_hwpx():
+    """문서 초안(텍스트) → 한글(.hwpx) 파일. 줄마다 한 문단."""
+    body = request.get_json(silent=True) or request.form or {}      # 화면은 폼 전송(파일명 유지), JSON 도 받음
+    title = _sec_clean_str(body.get("title"), 80)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(body.get("text") or ""))[:20000]
+    if not text.strip():
+        return jsonify({"success": False, "error": "초안 내용이 비어 있습니다."}), 400
+    try:
+        data = _sec_hwpx_build(title, text)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"한글 파일을 만들지 못했습니다: {e}"}), 500
+    fname = re.sub(r'[\\/:*?"<>|]+', "", title or "초안")[:60] + ".hwpx"
+    return Response(data, mimetype="application/hwp+zip",
+                    headers={"Content-Disposition": 'attachment; filename="draft.hwpx"; '
+                                                    "filename*=UTF-8''" + quote(fname)})
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────

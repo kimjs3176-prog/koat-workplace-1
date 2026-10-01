@@ -26,7 +26,7 @@ const EXAMPLES=[
 
 let S={ loaded:false, loading:null, common:{procedures:[],drafts:{}}, org:{procedures:[],drafts:{}}, admin:{},
         view:'home', query:'', formsQ:'', forms:null, regs:null,
-        cfg:{org:{},service:{},terms:{},reg_aliases:{},holidays:{}}, holidays:{}, status:{}, pstatus:{}, regCount:0, dateNote:'', matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
+        cfg:{org:{},service:{},terms:{},reg_aliases:{},holidays:{}}, holidays:{}, status:{}, pstatus:{}, regCount:0, dateNote:'', ai:{available:false}, aiRes:null, calYM:null, rcBusy:0, matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
         basisOpen:{}, basisCache:{}, catFilter:'' };
 
 // ── 저장소 ────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ async function load(force){
   if(S.loading && !force) return S.loading;
   S.loading=(async()=>{
     try{ const r=await fetch('/api/secretary/procedures'+(force?'?fresh=1':'')); const d=await r.json();
-      S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0;
+      S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.ai=d.ai||{available:false};
       S.common=deepTx(d.common||S.common); S.org=deepTx(d.org||S.org); S.admin=d.admin||{}; S.loaded=true;
       applyBranding(); checkPersonal();
     }catch(e){ S.loaded=false; throw e; }
@@ -234,7 +234,10 @@ async function start(opts){
 function ask(q){
   q=String(q||'').trim(); S.query=q;
   if(!q){ S.view='home'; render(); return; }
-  S.matches=match(q); S.related=null; S.basisOpen={};
+  S.matches=match(q); S.related=null; S.basisOpen={}; S.aiRes=null;
+  const lp=localPlan(q, S.matches);
+  if(lp) S.aiRes={q, ids:lp, local:true, summary:'여러 업무가 함께 있는 상황으로 보고 필요한 절차를 순서대로 모았습니다.'};
+  else setTimeout(()=>aiUnderstand(q), 0);
   if(S.matches.length){
     const p=S.matches[0].p; const ds=assignDates(p, q); S.dateNote='';
     if(ds){ const ex=cases().find(x=>x.procId===p.id && x.status!=='done');
@@ -260,7 +263,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -274,6 +277,7 @@ function render(){
   else if(S.view==='list') body=listView();
   else if(S.view==='history') body=historyView();
   else if(S.view==='forms') body=formsView();
+  else if(S.view==='cal') body=calView();
   else if(S.view==='manage') body=manageView();
   else if(S.view==='edit') body=editView();
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
@@ -308,7 +312,8 @@ function procView(){
   const p=getProc(S.procId); if(!p) return `<div class="sec-empty">절차를 찾을 수 없습니다.</div>`;
   const c=curCase(); const dates=(c&&c.dates)||{}; const checks=(c&&c.checks)||{};
   const pnote=personal().notes[p.id]||'';
-  const alt=S.matches.filter(m=>m.p.id!==p.id && m.hit.length).slice(0,4);   // 제목 단어만 겹친 약한 후보는 제외
+  const planShown=S.aiRes && S.aiRes.q===S.query && (S.aiRes.ids||[]).length>1;   // 복합 안내가 있으면 후보 칩은 생략
+  const alt=planShown?[]:S.matches.filter(m=>m.p.id!==p.id && m.hit.length).slice(0,4);   // 제목 단어만 겹친 약한 후보는 제외
   const altHtml=alt.length?`<div class="sec-alt">혹시 이 절차인가요? `+alt.map(m=>`<button class="sec-chip sm" data-a="proc" data-id="${esc(m.p.id)}" data-keep="1">${esc(m.p.icon||'')} ${esc(shortTitle(m.p.title))}</button>`).join('')+`</div>`:'';
   const pr=c?caseProgress(c,p):{done:0,total:(p.steps||[]).filter(s=>!s.optional).length,pct:0};
   const nx=c?nextStep(c,p):(p.steps&&p.steps.length?{i:0,s:p.steps[0],due:''}:null);
@@ -341,15 +346,16 @@ function procView(){
       (c&&c.status!=='done'?`<button class="sec-btn sm ghost" data-a="casedone">완료</button>`:'')+
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
-  return altHtml+`<div class="sec-proc">`+head+notes+approval+dateIn+nextBox+caseBar+
-    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${pitHtml}${caseNote}</div>`+
+  return aiBox()+altHtml+`<div class="sec-proc">`+head+notes+approval+dateIn+nextBox+caseBar+
+    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${caseNote}</div>`+
     `<aside class="sec-side">${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
 
 // 절차 상단 알림 — 문장에서 읽은 날짜, 근거 규정 개정, 우리 기관 규정에 연결 안 된 근거·서식, 기한 경과
 function procNotices(p, c){
   const out=[]; const st=p._status;
-  if(S.dateNote) out.push(`<div class="sec-notice info">🗓 문장에서 날짜를 읽어 기준일을 넣었어요 — <b>${esc(S.dateNote)}</b>. 다르면 아래에서 고쳐 주세요.</div>`);
+  if(S.dateNote){ const rc=/^영수증 날짜로 /.test(S.dateNote);
+    out.push(`<div class="sec-notice info">${rc?'🧾 영수증 날짜로':'🗓 문장에서 날짜를 읽어'} 기준일을 넣었어요 — <b>${esc(S.dateNote.replace(/^영수증 날짜로 /,''))}</b>. 다르면 아래에서 고쳐 주세요.</div>`); }
   if(st && st.stale && st.stale.length) out.push(`<div class="sec-notice warn">⚠ <b>근거 규정이 개정되었습니다</b> — `+
     st.stale.map(x=>`${esc(x.reg)}(확인 당시 ${esc(x.verified)} → 현재 ${esc(x.current)})`).join(', ')+
     `. 이 절차가 지금도 맞는지 원문과 다시 확인하세요.${p._layer!=='personal'?' 관리자는 확인 후 기관 층으로 다시 저장하면 이 알림이 사라집니다.':''}</div>`);
@@ -430,7 +436,7 @@ function noMatchView(){
       `<span class="sec-rel-h"><b>${esc(it.reg)} 제${esc(it.art)}조</b>${it.art_title?` (${esc(it.art_title)})`:''}${it.src==='semantic'?'<span class="sec-layer org">의미</span>':''}</span>`+
       `<span class="sec-rel-p">${esc(String(it.preview||'').replace(/^.*?[)）]\s*/,'').slice(0,160))}…</span></button>`).join('')+`</div>`
       :`<div class="sec-empty">관련 조문을 찾지 못했습니다. 다른 표현으로 말해 보세요.</div>`);
-  return `<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
+  return aiBox()+`<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
     `<div class="sec-hint">대신 관련 있어 보이는 규정 조문을 찾았습니다. 자주 하는 일이라면 <b>규정·절차 관리</b>에서 절차로 등록해 두면 다음부터 단계별로 안내합니다.</div>${list}`+
     `<div class="sec-row"><button class="sec-btn" data-a="formsq" data-q="${esc(S.query)}">📎 서식·규정에서 찾기</button><button class="sec-btn ghost" data-a="newproc">＋ 이 상황을 절차로 등록</button><button class="sec-btn ghost" data-a="view" data-v="list">절차 목록 보기</button></div></div>`;
 }
@@ -734,18 +740,19 @@ function openDraft(key){
   const d=allDrafts()[key]; if(!d){ toast('초안 서식을 찾을 수 없습니다.'); return; }
   const c=(S.view==='proc')?curCase():null; const p=getProc(S.procId);
   const saved=(c&&c.drafts&&c.drafts[key])||{};
-  const vals=Object.assign({}, draftAuto(d,c,p), saved);
+  const vals=Object.assign({}, draftAuto(d,c,p), receiptDraftVals(key, c), saved);   // 기준일·증빙에서 자동 → 저장한 값 우선
   S._draft={key, vals};
   const body=modal('secDraftModal','📝 '+esc(d.title)+' 초안');
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
-    `<div class="sec-row"><button class="sec-btn primary" data-da="copy">📋 복사</button><button class="sec-btn" data-da="txt">⬇ 텍스트 저장</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div class="sec-row"><button class="sec-btn primary" data-da="copy">📋 복사</button><button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button><button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
   const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
   body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ S._draft.vals[el.dataset.dk]=el.value; out(); }));
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
     if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
+    else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
     else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
     else if(b.dataset.da==='keep'){ updateCase(cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); }); toast('처리 이력에 초안 입력값을 저장했습니다.'); }
   });
@@ -877,7 +884,7 @@ function bind(panel){
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','pimport','askform','formsin','tokg','alias','cfg','cfghol','packfile'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','pimport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -902,6 +909,11 @@ function bind(panel){
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
+      case 'calmove': { const n=Number(D.d); if(!n){ S.calYM=null; } else { let {y,m}=S.calYM; m+=n; if(m<1){m=12;y--;} if(m>12){m=1;y++;} S.calYM={y,m}; } render(); break; }
+      case 'calics': calIcs(); break;
+      case 'aiask': aiUnderstand(S.query, true); break;
+      case 'aiopen': openWithDates(D.id, S.query); break;
+      case 'rcdel': updateCase(c=>{ c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
       case 'formsq': S.formsQ=D.q||''; S.view='forms'; render(); break;
       case 'tocal': addDeadlinesToCalendar(); break;
       case 'newcase': S.caseId=null; render(); toast('새 건으로 시작합니다. 체크하거나 기준일을 넣으면 저장돼요.'); break;
@@ -938,6 +950,9 @@ function bind(panel){
     else if(a==='lay'){ S.editLayer=el.value; render(); }
     else if(a==='alias'){ S._aliasDraft=S._aliasDraft||{}; if(el.value) S._aliasDraft[el.dataset.n]=el.value; else delete S._aliasDraft[el.dataset.n]; }
     else if(a==='packfile') readJsonFile(el, packRead);
+    else if(a==='rcfile'){ const fs=[...(el.files||[])].filter(f=>/^image\//.test(f.type)); el.value=''; if(fs.length) addReceipts(fs); }
+    else if(a==='rcf'){ const k=el.dataset.k; let v=el.value; if(k==='amount') v=Number(String(v).replace(/[^\d]/g,''))||0;
+      updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===el.dataset.id); if(r){ r[k]=v; if(k!=='note') r.edited=true; } }); render(); }
     else if(a==='es' && (el.type==='checkbox'||el.tagName==='SELECT')){ editorField(el); if(el.dataset.k==='dlref') render(); }
     else if(a==='himport') readJsonFile(el, d=>{ if(!d||!Array.isArray(d.cases)){ toast('처리 이력 파일이 아닙니다.'); return; }
       const cur=cases(); const ids=new Set(cur.map(c=>c.id)); const add=d.cases.filter(c=>c&&c.id&&!ids.has(c.id)); saveCases(add.concat(cur));
@@ -960,6 +975,233 @@ function bind(panel){
     else if(a==='cnote'){ updateCase(c=>{ c.note=el.value; }); }
     else if(a==='ef' || (a==='es' && el.type!=='checkbox' && el.tagName!=='SELECT')) editorField(el);
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ① 업무 달력 — 진행 중인 모든 건의 기한을 한 달 달력과 '이번 주 할 일'로
+// ═══════════════════════════════════════════════════════════════════════════
+function allDeadlines(){
+  const out=[];
+  cases().filter(c=>c.status!=='done').forEach(c=>{ const p=getProc(c.procId); if(!p) return;
+    (p.steps||[]).forEach((s,i)=>{ if((c.checks||{})[i]) return; const due=stepDue(s,c.dates); if(!due) return;
+      out.push({date:due, caseId:c.id, procId:p.id, icon:p.icon||'📌', proc:shortTitle(p.title), step:s.t, i, optional:!!s.optional}); }); });
+  return out.sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+}
+function weekRange(d){ const [y,m,dd]=d.split('-').map(Number); const w=new Date(y,m-1,dd).getDay(); const mon=addDays(d,-((w+6)%7)); return [mon, addDays(mon,6)]; }
+function calView(){
+  const t=today(); if(!S.calYM){ const [y,m]=t.split('-').map(Number); S.calYM={y, m}; }
+  const {y,m}=S.calYM; const first=`${y}-${String(m).padStart(2,'0')}-01`;
+  const startW=new Date(y,m-1,1).getDay(); const days=new Date(y,m,0).getDate();
+  const ev=allDeadlines(); const by={}; ev.forEach(e=>{ (by[e.date]=by[e.date]||[]).push(e); });
+  const cells=[];
+  for(let i=0;i<startW;i++) cells.push(`<div class="sec-cal-c out"></div>`);
+  for(let d=1; d<=days; d++){ const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const w=(startW+d-1)%7; const hol=S.holidays[ds]; const list=by[ds]||[];
+    const cls=['sec-cal-c', ds===t?'today':'', w===0||hol?'sun':'', w===6&&!hol?'sat':'', ds<t&&list.length?'past':''].filter(Boolean).join(' ');
+    cells.push(`<div class="${cls}"><div class="sec-cal-d"><b>${d}</b>${hol?`<span class="sec-cal-h">${esc(hol)}</span>`:''}</div>`+
+      list.slice(0,3).map(e=>`<button class="sec-cal-e${e.date<t?' over':''}${e.optional?' opt':''}" data-a="case" data-id="${esc(e.caseId)}" title="${esc(e.proc+' — '+e.step)}">${esc(e.icon)} ${esc(e.proc)}</button>`).join('')+
+      (list.length>3?`<span class="sec-cal-more">+${list.length-3}</span>`:'')+`</div>`); }
+  const [ws,we]=weekRange(t);
+  const over=ev.filter(e=>e.date<t && !e.optional), week=ev.filter(e=>e.date>=t && e.date<=we), next=ev.filter(e=>e.date>we && e.date<=addDays(we,7));
+  const row=e=>{ const dd=dday(e.date); return `<button class="sec-next" data-a="case" data-id="${esc(e.caseId)}"><span class="sec-next-ic">${esc(e.icon)}</span>`+
+    `<span class="sec-next-m"><span class="sec-next-t">${esc(e.proc)}</span><span class="sec-next-s">${esc(e.i+1+'. '+e.step)}</span></span>`+
+    `<span class="sec-dd ${dd.cls}">${esc(fmtDate(e.date))} · ${dd.label}</span>${offHtml(e.date)}</button>`; };
+  const sec=(h,arr,empty)=>`<div class="sec-card-h" style="margin-top:6px;">${h} <span class="sec-sub">${arr.length}건</span></div>`+
+    (arr.length?`<div class="sec-next-list">${arr.map(row).join('')}</div>`:`<div class="sec-hint">${empty}</div>`);
+  return `<div class="sec-layout sec-cal-layout"><div class="sec-main"><div class="sec-card">`+
+    `<div class="sec-cal-top"><button class="sec-btn sm ghost" data-a="calmove" data-d="-1" aria-label="이전 달">‹</button>`+
+    `<b class="sec-cal-title">${y}년 ${m}월</b><button class="sec-btn sm ghost" data-a="calmove" data-d="1" aria-label="다음 달">›</button>`+
+    `<button class="sec-btn sm ghost" data-a="calmove" data-d="0">오늘</button><span class="sec-sp"></span>`+
+    `<button class="sec-btn sm" data-a="calics" ${ev.length?'':'disabled'}>📅 전체 기한 캘린더(.ics)</button></div>`+
+    `<div class="sec-cal" role="grid" aria-label="${y}년 ${m}월 업무 기한">${'일월화수목금토'.split('').map((w,i)=>`<div class="sec-cal-w${i===0?' sun':i===6?' sat':''}">${w}</div>`).join('')}${cells.join('')}</div>`+
+    `<div class="sec-hint">처리 중인 건의 단계 기한이 표시됩니다(기준일을 넣은 건만). 빨간 날은 일요일·공휴일·기관 휴일입니다.</div></div></div>`+
+    `<aside class="sec-side"><div class="sec-card">`+
+      (over.length?sec('⏰ 기한 지남',over,''):'')+sec('📌 이번 주 할 일',week,'이번 주에 기한이 있는 일이 없습니다.')+sec('🗓 다음 주',next,'다음 주 기한이 없습니다.')+
+    `</div></aside></div>`;
+}
+function calIcs(){
+  const ev=allDeadlines(); if(!ev.length){ toast('기한이 있는 진행 건이 없습니다.'); return; }
+  const o=S.cfg.org||{};
+  const body=ev.map(e=>{ const d=e.date.replace(/-/g,''), nx=addDays(e.date,1).replace(/-/g,'');
+    return ['BEGIN:VEVENT',`UID:${e.caseId}-${e.i}@secretary`,'DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z',
+      'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${e.proc} — ${e.step.replace(/[.。]$/,'').slice(0,50)}`),'END:VEVENT'].join('\r\n'); });
+  const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...body,'END:VCALENDAR'].join('\r\n');
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
+  a.download=`서무비서_전체기한_${today()}.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast(`📅 기한 ${ev.length}건을 캘린더 파일로 받았습니다.`, 3600);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ② 증빙(영수증) 첨부·인식 — 사진에서 날짜·금액을 읽어 기준일·초안·증빙 점검에 반영
+//   원본 이미지는 서버에 저장하지 않는다(AI 분석 후 버림). 브라우저에는 작은 미리보기만 남긴다.
+// ═══════════════════════════════════════════════════════════════════════════
+const RC_KINDS=['운임','숙박','식비','회의비','물품','기타'];
+const RC_PAY=['법인카드','개인카드','현금','기타','알수없음'];
+const RC_RE=/영수증|매출전표|세금계산서|승차권|탑승권|증빙|거래명세서/;
+function wantsReceipts(p){ return (p.steps||[]).some(s=>(s.docs||[]).some(d=>RC_RE.test(d))) || ['corp-card','event','daily-expense'].includes(p.id); }
+function receipts(c){ return (c&&c.receipts)||[]; }
+function won(n){ return (Number(n)||0).toLocaleString('ko-KR'); }
+function imgToJpeg(file, max, q){
+  return new Promise((res,rej)=>{ const url=URL.createObjectURL(file); const im=new Image();
+    im.onload=()=>{ const s=Math.min(1, max/Math.max(im.width, im.height)); const cv=document.createElement('canvas');
+      cv.width=Math.round(im.width*s); cv.height=Math.round(im.height*s); const g=cv.getContext('2d'); g.fillStyle='#fff'; g.fillRect(0,0,cv.width,cv.height);
+      g.drawImage(im,0,0,cv.width,cv.height); URL.revokeObjectURL(url); res(cv.toDataURL('image/jpeg', q)); };
+    im.onerror=()=>{ URL.revokeObjectURL(url); rej(new Error('이미지를 열 수 없습니다.')); }; im.src=url; });
+}
+async function addReceipts(files){
+  const p=getProc(S.procId); if(!p||!files||!files.length) return;
+  ensureCase(); const n0=receipts(curCase()).length;
+  if(n0+files.length>20){ toast('한 건에 증빙은 20장까지 넣을 수 있습니다.'); return; }
+  S.rcBusy=(S.rcBusy||0)+files.length; render();
+  const year=((curCase().dates||{}).start||today()).slice(0,4);
+  for(const f of files){
+    const r={id:uid(), name:String(f.name||'증빙').slice(0,60), date:'', end_date:'', amount:0, vendor:'', kind:'기타', payment:'알수없음', nights:0, route:'', items:'', note:'', confidence:'', ai:false};
+    try{
+      r.thumb=await imgToJpeg(f, 220, .7);
+      if(S.ai.available){
+        const big=await imgToJpeg(f, 1600, .85);
+        const resp=await fetch('/api/secretary/ai/receipt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:big, context:p.title, year})});
+        const d=await resp.json();
+        if(d.success){ Object.assign(r, d.receipt, {ai:true}); } else { r.note=d.error||'인식하지 못했습니다 — 직접 입력하세요.'; }
+      }
+    }catch(e){ r.note='이미지를 읽지 못했습니다 — 직접 입력하세요.'; }
+    updateCase(c=>{ (c.receipts=c.receipts||[]).push(r); });
+    S.rcBusy--; render();
+  }
+  // 영수증 날짜로 비어 있는 기준일 채우기(출장: 첫날~마지막 날, 그 밖: 첫 날짜)
+  const c=curCase(); const ds=receipts(c).flatMap(x=>[x.date, x.end_date]).filter(Boolean).sort();
+  const keys=(p.dates||[]).map(d=>d.k);
+  if(ds.length && keys.length && !Object.keys(c.dates||{}).length){
+    const fill={}; fill[keys[0]]=ds[0]; if(keys[1]) fill[keys[1]]=ds[ds.length-1];
+    updateCase(x=>{ x.dates=fill; });
+    S.dateNote='영수증 날짜로 '+(p.dates||[]).filter(d=>fill[d.k]).map(d=>`${d.l} ${fmtDate(fill[d.k])}`).join(' · ');
+    render();
+  }
+}
+// 증빙 점검 — 규정 근거 점검 항목을 '자동으로' 미리 확인해 주는 부분
+function receiptChecks(p, c){
+  const rs=receipts(c); if(!rs.length) return [];
+  const out=[]; const d=(c&&c.dates)||{};
+  const trip=['domestic-trip','overseas-trip','training'].includes(p.id);
+  if(trip){
+    if(!rs.some(r=>r.kind==='운임')) out.push(['warn','운임(승차권·항공권) 증빙이 아직 없습니다.']);
+    const nights=d.start&&d.end?Math.round((new Date(d.end)-new Date(d.start))/86400000):0;
+    if(nights>0 && !rs.some(r=>r.kind==='숙박')) out.push(['warn',`출장이 ${nights}박인데 숙박 영수증이 없습니다(자가 숙박이면 사유를 적어 두세요).`]);
+    if(d.start&&d.end) rs.filter(r=>r.date && (r.date<addDays(d.start,-1) || r.date>addDays(d.end,1)))
+      .forEach(r=>out.push(['warn',`${r.vendor||r.name}: 이용일 ${fmtDate(r.date)}이 출장 기간(${fmtDate(d.start)}~${fmtDate(d.end)}) 밖입니다.`]));
+  }
+  if(['domestic-trip','overseas-trip','corp-card','event'].includes(p.id)){
+    const non=rs.filter(r=>r.payment==='개인카드'||r.payment==='현금');
+    if(non.length) out.push(['warn',`법인카드가 아닌 결제 ${non.length}건 — 법인카드를 쓰지 못한 사유를 적어 두세요(「여비규정」 제8조).`]);
+  }
+  rs.filter(r=>!r.date||!r.amount).forEach(r=>out.push(['info',`${r.vendor||r.name}: 날짜·금액을 확인해 입력하세요.`]));
+  rs.filter(r=>r.confidence==='low'||r.note).forEach(r=>{ if(r.note) out.push(['info',`${r.vendor||r.name}: ${r.note}`]); });
+  if(!out.some(x=>x[0]==='warn')) out.unshift(['ok','증빙 점검에서 걸리는 항목이 없습니다.']);
+  return out;
+}
+function receiptHtml(p, c){
+  if(!wantsReceipts(p)) return '';
+  const rs=receipts(c); const busy=S.rcBusy||0;
+  const sums={}; rs.forEach(r=>{ sums[r.kind]=(sums[r.kind]||0)+(Number(r.amount)||0); });
+  const total=rs.reduce((a,r)=>a+(Number(r.amount)||0),0);
+  const rows=rs.map(r=>`<div class="sec-rc">`+(r.thumb?`<img class="sec-rc-img" src="${esc(r.thumb)}" alt="${esc(r.name)}">`:`<span class="sec-rc-img ph">🧾</span>`)+
+    `<div class="sec-rc-f">`+
+      `<label><span>날짜</span><input type="date" value="${esc(r.date)}" data-a="rcf" data-id="${esc(r.id)}" data-k="date"></label>`+
+      `<label><span>금액(원)</span><input inputmode="numeric" value="${r.amount?esc(won(r.amount)):''}" data-a="rcf" data-id="${esc(r.id)}" data-k="amount" placeholder="0"></label>`+
+      `<label><span>가맹점</span><input value="${esc(r.vendor)}" data-a="rcf" data-id="${esc(r.id)}" data-k="vendor" placeholder="코레일"></label>`+
+      `<label><span>종류</span><select data-a="rcf" data-id="${esc(r.id)}" data-k="kind">${RC_KINDS.map(k=>`<option ${r.kind===k?'selected':''}>${k}</option>`).join('')}</select></label>`+
+      `<label><span>결제</span><select data-a="rcf" data-id="${esc(r.id)}" data-k="payment">${RC_PAY.map(k=>`<option ${r.payment===k?'selected':''}>${k}</option>`).join('')}</select></label>`+
+    `</div><div class="sec-rc-m">${r.ai?`<span class="sec-layer org" title="AI가 읽은 값 — 확인 후 고쳐 주세요">✦ AI ${r.confidence==='high'?'인식':'인식(확인 필요)'}</span>`:''}`+
+      `${r.route?`<span class="sec-sub">${esc(r.route)}</span>`:''}${r.items?`<span class="sec-sub">${esc(r.items)}</span>`:''}`+
+      `<button class="sec-x" data-a="rcdel" data-id="${esc(r.id)}" aria-label="증빙 삭제">✕</button></div></div>`).join('');
+  const checks=receiptChecks(p, c);
+  return `<div class="sec-card sec-rcard"><div class="sec-card-h">🧾 증빙 첨부 <span class="sec-sub">${S.ai.available?'영수증·승차권 사진을 올리면 AI가 날짜·금액을 읽습니다':'사진을 올리고 날짜·금액을 입력하세요(AI 인식은 관리자가 AI 키를 설정하면 켜집니다)'}</span></div>`+
+    `<label class="sec-drop"><input type="file" accept="image/*" multiple data-a="rcfile" hidden>`+
+      `<span>📷 사진 선택 또는 촬영</span><span class="sec-sub">여러 장 가능 · 사진은 서버에 저장하지 않습니다${S.ai.available?' (AI 분석에만 사용)':''}</span></label>`+
+    (busy?`<div class="assist-loading sm"><div class="spinner"></div><span>증빙 ${busy}장 읽는 중...</span></div>`:'')+
+    (rs.length?`<div class="sec-rc-list">${rows}</div>`+
+      `<div class="sec-rc-sum">합계 <b>${won(total)}원</b> `+Object.entries(sums).map(([k,v])=>`<span class="sec-doc">${esc(k)} ${won(v)}원</span>`).join('')+`</div>`+
+      `<div class="sec-rc-chk">`+checks.map(([lv,t])=>`<div class="sec-rc-ck ${lv}">${lv==='ok'?'✓':lv==='warn'?'⚠':'ℹ'} ${esc(t)}</div>`).join('')+`</div>`:'')+`</div>`;
+}
+// 초안 자동 채움 — 증빙에서 운임·숙박 합계, 증빙 목록, 사용일·장소·금액
+function receiptDraftVals(key, c){
+  const rs=receipts(c); if(!rs.length) return {};
+  const sum=k=>rs.filter(r=>r.kind===k).reduce((a,r)=>a+(Number(r.amount)||0),0);
+  const cnt={}; rs.forEach(r=>{ cnt[r.kind]=(cnt[r.kind]||0)+1; });
+  const label={운임:'승차권·운임 영수증',숙박:'숙박 영수증',식비:'식비 영수증',회의비:'회의비 영수증',물품:'물품 영수증',기타:'기타 증빙'};
+  const pays=[...new Set(rs.map(r=>r.payment).filter(x=>x&&x!=='알수없음'))];
+  const v={};
+  if(key==='travel-settle'){ if(sum('운임')) v.fare=won(sum('운임')); if(sum('숙박')) v.lodging=won(sum('숙박'));
+    if(pays.length) v.card=pays.join(' / '); v.evid=Object.entries(cnt).map(([k,n])=>`${label[k]} ${n}매`).join(', '); }
+  if(key==='card-evidence'){ const r=rs[0]; if(r.vendor) v.place=r.vendor; if(r.amount) v.amount=won(rs.reduce((a,x)=>a+(Number(x.amount)||0),0)); if(r.date) v.date=fmtLong(r.date); }
+  return v;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ③ AI 상황 이해 — 등록 절차에 없는 표현·여러 업무가 섞인 문장을 절차 목록 안에서 해석
+// ═══════════════════════════════════════════════════════════════════════════
+const COMPOUND=/하고|가서|그리고|및|겸|하면서|이랑|랑 |, |그 다음|다음에|후에|전에/;
+// 여러 업무가 섞인 문장 — 트리거로 각각 찾은 절차를 문장에 나온 순서대로(같은 분류는 최고점 하나)
+function localPlan(q, matches){
+  if(!COMPOUND.test(q)) return null;
+  const qn=norm(q); const seen=new Set(); const out=[];
+  matches.filter(m=>m.hit.length).forEach(m=>{ if(seen.has(m.p.category)) return; seen.add(m.p.category);
+    out.push({id:m.p.id, pos:Math.min(...m.hit.map(h=>qn.indexOf(norm(h))).filter(i=>i>=0))}); });
+  return out.length>=2 ? out.sort((a,b)=>a.pos-b.pos).slice(0,4).map(x=>x.id) : null;
+}
+function needAI(q, matches){
+  if(!S.ai.available) return false;
+  if(!matches.length) return true;
+  if(COMPOUND.test(q)) return !localPlan(q, matches);   // 섞인 문장인데 절차를 하나밖에 못 찾았으면 AI로
+  return matches[0].sc<4;      // 약한 매칭(짧은 단어 하나)이면 AI로 확인
+}
+async function aiUnderstand(q, force){
+  if(!S.ai.available || (!force && !needAI(q, S.matches))) return;
+  S.aiRes={q, loading:true}; render();
+  const procs=allProcs().map(p=>({id:p.id, title:p.title, summary:p.summary||'', triggers:(p.triggers||[]).slice(0,15)}));
+  try{ const r=await fetch('/api/secretary/ai/understand',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q, procedures:procs})});
+    const d=await r.json(); if(S.query!==q) return;
+    S.aiRes=d.success?{q, ids:(d.procedure_ids||[]).filter(id=>getProc(id)), summary:d.summary, uncovered:d.uncovered}:{q, error:d.error||'AI가 이해하지 못했습니다.'};
+  }catch(e){ if(S.query===q) S.aiRes={q, error:'AI에 연결하지 못했습니다.'}; }
+  // 등록 절차를 못 찾았는데 AI가 하나를 골랐다면 바로 그 절차로
+  if(S.view==='nomatch' && S.aiRes.ids && S.aiRes.ids.length===1){ openWithDates(S.aiRes.ids[0], q); return; }
+  render();
+}
+function openWithDates(pid, q){
+  const p=getProc(pid); if(!p) return; const ds=assignDates(p, q||S.query); S.dateNote='';
+  if(ds){ const ex=cases().find(x=>x.procId===p.id && x.status!=='done'); const c=(ex&&!Object.keys(ex.dates||{}).length)?ex:null;
+    S.procId=p.id; S.caseId=c?c.id:null; ensureCase(); updateCase(x=>{ x.dates=Object.assign({}, x.dates||{}, ds); });
+    S.dateNote=(p.dates||[]).filter(d=>ds[d.k]).map(d=>`${d.l} ${fmtDate(ds[d.k])}`).join(' · ');
+    selectProc(p.id,{keepQuery:true, caseId:S.caseId, keepNote:true}); return; }
+  selectProc(p.id,{keepQuery:true});
+}
+function aiBox(){
+  const a=S.aiRes; if(!a || a.q!==S.query) return S.ai.available&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 다시 이해하기</button></div>`:'';
+  if(a.loading) return `<div class="sec-notice ai"><div class="assist-loading sm"><div class="spinner"></div><span>✦ AI가 상황을 이해하는 중...</span></div></div>`;
+  if(a.error) return `<div class="sec-notice ai">✦ ${esc(a.error)}</div>`;
+  if(!a.ids.length) return `<div class="sec-notice ai">✦ ${esc(a.summary||'등록된 절차 가운데 맞는 것을 찾지 못했습니다.')}${a.uncovered?` <span class="sec-sub">(${esc(a.uncovered)})</span>`:''}</div>`;
+  const ps=a.ids.map(getProc).filter(Boolean);
+  if(ps.length===1 && ps[0].id===S.procId) return `<div class="sec-notice ai">✦ AI도 이 절차로 이해했습니다 — ${esc(a.summary)}</div>`;
+  const plan=ps.length>1?`<div class="sec-plan">`+ps.map((p,n)=>{ const c=cases().find(x=>x.procId===p.id&&x.status!=='done'); const nx=c?nextStep(c,p):{i:0,s:p.steps[0]};
+      return `<div class="sec-plan-i"><span class="sec-plan-n">${n+1}</span><div class="sec-plan-m"><b>${esc(p.icon||'')} ${esc(shortTitle(p.title))}</b>`+
+        `<span class="sec-sub">${nx&&nx.s?'먼저: '+esc(nx.s.t.slice(0,70)):''}</span></div><button class="sec-btn sm" data-a="aiopen" data-id="${esc(p.id)}">${p.id===S.procId?'보는 중':'열기'}</button></div>`; }).join('')+`</div>`:
+    `<div class="sec-row"><button class="sec-btn sm primary" data-a="aiopen" data-id="${esc(ps[0].id)}">${esc(ps[0].icon||'')} ${esc(shortTitle(ps[0].title))} 열기</button></div>`;
+  return `<div class="sec-notice ai"><div>${a.local?'🧩 <b>여러 업무가 섞인 상황</b>':'✦ <b>AI가 이해한 상황</b>'} — ${esc(a.summary)}${ps.length>1?` <span class="sec-sub">절차 ${ps.length}개를 순서대로 처리하세요</span>`:''}</div>${plan}`+
+    (a.uncovered?`<div class="sec-sub">등록 절차로 안내되지 않는 부분: ${esc(a.uncovered)}</div>`:'')+`</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑤ 초안 → 한글(.hwpx)
+// ═══════════════════════════════════════════════════════════════════════════
+function downloadHwpx(title, text){
+  // 일반 폼 전송(숨은 iframe)으로 받는다 — 서버가 붙인 파일명이 그대로 쓰이고, 비동기 뒤 클릭 제약도 없다
+  if(!String(text||'').trim()){ toast('초안 내용이 비어 있습니다.'); return; }
+  let fr=document.getElementById('secDlFrame');
+  if(!fr){ fr=document.createElement('iframe'); fr.id=fr.name='secDlFrame'; fr.hidden=true; fr.title='파일 받기'; document.body.appendChild(fr); }
+  const f=document.createElement('form'); f.method='POST'; f.action='/api/secretary/draft/hwpx'; f.target='secDlFrame'; f.hidden=true;
+  [['title',title||'초안'],['text',text]].forEach(([k,v])=>{ const i=document.createElement('textarea'); i.name=k; i.value=v; f.appendChild(i); });
+  document.body.appendChild(f); f.submit(); f.remove();
+  toast('한글(.hwpx) 파일을 받습니다.');
 }
 
 // ── 공개 ─────────────────────────────────────────────────────────────────
