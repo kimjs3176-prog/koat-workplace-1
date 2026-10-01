@@ -1,0 +1,20 @@
+{
+ "schema_version": 1,
+ "org": {"name": "한국농업기술진흥원", "short": "KOAT", "abbr": "농진원"},
+ "service": {
+  "title": "서무비서",
+  "icon": "🗂",
+  "primary": "#256ef4",
+  "tagline": "출장·물품·행사·복무·결재 — 상황을 말하면 절차·기한·서식·근거 안내",
+  "footer": "근거 조문은 기관 현행 내규 원문을 기준으로 안내합니다. 최종 판단은 원문과 담당 부서 확인을 거쳐 주세요."
+ },
+ "terms": {"erp": "ERP", "portal": "내부 포털", "accounting": "회계부서", "approval": "전자결재"},
+ "reg_aliases": {},
+ "holidays": {
+  "extra": [
+   {"date": "2026-05-01", "name": "근로자의 날"},
+   {"date": "2027-05-01", "name": "근로자의 날"}
+  ],
+  "exclude": []
+ }
+}

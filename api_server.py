@@ -1569,7 +1569,7 @@ def internal_original():
     name = request.args.get("name", "").strip()
     if not name:
         return jsonify({"error": "name 파라미터가 필요합니다"}), 400
-    m = _find_reg_original(name)
+    m, _via = _sec_resolve_reg(name)      # 다른 기관: 규정명 매핑·접두어·근사 연결까지
     if not m:
         return jsonify({"success": True, "found": False, "name": name})
     out = {"success": True, "found": True, "name": name,
@@ -1596,15 +1596,38 @@ def ping():
 # 서무비서 — 서무 규정·지침·서식을 담아 두고, 상황을 말하면 절차·기한·서식·근거를 안내
 #   공통(secretary/procedures.json, 저장소 기본 탑재) → 기관(secretary/org.json, 관리자 등록)
 #   → 개인 보충(브라우저 localStorage) 세 층으로 관리한다. 근거 조문은 번들 내규 원문에서 뽑는다.
+#
+#   다른 기관에서 쓰려면: secretary/config.json(기관명·명칭·규정명 매핑·휴일)을 바꾸고
+#   자기 내규를 regulations/ 에 올린다(scripts/import_regs.py). 절차의 규정명은
+#   매핑 → 정확 일치 → 기관명 접두어 제거 → 포함 관계 순으로 그 기관 규정에 연결된다.
 # ══════════════════════════════════════════════════════════════════════════
 SEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secretary")
 SEC_COMMON_PATH = os.path.join(SEC_DIR, "procedures.json")
 SEC_ORG_PATH = os.path.join(SEC_DIR, "org.json")
 SEC_ORG_REPO_PATH = "secretary/org.json"
+SEC_CONFIG_PATH = os.environ.get("SECRETARY_CONFIG", "").strip() or os.path.join(SEC_DIR, "config.json")
+SEC_CONFIG_REPO_PATH = "secretary/config.json"
+SEC_HOLIDAYS_PATH = os.path.join(SEC_DIR, "holidays.json")
 _SEC_ORG_CACHE: dict = {"ts": 0.0, "data": None}
+_SEC_CFG_CACHE: dict = {"ts": 0.0, "data": None}
 _SEC_CHUNKS = None            # [(title, no, art_title, body)] — 근거 조문·관련 조문 검색용(모듈 캐시)
+_SEC_ART_INDEX = None         # {(norm 규정명, 조번호): (title, no, art_title, text)}
 _SEC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{1,47}$")
 _SEC_ACT_KINDS = {"proc"}          # 단계 바로가기는 다른 절차로의 이동만 허용
+_SEC_TERM_KEYS = ("erp", "portal", "accounting", "approval")
+_SEC_CFG_DEFAULT = {
+    "schema_version": 1,
+    "org": {"name": "한국농업기술진흥원", "short": "KOAT", "abbr": "농진원"},
+    "service": {"title": "서무비서", "icon": "🗂", "primary": "#256ef4",
+                "tagline": "출장·물품·행사·복무·결재 — 상황을 말하면 절차·기한·서식·근거 안내",
+                "footer": "근거 조문은 기관 현행 내규 원문을 기준으로 안내합니다. 최종 판단은 원문과 담당 부서 확인을 거쳐 주세요."},
+    # 절차 문장 속 [[erp]] 같은 자리표시를 기관 명칭으로 바꾼다
+    "terms": {"erp": "ERP", "portal": "내부 포털", "accounting": "회계부서", "approval": "전자결재"},
+    # 절차가 가리키는 규정명 → 우리 기관 규정명
+    "reg_aliases": {},
+    # 기본 공휴일(holidays.json) 외 기관 휴일(창립기념일 등) 추가·제외
+    "holidays": {"extra": [], "exclude": []},
+}
 
 
 def _sec_read_json(path: str, default):
@@ -1615,29 +1638,59 @@ def _sec_read_json(path: str, default):
         return default
 
 
-def _sec_org_load(force: bool = False) -> dict:
-    """기관 층. GitHub 연동 시 저장소 최신본(60초 캐시) — 배포 전에도 방금 저장한 내용이 보이게."""
-    if not force and _SEC_ORG_CACHE["data"] is not None and time.time() - _SEC_ORG_CACHE["ts"] < 60:
-        return _SEC_ORG_CACHE["data"]
+def _sec_layer_load(cache: dict, repo_path: str, local_path: str, force: bool = False):
+    """저장소 파일(기관 층·설정). GitHub 연동 시 저장소 최신본(60초 캐시) — 배포 전에도 방금 저장한 값이 보이게."""
+    if not force and cache["data"] is not None and time.time() - cache["ts"] < 60:
+        return cache["data"]
     data = None
     if _gh_enabled():
-        raw = _gh_file(SEC_ORG_REPO_PATH)
+        raw = _gh_file(repo_path)
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception:
                 data = None
     if data is None:
-        data = _sec_read_json(SEC_ORG_PATH, {})
+        data = _sec_read_json(local_path, {})
     data = data if isinstance(data, dict) else {}
+    cache.update({"ts": time.time(), "data": data})
+    return data
+
+
+def _sec_org_load(force: bool = False) -> dict:
+    data = _sec_layer_load(_SEC_ORG_CACHE, SEC_ORG_REPO_PATH, SEC_ORG_PATH, force)
     data.setdefault("procedures", [])
     data.setdefault("drafts", {})
-    _SEC_ORG_CACHE.update({"ts": time.time(), "data": data})
     return data
+
+
+def _sec_config(force: bool = False) -> dict:
+    """기관 설정 = 기본값 위에 config.json 을 얕게(섹션 단위) 덮어쓴 값."""
+    raw = _sec_layer_load(_SEC_CFG_CACHE, SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, force)
+    cfg = json.loads(json.dumps(_SEC_CFG_DEFAULT))
+    for k, v in raw.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict) and k != "reg_aliases":
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
 
 
 def _sec_clean_str(v, n: int = 400) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v or "")).strip()[:n]
+
+
+def _sec_ref_list(arr, n=6):
+    out = []
+    for b in (arr or [])[:n]:
+        if not isinstance(b, dict) or not _sec_clean_str(b.get("reg"), 80):
+            continue
+        r = {"reg": _sec_clean_str(b.get("reg"), 80)}
+        for k in ("art", "q", "label", "title"):
+            if b.get(k):
+                r[k] = _sec_clean_str(b.get(k), 60)
+        out.append(r)
+    return out
 
 
 def _sec_clean_proc(p: dict) -> dict | None:
@@ -1648,18 +1701,8 @@ def _sec_clean_proc(p: dict) -> dict | None:
     title = _sec_clean_str(p.get("title"), 80)
     if not _SEC_ID_RE.match(pid) or not title:
         return None
-
-    def ref_list(arr, n=6):
-        out = []
-        for b in (arr or [])[:n]:
-            if not isinstance(b, dict) or not _sec_clean_str(b.get("reg"), 80):
-                continue
-            r = {"reg": _sec_clean_str(b.get("reg"), 80)}
-            for k in ("art", "q", "label", "title"):
-                if b.get(k):
-                    r[k] = _sec_clean_str(b.get(k), 60)
-            out.append(r)
-        return out
+    if p.get("hidden"):
+        return {"id": pid, "title": title, "hidden": True}   # 기관 층에서 공통 절차 숨김(같은 id)
 
     def act(a):
         if not isinstance(a, dict) or a.get("k") not in _SEC_ACT_KINDS:
@@ -1667,8 +1710,6 @@ def _sec_clean_proc(p: dict) -> dict | None:
         r = {"k": a["k"], "l": _sec_clean_str(a.get("l"), 30) or "바로가기"}
         if a.get("id"):
             r["id"] = _sec_clean_str(a.get("id"), 48)
-        if a.get("q"):
-            r["q"] = _sec_clean_str(a.get("q"), 60)
         return r
 
     steps = []
@@ -1693,16 +1734,25 @@ def _sec_clean_proc(p: dict) -> dict | None:
             except (TypeError, ValueError):
                 pass
         if s.get("basis"):
-            st["basis"] = ref_list(s.get("basis"))
+            st["basis"] = _sec_ref_list(s.get("basis"))
         if isinstance(s.get("form"), dict):
-            f = ref_list([s["form"]], 1)
+            f = _sec_ref_list([s["form"]], 1)
             if f:
                 st["form"] = f[0]
         a = act(s.get("act"))
         if a:
             st["act"] = a
         steps.append(st)
-    out = {
+    pitfalls = []
+    for pf in (p.get("pitfalls") or [])[:15]:
+        if isinstance(pf, str):
+            pf = {"t": pf}
+        if isinstance(pf, dict) and _sec_clean_str(pf.get("t")):
+            x = {"t": _sec_clean_str(pf.get("t"), 300)}
+            if pf.get("basis"):
+                x["basis"] = _sec_ref_list(pf.get("basis"), 3)
+            pitfalls.append(x)
+    return {
         "id": pid, "title": title,
         "icon": _sec_clean_str(p.get("icon"), 4) or "📌",
         "category": _sec_clean_str(p.get("category"), 20) or "기타",
@@ -1712,16 +1762,14 @@ def _sec_clean_proc(p: dict) -> dict | None:
         "dates": [{"k": _sec_clean_str(d.get("k"), 12), "l": _sec_clean_str(d.get("l"), 30)}
                   for d in (p.get("dates") or [])[:3] if isinstance(d, dict) and d.get("k")],
         "steps": steps,
-        "forms": ref_list(p.get("forms"), 12),
+        "forms": _sec_ref_list(p.get("forms"), 12),
+        "pitfalls": pitfalls,
         "tips": [_sec_clean_str(t, 300) for t in (p.get("tips") or [])[:10] if _sec_clean_str(t)],
     }
-    if p.get("hidden"):
-        out["hidden"] = True          # 기관 층에서 공통 절차를 숨길 때(같은 id + hidden)
-    return out
 
 
 def _sec_chunks():
-    global _SEC_CHUNKS
+    global _SEC_CHUNKS, _SEC_ART_INDEX
     if _SEC_CHUNKS is None:
         try:
             import reg_chunks
@@ -1730,12 +1778,64 @@ def _sec_chunks():
         except Exception as e:
             print(f"[secretary] 조문 색인 실패: {e}")
             _SEC_CHUNKS = []
+        _SEC_ART_INDEX = {}
+        for c in _SEC_CHUNKS:
+            _SEC_ART_INDEX.setdefault((_norm_key(c[0]), c[1]), c)
     return _SEC_CHUNKS
 
 
+def _sec_art(title: str, no: str):
+    _sec_chunks()
+    return (_SEC_ART_INDEX or {}).get((_norm_key(title), no))
+
+
+_SEC_REG_SUFFIX = re.compile(r"(규정|규칙|지침|요령|세칙|기준|매뉴얼|훈령|예규)$")
+
+
+def _sec_resolve_reg(name: str):
+    """절차의 규정명 → 우리 기관 manifest 항목. (항목, 방식) — 방식: alias|exact|prefix|approx.
+
+    다른 기관에 그대로 옮겨도 절차가 깨지지 않도록 단계적으로 찾는다.
+    approx(포함 관계·어간) 는 틀릴 수 있으므로 호환성 점검에서 '확인 필요'로 표시한다.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None, ""
+    cfg = _sec_config()
+    aliases = {_norm_key(k): v for k, v in (cfg.get("reg_aliases") or {}).items() if v}
+    via = ""
+    if _norm_key(name) in aliases:
+        name, via = aliases[_norm_key(name)], "alias"
+    m = _find_reg_exact(name)
+    if m:
+        return m, via or "exact"
+    org = cfg.get("org") or {}
+    for pre in (org.get("name"), org.get("short"), org.get("abbr")):   # "○○공사 여비규정" ↔ "여비규정"
+        if not pre:
+            continue
+        if name.startswith(pre):
+            m = _find_reg_exact(name[len(pre):].strip())
+        else:
+            m = _find_reg_exact(f"{pre} {name}") or _find_reg_exact(f"{pre}{name}")
+        if m:
+            return m, via or "prefix"
+    m = _find_reg_original(name)                       # 포함 관계(가장 가까운 제목)
+    if m:
+        return m, via or "approx"
+    stem = _SEC_REG_SUFFIX.sub("", _norm_key(name))    # "여비규정" ↔ "여비 지급 지침"
+    if len(stem) >= 2:
+        def _st(x):
+            return _SEC_REG_SUFFIX.sub("", _norm_key(x.get("title", "")))
+        cands = [x for x in _load_reg_manifest()
+                 if len(_st(x)) >= 2 and (_st(x).startswith(stem) or stem.startswith(_st(x)))]
+        if cands:
+            return min(cands, key=lambda x: (abs(len(_st(x)) - len(stem)), len(x.get("title", "")))), via or "approx"
+    return None, ""
+
+
 def _sec_reg_text(title: str) -> str:
-    m = _find_reg_exact(title) or {}
-    slug = m.get("slug") or title.replace(" ", "_")
+    m, _ = _sec_resolve_reg(title)
+    slug = (m or {}).get("slug") or title.replace(" ", "_")
     path = os.path.join(REG_DIR, slug, "index.html")
     try:
         import reg_chunks
@@ -1745,20 +1845,164 @@ def _sec_reg_text(title: str) -> str:
         return ""
 
 
+def _sec_forms_set():
+    return {(_norm_key(f["reg"]), _norm_key(f["label"])) for f in _reg_forms_index()}
+
+
+def _sec_proc_refs(p: dict):
+    """절차가 참조하는 (종류, ref) 목록 — 근거·서식."""
+    out = []
+    for s in p.get("steps") or []:
+        out += [("basis", b) for b in s.get("basis") or []]
+        if s.get("form"):
+            out.append(("form", s["form"]))
+    out += [("form", f) for f in p.get("forms") or []]
+    for pf in p.get("pitfalls") or []:
+        out += [("basis", b) for b in (pf.get("basis") or [])]
+    return out
+
+
+def _sec_proc_status(p: dict, forms=None) -> dict:
+    """호환성 점검 — 연결 안 된 근거·서식(missing), 근사 연결(approx), 근거 규정 개정(stale)."""
+    forms = forms if forms is not None else _sec_forms_set()
+    missing, approx, seen = [], [], set()
+    resolved = {}
+    for kind, r in _sec_proc_refs(p):
+        reg = r.get("reg", "")
+        if reg not in resolved:
+            resolved[reg] = _sec_resolve_reg(reg)
+        m, via = resolved[reg]
+        key = (kind, reg, r.get("art", ""), r.get("label", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not m:
+            missing.append({"kind": kind, "reg": reg, "why": "규정 없음", **{k: r[k] for k in ("art", "label") if r.get(k)}})
+            continue
+        if via == "approx" and not any(a["reg"] == reg for a in approx):
+            approx.append({"reg": reg, "matched": m.get("title", "")})
+        if kind == "basis" and r.get("art") and not _sec_art(m["title"], r["art"]):
+            missing.append({"kind": kind, "reg": reg, "art": r["art"], "why": "조문 없음"})
+        if kind == "form" and (_norm_key(m["title"]), _norm_key(r.get("label", ""))) not in forms:
+            missing.append({"kind": kind, "reg": reg, "label": r.get("label", ""), "why": "서식 없음"})
+    # verified: {절차의 규정명: 개정} 또는 {절차의 규정명: {"title": 확인한 규정, "revision": 개정}}
+    #   같은 규정인데 개정이 다르면 stale(재확인 필요), 다른 규정(다른 기관·매핑)이면 unverified(우리 규정으로 확인 전)
+    stale, unverified = [], []
+    for reg, v in (p.get("verified") or {}).items():
+        m, via = resolved.get(reg) or _sec_resolve_reg(reg)
+        if not m or via == "approx":
+            continue
+        vt, vr = (v.get("title") or reg, v.get("revision", "")) if isinstance(v, dict) else (reg, v)
+        cur = m.get("revision", "")
+        if _norm_key(vt) != _norm_key(m.get("title", "")):
+            unverified.append({"reg": reg, "verified_title": vt, "matched": m.get("title", "")})
+        elif vr and cur and _norm_key(cur) != _norm_key(vr):
+            stale.append({"reg": reg, "verified": vr, "current": cur})
+    return {"ok": not missing and not stale, "missing": missing, "approx": approx,
+            "stale": stale, "unverified": unverified}
+
+
+def _sec_stamp(p: dict) -> dict:
+    """절차가 근거로 삼은 규정의 현재 개정 정보를 기록(이후 개정되면 '재확인 필요'로 감지)."""
+    ver = {}
+    for _, r in _sec_proc_refs(p):
+        m, _v = _sec_resolve_reg(r.get("reg", ""))
+        if m and m.get("revision"):
+            same = _norm_key(m.get("title", "")) == _norm_key(r["reg"])
+            ver[r["reg"]] = m["revision"] if same else {"title": m["title"], "revision": m["revision"]}
+    if ver:
+        p["verified"] = dict(sorted(ver.items()))
+    return p
+
+
+def _sec_holidays(cfg: dict) -> dict:
+    base = (_sec_read_json(SEC_HOLIDAYS_PATH, {}) or {}).get("dates") or {}
+    h = dict(base)
+    hc = cfg.get("holidays") or {}
+    for d in hc.get("extra") or []:
+        if isinstance(d, dict) and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d.get("date", ""))):
+            h[d["date"]] = _sec_clean_str(d.get("name"), 30) or "기관 휴일"
+    for d in hc.get("exclude") or []:
+        h.pop(str(d), None)
+    return h
+
+
+def _sec_public_config(cfg: dict) -> dict:
+    return {"org": cfg.get("org", {}), "service": cfg.get("service", {}), "terms": cfg.get("terms", {}),
+            "reg_aliases": cfg.get("reg_aliases", {}), "holidays": cfg.get("holidays", {}),
+            "updated": cfg.get("updated", "")}
+
+
+@app.route("/api/secretary/config")
+def secretary_config():
+    """기관 설정(브랜드·명칭·매핑·휴일). 업로드 화면 등 다른 페이지도 이 값을 쓴다."""
+    cfg = _sec_config(force=request.args.get("fresh") == "1")
+    return jsonify({"success": True, "config": _sec_public_config(cfg), "holidays": _sec_holidays(cfg)})
+
+
 @app.route("/api/secretary/procedures")
 def secretary_procedures():
-    """서무비서 절차 — 공통 층 + 기관 층. 개인 층은 브라우저가 합친다."""
+    """서무비서 절차 — 공통 층 + 기관 층(+각 절차의 호환성 상태). 개인 층은 브라우저가 합친다."""
+    fresh = request.args.get("fresh") == "1"
     common = _sec_read_json(SEC_COMMON_PATH, {"procedures": [], "drafts": {}})
-    org = _sec_org_load(force=request.args.get("fresh") == "1")
+    org = _sec_org_load(force=fresh)
+    cfg = _sec_config(force=fresh)
+    forms = _sec_forms_set()
+    status = {}
+    for layer, procs in (("common", common.get("procedures", [])), ("org", org.get("procedures", []))):
+        for p in procs:
+            if not p.get("hidden"):
+                status[f"{layer}:{p['id']}"] = _sec_proc_status(p, forms)
     return jsonify({
         "success": True,
         "common": {"procedures": common.get("procedures", []), "drafts": common.get("drafts", {}),
                    "updated": common.get("updated", "")},
         "org": {"procedures": org.get("procedures", []), "drafts": org.get("drafts", {}),
                 "updated": org.get("updated", ""), "updated_by": org.get("updated_by", "")},
+        "status": status,
+        "config": _sec_public_config(cfg),
+        "holidays": _sec_holidays(cfg),
+        "regs": len(_load_reg_manifest()),
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
                   "github": _gh_enabled()},
     })
+
+
+@app.route("/api/secretary/check", methods=["POST"])
+def secretary_check():
+    """절차 목록(개인 절차·가져올 절차 팩)의 호환성 점검 — 저장하지 않는다."""
+    body = request.get_json(silent=True) or {}
+    procs = body.get("procedures")
+    if not isinstance(procs, list) or len(procs) > 300:
+        return jsonify({"success": False, "error": "procedures 목록(최대 300건)이 필요합니다."}), 400
+    forms = _sec_forms_set()
+    out = {}
+    for p in procs:
+        c = _sec_clean_proc(p)
+        if c and not c.get("hidden"):
+            if isinstance(p.get("verified"), dict):
+                c["verified"] = {str(k)[:80]: ({"title": _sec_clean_str(v.get("title"), 80), "revision": _sec_clean_str(v.get("revision"), 60)}
+                                               if isinstance(v, dict) else _sec_clean_str(v, 60))
+                                 for k, v in list(p["verified"].items())[:40]}
+            out[c["id"]] = _sec_proc_status(c, forms)
+    return jsonify({"success": True, "status": out})
+
+
+@app.route("/api/secretary/regs")
+def secretary_regs():
+    """규정명 매핑용 — 우리 기관 규정 목록과, 절차들이 참조하는 규정명이 어디에 연결되는지."""
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": []})
+    org = _sec_org_load()
+    names = set()
+    for p in common.get("procedures", []) + org.get("procedures", []):
+        names |= {r.get("reg", "") for _, r in _sec_proc_refs(p)}
+    refs = []
+    for n in sorted(x for x in names if x):
+        m, via = _sec_resolve_reg(n)
+        refs.append({"name": n, "matched": (m or {}).get("title", ""), "via": via})
+    regs = [{"title": m.get("title", ""), "category": m.get("category", ""), "revision": m.get("revision", "")}
+            for m in _load_reg_manifest()]
+    return jsonify({"success": True, "refs": refs, "regs": regs})
 
 
 @app.route("/api/secretary/basis")
@@ -1769,15 +2013,19 @@ def secretary_basis():
     q = (request.args.get("q") or "").strip()
     if not reg or not (art or q):
         return jsonify({"error": "reg 와 art 또는 q 가 필요합니다."}), 400
-    meta = _find_reg_exact(reg) or {}
+    meta, via = _sec_resolve_reg(reg)
+    if not meta:
+        return jsonify({"success": False, "error": f"「{reg}」 규정이 등록되어 있지 않습니다. "
+                                                   "관리자에게 규정 업로드나 규정명 매핑을 요청하세요."})
     title = meta.get("title") or reg
+    extra = {"revision": meta.get("revision", ""), "via": via,
+             **({"requested": reg} if _norm_key(reg) != _norm_key(title) else {})}
     if art:
-        key = _norm_key(title)
-        for t, no, at, text in _sec_chunks():
-            if _norm_key(t) == key and no == art:
-                return jsonify({"success": True, "reg": t, "art": no, "art_title": at, "text": text,
-                                "revision": meta.get("revision", "")})
-        return jsonify({"success": False, "error": f"「{title}」 제{art}조를 찾지 못했습니다."})
+        hit = _sec_art(title, art)
+        if hit:
+            t, no, at, text = hit
+            return jsonify({"success": True, "reg": t, "art": no, "art_title": at, "text": text, **extra})
+        return jsonify({"success": False, "error": f"「{title}」 제{art}조를 찾지 못했습니다.", **extra})
     text = _sec_reg_text(title)
     if not text:
         return jsonify({"success": False, "error": f"「{title}」 원문을 찾지 못했습니다."})
@@ -1793,10 +2041,9 @@ def secretary_basis():
         if len(picks) >= 3:
             break
     if not picks:
-        return jsonify({"success": False, "error": f"「{title}」에서 '{q}'를 찾지 못했습니다."})
+        return jsonify({"success": False, "error": f"「{title}」에서 '{q}'를 찾지 못했습니다.", **extra})
     snippet = "\n…\n".join(picks)[:1800]
-    return jsonify({"success": True, "reg": title, "q": q, "text": snippet,
-                    "revision": meta.get("revision", "")})
+    return jsonify({"success": True, "reg": title, "q": q, "text": snippet, **extra})
 
 
 @app.route("/api/secretary/related")
@@ -1845,6 +2092,23 @@ def secretary_related():
     return jsonify({"success": True, "items": items[:12]})
 
 
+def _sec_save_repo_file(repo_path: str, local_path: str, payload: str, message: str) -> str:
+    """기관 층·설정 저장 — GitHub 연동 시 커밋, 아니면 로컬 파일. 안내 문구를 돌려준다."""
+    if _gh_enabled():
+        sha = _gh_commit_files({repo_path: payload}, message)
+        return f"저장소에 커밋했습니다({sha[:7]}). 배포가 끝나면 모든 사용자에게 반영됩니다."
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp = local_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(tmp, local_path)
+    return "서버에 저장했습니다."
+
+
+_SEC_READONLY_MSG = ("이 서버는 파일을 쓸 수 없습니다(읽기 전용 배포). "
+                     "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다.")
+
+
 @app.route("/api/secretary/org", methods=["POST"])
 def secretary_org_save():
     """기관 층 저장(관리자). 내규 업로드와 같은 토큰을 쓰고, GitHub 연동 시 저장소에 커밋한다."""
@@ -1862,6 +2126,7 @@ def secretary_org_save():
     ids = [p["id"] for p in procs]
     if len(ids) != len(set(ids)):
         return jsonify({"success": False, "error": "같은 id 의 절차가 두 번 들어 있습니다."}), 400
+    procs = [p if p.get("hidden") else _sec_stamp(p) for p in procs]   # 저장 시점의 근거 개정 기록
     drafts = {}
     for k, d in (body.get("drafts") or {}).items():
         k = _sec_clean_str(k, 48).lower()
@@ -1872,30 +2137,71 @@ def secretary_org_save():
                      "fields": [{"k": _sec_clean_str(f.get("k"), 24), "l": _sec_clean_str(f.get("l"), 40),
                                  "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {})}
                                 for f in (d.get("fields") or [])[:20] if isinstance(f, dict) and f.get("k")]}
-    data = {"version": 1, "layer": "org",
-            "updated": datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M"),
+    data = {"version": 1, "layer": "org", "updated": _now_kst(),
             "updated_by": _sec_clean_str(body.get("editor"), 40),
             "procedures": procs, "drafts": drafts}
     payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
     try:
-        if _gh_enabled():
-            sha = _gh_commit_files({SEC_ORG_REPO_PATH: payload},
-                                   f"서무비서 기관 절차 갱신: {len(procs)}건")
-            where = f"저장소에 커밋했습니다({sha[:7]}). 배포가 끝나면 모든 사용자에게 반영됩니다."
-        else:
-            os.makedirs(SEC_DIR, exist_ok=True)
-            tmp = SEC_ORG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp, SEC_ORG_PATH)
-            where = "서버에 저장했습니다."
+        where = _sec_save_repo_file(SEC_ORG_REPO_PATH, SEC_ORG_PATH, payload,
+                                    f"서무비서 기관 절차 갱신: {len(procs)}건")
     except OSError:
-        return jsonify({"success": False, "error": "이 서버는 파일을 쓸 수 없습니다(읽기 전용 배포). "
-                                                   "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다."}), 500
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 502
     _SEC_ORG_CACHE.update({"ts": time.time(), "data": data})
     return jsonify({"success": True, "count": len(procs), "message": where, "org": data})
+
+
+_SEC_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+@app.route("/api/secretary/config", methods=["POST"])
+def secretary_config_save():
+    """기관 설정 저장(관리자) — 기관명·서비스 이름·색·명칭·규정명 매핑·기관 휴일."""
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    body = (request.get_json(silent=True) or {}).get("config") or {}
+    if not isinstance(body, dict):
+        return jsonify({"success": False, "error": "config 객체가 필요합니다."}), 400
+    org = body.get("org") or {}
+    svc = body.get("service") or {}
+    if not _sec_clean_str(org.get("name"), 60):
+        return jsonify({"success": False, "error": "기관명을 입력하세요."}), 400
+    primary = _sec_clean_str(svc.get("primary"), 7)
+    cfg = {
+        "schema_version": 1,
+        "org": {k: _sec_clean_str(org.get(k), 60) for k in ("name", "short", "abbr")},
+        "service": {"title": _sec_clean_str(svc.get("title"), 30) or "서무비서",
+                    "icon": _sec_clean_str(svc.get("icon"), 4) or "🗂",
+                    "primary": primary if _SEC_HEX.match(primary) else "#256ef4",
+                    "tagline": _sec_clean_str(svc.get("tagline"), 120),
+                    "footer": _sec_clean_str(svc.get("footer"), 300)},
+        "terms": {k: _sec_clean_str((body.get("terms") or {}).get(k), 30) or _SEC_CFG_DEFAULT["terms"][k]
+                  for k in _SEC_TERM_KEYS},
+        "reg_aliases": {_sec_clean_str(k, 80): _sec_clean_str(v, 80)
+                        for k, v in list((body.get("reg_aliases") or {}).items())[:300]
+                        if _sec_clean_str(k, 80) and _sec_clean_str(v, 80)},
+        "holidays": {
+            "extra": [{"date": d["date"], "name": _sec_clean_str(d.get("name"), 30) or "기관 휴일"}
+                      for d in ((body.get("holidays") or {}).get("extra") or [])[:100]
+                      if isinstance(d, dict) and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d.get("date", "")))],
+            "exclude": [str(d) for d in ((body.get("holidays") or {}).get("exclude") or [])[:100]
+                        if re.match(r"^\d{4}-\d{2}-\d{2}$", str(d))],
+        },
+        "updated": _now_kst(),
+        "updated_by": _sec_clean_str((request.get_json(silent=True) or {}).get("editor"), 40),
+    }
+    payload = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
+    try:
+        where = _sec_save_repo_file(SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, payload,
+                                    f"서무비서 기관 설정 갱신: {cfg['org']['name']}")
+    except OSError:
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    _SEC_CFG_CACHE.update({"ts": time.time(), "data": cfg})
+    return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config())})
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────

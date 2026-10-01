@@ -1,0 +1,23 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://koat-secretary/schema/config.schema.json",
+ "title": "서무비서 기관 설정(secretary/config.json)",
+ "type": "object",
+ "required": ["org"],
+ "properties": {
+  "schema_version": {"type": "integer"},
+  "org": {"type": "object", "required": ["name"], "properties": {
+   "name": {"type": "string", "description": "기관 정식 명칭"}, "short": {"type": "string", "description": "영문 약칭"}, "abbr": {"type": "string", "description": "줄임말"}}},
+  "service": {"type": "object", "properties": {
+   "title": {"type": "string"}, "icon": {"type": "string", "maxLength": 4}, "primary": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
+   "tagline": {"type": "string"}, "footer": {"type": "string"}}},
+  "terms": {"type": "object", "description": "절차 문장 [[키]] 자리표시의 기관 명칭",
+            "properties": {"erp": {"type": "string"}, "portal": {"type": "string"}, "accounting": {"type": "string"}, "approval": {"type": "string"}}},
+  "reg_aliases": {"type": "object", "description": "절차가 참조하는 규정명 → 우리 기관 규정명", "additionalProperties": {"type": "string"}},
+  "holidays": {"type": "object", "properties": {
+   "extra": {"type": "array", "items": {"type": "object", "required": ["date"], "properties": {"date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}, "name": {"type": "string"}}}},
+   "exclude": {"type": "array", "items": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}}}},
+  "updated": {"type": "string"},
+  "updated_by": {"type": "string"}
+ }
+}

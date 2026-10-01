@@ -1046,5 +1046,9 @@ function showMgmtResult(ok,html){
 initTab();
 loadStatus();
 </script>
+<script>/* 기관 설정(이름·색)을 업로드 화면에도 적용 */
+fetch('/api/secretary/config').then(function(r){return r.json();}).then(function(d){ var c=(d&&d.config)||{}, o=c.org||{}, v=c.service||{};
+  var t=[o.short||o.name, v.title||'서무비서'].filter(Boolean).join(' '); document.title='개정 내규 업로드 · '+t;
+  var f=document.querySelector('.foot'); if(f) f.textContent=t+' · 개정 내규 업로드'; }).catch(function(){});</script>
 </body>
 </html>
