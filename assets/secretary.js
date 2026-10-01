@@ -6,7 +6,7 @@
  *   기관: secretary/org.json(관리자 등록 → 모든 사용자)
  *   개인: localStorage(내 브라우저 — 보충 메모·개인 절차)
  * 처리 이력(진행 중인 건)도 localStorage 에만 저장한다.
- * index.html 의 공용 함수(escHtml·wsOpen·openExpense 등)를 그대로 쓴다.
+ * 단독 페이지(index.html)용 — 원문 보기 패널·모달·토스트도 여기서 다룬다.
  * ═══════════════════════════════════════════════════════════════════════════ */
 (function(){
 'use strict';
@@ -25,7 +25,7 @@ const EXAMPLES=[
 ];
 
 let S={ loaded:false, loading:null, common:{procedures:[],drafts:{}}, org:{procedures:[],drafts:{}}, admin:{},
-        view:'home', query:'', matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
+        view:'home', query:'', formsQ:'', forms:null, regs:null, matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
         basisOpen:{}, basisCache:{}, catFilter:'' };
 
 // ── 저장소 ────────────────────────────────────────────────────────────────
@@ -36,8 +36,10 @@ function personal(){ const p=_ls(LS_PERSONAL,{}); p.procedures=Array.isArray(p.p
 function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
 function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); }
-function toast(m,ms){ if(typeof window._toast==='function') window._toast(m, ms||2600); }
-const esc=s=>(typeof window.escHtml==='function')?window.escHtml(String(s==null?'':s)):String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let _toastT=null;
+function toast(m,ms){ const el=document.getElementById('toast'); if(!el) return; el.textContent=m; el.classList.add('show');
+  clearTimeout(_toastT); _toastT=setTimeout(()=>el.classList.remove('show'), ms||2600); }
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const norm=s=>String(s||'').replace(/\s+/g,'').toLowerCase();
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 
@@ -132,24 +134,15 @@ function openCasesWithNext(){
 }
 
 // ── 화면 진입 ────────────────────────────────────────────────────────────
-async function openSecretary(opts){
+async function start(opts){
   opts=opts||{};
-  if(typeof window.wsBackToList==='function') window.wsBackToList();
-  const mc=document.querySelector('.main-content'); if(mc) mc.classList.add('assist-on');
-  document.querySelectorAll('.sm-item.active').forEach(el=>el.classList.remove('active'));
-  const tab=document.getElementById('smSecretary'); if(tab) tab.classList.add('active');
-  window._assistMode='secretary';
-  const p=document.getElementById('assistantPanel'); if(!p) return;
-  p.innerHTML=`<div class="assist-head"><span class="assist-h-ic">🗂</span><span class="assist-h-t">서무비서</span>`+
-    `<span class="assist-h-hint">출장·물품·행사·복무·결재 — 상황을 말하면 절차·기한·서식·근거를 찾아 드립니다.</span>`+
-    (typeof window._assistCloseBtn==='function'?window._assistCloseBtn():'')+`</div>`+
-    `<div class="sec-wrap" id="secWrap"><div class="assist-loading"><div class="spinner"></div><span>서무 절차 불러오는 중...</span></div></div>`;
-  bind(p);
+  const w=document.getElementById('secWrap'); if(!w) return;
+  bind(w); bindViewer();
   try{ await load(); }
-  catch(e){ const w=document.getElementById('secWrap'); if(w) w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
+  catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
+  if(opts.reg) openReg(opts.reg);
   if(opts.q){ ask(opts.q); return; }
-  if(opts.view) S.view=opts.view;
-  else if(!S.procId) S.view='home';
+  if(opts.view && ['list','history','forms','manage'].includes(opts.view)) S.view=opts.view;
   render();
 }
 
@@ -175,7 +168,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],['list','📚 절차 목록'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -188,10 +181,12 @@ function render(){
   else if(S.view==='nomatch') body=noMatchView();
   else if(S.view==='list') body=listView();
   else if(S.view==='history') body=historyView();
+  else if(S.view==='forms') body=formsView();
   else if(S.view==='manage') body=manageView();
   else if(S.view==='edit') body=editView();
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
   if(S.view==='proc') loadOpenBasis();
+  if(S.view==='forms') loadForms();
 }
 
 function homeView(){
@@ -247,7 +242,7 @@ function procView(){
     (c?`<span class="sec-case-st">🕘 처리 이력 저장 중 · ${pr.done}/${pr.total} 단계${c.status==='done'?' · 완료':''}</span>`:`<span class="sec-case-st muted">단계를 체크하거나 기준일을 넣으면 처리 이력에 자동 저장됩니다</span>`)+
     `<span class="sec-prog"><i style="width:${pr.pct}%"></i></span>`+
     `<span class="sec-casebar-acts">`+
-      (p.steps.some(s=>s.deadline)?`<button class="sec-btn sm" data-a="tocal" title="계산된 기한을 일정관리 › 일정에 담습니다">📅 기한을 일정에</button>`:'')+
+      (p.steps.some(s=>s.deadline)?`<button class="sec-btn sm" data-a="tocal" title="계산된 기한을 캘린더 파일(.ics)로 받아 Outlook·구글 캘린더 등에 넣습니다">📅 기한 캘린더(.ics)</button>`:'')+
       (c?`<button class="sec-btn sm ghost" data-a="newcase" title="같은 절차를 새 건으로 시작">＋ 새 건</button>`:'')+
       (c&&c.status!=='done'?`<button class="sec-btn sm ghost" data-a="casedone">완료</button>`:'')+
     `</span></div>`;
@@ -273,7 +268,7 @@ function stepHtml(p, s, i, checks, dates){
   (s.basis||[]).forEach((b,bi)=>acts.push(`<button class="sec-mini${S.basisOpen[i+':'+bi]?' on':''}" data-a="basis" data-i="${i}" data-bi="${bi}" title="근거 조문 펼치기">📖 ${esc(basisLabel(b))}</button>`));
   if(s.form) acts.push(`<button class="sec-mini" data-a="form" data-reg="${esc(s.form.reg)}" data-label="${esc(s.form.label)}">📎 ${esc(s.form.label)}</button>`);
   if(s.draft && allDrafts()[s.draft]) acts.push(`<button class="sec-mini primary" data-a="draft" data-d="${esc(s.draft)}">📝 초안 작성</button>`);
-  if(s.act) acts.push(`<button class="sec-mini" data-a="act" data-k="${esc(s.act.k)}" data-id="${esc(s.act.id||'')}" data-q="${esc(s.act.q||'')}">↗ ${esc(s.act.l||'바로가기')}</button>`);
+  if(s.act && s.act.k==='proc' && getProc(s.act.id)) acts.push(`<button class="sec-mini" data-a="proc" data-id="${esc(s.act.id)}">↗ ${esc(s.act.l||'관련 절차')}</button>`);
   const basisBoxes=(s.basis||[]).map((b,bi)=>S.basisOpen[i+':'+bi]?`<div class="sec-basis" id="secb_${i}_${bi}"><div class="assist-loading sm"><div class="spinner"></div><span>근거 불러오는 중...</span></div></div>`:'').join('');
   return `<div class="sec-step${done?' done':''}${s.optional?' opt':''}">`+
     `<button class="sec-chk" data-a="check" data-i="${i}" aria-pressed="${done}" aria-label="${i+1}단계 ${done?'완료 취소':'완료'}">${done?'✓':i+1}</button>`+
@@ -310,7 +305,7 @@ function noMatchView(){
       :`<div class="sec-empty">관련 조문을 찾지 못했습니다. 다른 표현으로 말해 보세요.</div>`);
   return `<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
     `<div class="sec-hint">대신 관련 있어 보이는 규정 조문을 찾았습니다. 자주 하는 일이라면 <b>규정·절차 관리</b>에서 절차로 등록해 두면 다음부터 단계별로 안내합니다.</div>${list}`+
-    `<div class="sec-row"><button class="sec-btn" data-a="search" data-q="${esc(S.query)}">📋 내규똑똑에서 검색</button><button class="sec-btn ghost" data-a="newproc">＋ 이 상황을 절차로 등록</button><button class="sec-btn ghost" data-a="view" data-v="list">절차 목록 보기</button></div></div>`;
+    `<div class="sec-row"><button class="sec-btn" data-a="formsq" data-q="${esc(S.query)}">📎 서식·규정에서 찾기</button><button class="sec-btn ghost" data-a="newproc">＋ 이 상황을 절차로 등록</button><button class="sec-btn ghost" data-a="view" data-v="list">절차 목록 보기</button></div></div>`;
 }
 
 function listView(){
@@ -494,7 +489,7 @@ function openDraft(key){
   const saved=(c&&c.drafts&&c.drafts[key])||{};
   const vals=Object.assign({}, draftAuto(d,c,p), saved);
   S._draft={key, vals};
-  const body=window._wpModal?window._wpModal('secDraftModal','📝 '+esc(d.title)+' 초안','',true):null; if(!body) return;
+  const body=modal('secDraftModal','📝 '+esc(d.title)+' 초안');
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
@@ -510,45 +505,118 @@ function openDraft(key){
   out();
 }
 
-// ── 서식·근거·바로가기 ───────────────────────────────────────────────────
-async function openForm(reg, label){
-  try{
-    if(typeof window.openOriginalPdf!=='function'){ throw 0; }
-    await window.openOriginalPdf(reg);
-    const fr=document.getElementById('origPdfFrame'); if(!fr) return;
-    const go=()=>{ try{ window.scrollFrameToAnnex(fr, label); }catch(e){} };
-    if(fr.contentDocument && fr.contentDocument.readyState==='complete') setTimeout(go,150);
-    fr.addEventListener('load', ()=>setTimeout(go,150), {once:true});
-  }catch(e){ openReg(reg); }
+// ── 원문 보기 패널(규정 전문·서식) ──────────────────────────────────────
+function modal(id, title){
+  let bg=document.getElementById(id);
+  if(!bg){ bg=document.createElement('div'); bg.id=id; bg.className='modal-bg';
+    bg.addEventListener('click', e=>{ if(e.target===bg) closeModal(id); }); document.body.appendChild(bg); }
+  bg.innerHTML=`<div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title).replace(/<[^>]+>/g,'')}"><div class="modal-h"><span class="modal-t">${title}</span>`+
+    `<button class="viewer-x" type="button" data-close="${id}" aria-label="닫기">✕</button></div><div class="modal-b"></div></div>`;
+  bg.querySelector('[data-close]').addEventListener('click', ()=>closeModal(id));
+  bg.classList.add('show'); return bg.querySelector('.modal-b');
 }
-function openReg(reg, art, q){
-  if(typeof window.closeAssist==='function') window.closeAssist();
-  if(typeof window.wsOpen!=='function') return;
-  window.wsOpen(reg, 'internal', undefined, '', '', art?'':(q||''));
-  if(art && typeof window._wsJumpAfterOpen==='function') window._wsJumpAfterOpen(reg, 'internal', '제'+art+'조');
-  toast('작업공간에 전문을 열었습니다. 왼쪽 메뉴 🗂 서무비서로 돌아올 수 있어요.', 3200);
+function closeModal(id){ const bg=document.getElementById(id); if(bg) bg.classList.remove('show'); }
+const _origCache={};
+async function regInfo(reg){
+  const k=norm(reg); if(k in _origCache) return _origCache[k];
+  try{ const r=await fetch('/api/internal/original?name='+encodeURIComponent(reg)); const d=await r.json(); _origCache[k]=(d&&d.found&&d.html_url)?d:null; }
+  catch(e){ return null; }
+  return _origCache[k];
 }
-function runAct(k, id, q){
-  const close=()=>{ if(typeof window.closeAssist==='function') window.closeAssist(); };
-  if(k==='proc' && id){ selectProc(id); return; }
-  if(k==='expense' && window.openExpense) return window.openExpense();
-  if(k==='service' && window.openService) return window.openService();
-  if(k==='company' && window.openAssist) return window.openAssist('company');
-  if(k==='forms' && window.openForms) return window.openForms();
-  if(k==='memo' && window.openDashboard) return window.openDashboard();
-  if(k==='search'){ close(); if(window.setMode) window.setMode('internal'); if(window.quick) window.quick(q||S.query); return; }
+// 원문 HTML(같은 출처)을 패널에 띄우고, 조문·별표·검색어 위치로 스크롤한다.
+async function openViewer(reg, target){
+  const info=await regInfo(reg);
+  if(!info){ toast(`「${reg}」 원문을 찾지 못했습니다.`, 3000); return; }
+  const v=document.getElementById('viewer'), fr=document.getElementById('viewerFrame');
+  document.getElementById('viewerTitle').innerHTML=`📄 ${esc(info.title||reg)}${info.revision?`<small>${esc(info.revision)}</small>`:''}`;
+  document.getElementById('viewerExt').href=info.html_url;
+  v.classList.add('open'); document.getElementById('viewerDim').classList.add('show');
+  const go=()=>setTimeout(()=>{ try{ scrollFrame(fr, target||{}); }catch(e){} }, 120);
+  const want=new URL(info.html_url, location.href).href;
+  if(fr.src===want && fr.contentDocument && fr.contentDocument.readyState==='complete') go();
+  else { fr.addEventListener('load', go, {once:true}); fr.src=info.html_url; }
+  document.getElementById('viewerClose').focus();
 }
+function closeViewer(){
+  const v=document.getElementById('viewer'); if(!v||!v.classList.contains('open')) return false;
+  v.classList.remove('open'); document.getElementById('viewerDim').classList.remove('show'); return true;
+}
+function flash(el){ if(!el) return; el.scrollIntoView({behavior:'smooth',block:'start'}); const prev=el.style.backgroundColor;
+  el.style.backgroundColor='#fff3a3'; setTimeout(()=>{ el.style.backgroundColor=prev||''; }, 2400); }
+function scrollFrame(fr, t){
+  const doc=fr.contentDocument; if(!doc||!doc.body) return;
+  const blocks=[...doc.body.querySelectorAll('p,div,td,th,h1,h2,h3,li')].filter(el=>!el.querySelector('p,div,td,table'));
+  const txt=el=>(el.textContent||'').replace(/\s+/g,' ').trim();
+  if(t.art){   // 제N조(제목) 로 시작하는 단락 — 목차(짧은 줄)보다 본문(긴 단락)을 우선
+    const [n,m]=String(t.art).split('의');
+    const re=new RegExp('^제\\s*'+n+'\\s*조'+(m?'\\s*의\\s*'+m:'(?!\\s*의)')+'\\s*[(（]');
+    const hits=blocks.filter(el=>re.test(txt(el)));
+    flash(hits.find(el=>txt(el).length>60)||hits[0]); return;
+  }
+  if(t.annex){   // 별표·별지: 괄호로 둘러싼 서식 머리 → 라벨로 시작하는 짧은 요소 → 라벨 포함 마지막 요소
+    const key=String(t.annex).replace(/\s+/g,''); const mm=key.match(/^(별[표지])(?:제)?(\d+(?:의\d+)?)?/); if(!mm) return;
+    // 번호 없는 「별표」는 번호가 붙지 않은 머리(〔별표〕)만 — "별표 1" 등에 걸리지 않게
+    const re=new RegExp(mm[1][0]+'\\s*'+mm[1][1]+(mm[2]?'\\s*(?:제)?\\s*'+mm[2]+'(?![\\d의])\\s*호?':'(?!\\s*(?:제\\s*)?\\d)'));
+    const reHead=new RegExp('^[\\[〔【［(（<〈]\\s*'+re.source);
+    let el=blocks.find(b=>{ const x=txt(b); return x.length<=80 && reHead.test(x); });
+    if(!el) blocks.forEach(b=>{ const x=txt(b); if(x.length<=60 && re.test(x.slice(0,20))) el=b; });
+    if(!el) blocks.forEach(b=>{ if(re.test(txt(b))) el=b; });
+    flash(el); return;
+  }
+  if(t.q){ const q=String(t.q).replace(/\s+/g,''); flash(blocks.find(el=>txt(el).replace(/\s+/g,'').includes(q))); }
+}
+function bindViewer(){
+  document.getElementById('viewerClose').addEventListener('click', closeViewer);
+  document.getElementById('viewerDim').addEventListener('click', closeViewer);
+  document.addEventListener('keydown', e=>{ if(e.key!=='Escape') return;
+    const m=document.querySelector('.modal-bg.show'); if(m){ m.classList.remove('show'); return; }
+    closeViewer(); });
+}
+function openForm(reg, label){ return openViewer(reg, {annex:label}); }
+function openReg(reg, art, q){ return openViewer(reg, art?{art}:(q?{q}:{})); }
+
+// ── 서식·규정 찾기 ───────────────────────────────────────────────────────
+function loadForms(){
+  if(S.forms==null){ S.forms=false;
+    fetch('/api/internal/forms').then(r=>r.json()).then(d=>{ S.forms=(d&&d.forms)||[]; if(S.view==='forms') renderFormsList(); }).catch(()=>{ S.forms=[]; if(S.view==='forms') renderFormsList(); });
+    fetch('/api/regs/names').then(r=>r.json()).then(d=>{ S.regs=(d&&d.names)||[]; if(S.view==='forms') renderFormsList(); }).catch(()=>{ S.regs=[]; });
+  } else renderFormsList();
+}
+function formsView(){
+  return `<div class="sec-card"><div class="sec-card-h">📎 서식·규정 찾기 <span class="sec-sub">규정의 별표·별지 서식과 규정 원문을 바로 엽니다</span></div>`+
+    `<input id="secFormsQ" class="sec-fq" data-a="formsin" placeholder="서식명·규정명 (예: 귀국보고서, 청구서, 여비)" value="${esc(S.formsQ)}" aria-label="서식·규정 검색">`+
+    `<div id="secFormsList"><div class="assist-loading"><div class="spinner"></div><span>서식 목록 불러오는 중...</span></div></div></div>`;
+}
+function renderFormsList(){
+  const box=document.getElementById('secFormsList'); if(!box) return;
+  if(!S.forms){ return; }
+  const q=norm(S.formsQ);
+  const regs=(S.regs||[]).filter(r=>q && norm(r.title).includes(q)).slice(0,12);
+  const forms=S.forms.filter(f=>!q || norm(f.reg+f.label+f.title).includes(q));
+  const regHtml=regs.length?`<div class="sec-card-h" style="margin-top:12px;">📖 규정 원문 <span class="sec-sub">${regs.length}건</span></div><div class="sec-forms">`+
+    regs.map(r=>`<button class="sec-form" data-a="openreg" data-reg="${esc(r.title)}"><span class="sec-form-t">${esc(r.title)}</span><span class="sec-form-s">${esc(r.category||'')}${r.revision?' · '+esc(r.revision):''}</span></button>`).join('')+`</div>`:'';
+  const formHtml=`<div class="sec-card-h" style="margin-top:12px;">📎 서식 <span class="sec-sub">${forms.length}건${q?` (전체 ${S.forms.length}건 중)`:''}</span></div>`+
+    (forms.length?`<div class="sec-forms sec-forms-grid">`+forms.slice(0,200).map(f=>`<button class="sec-form" data-a="form" data-reg="${esc(f.reg)}" data-label="${esc(f.label)}"><span class="sec-form-t">${esc(f.title)}</span><span class="sec-form-s">${esc(f.reg)} ${esc(f.label)}</span></button>`).join('')+`</div>`+
+      (forms.length>200?`<div class="sec-hint">상위 200건만 표시 — 검색어로 좁혀 주세요.</div>`:''):`<div class="sec-empty">검색 결과가 없습니다.</div>`);
+  box.innerHTML=regHtml+formHtml;
+}
+
+// ── 기한 → 캘린더 파일(.ics) ──────────────────────────────────────────────
+function icsEsc(t){ return String(t).replace(/[\\;,]/g,m=>'\\'+m).replace(/\n/g,'\\n'); }
 function addDeadlinesToCalendar(){
   const p=getProc(S.procId); const c=curCase(); if(!p) return;
   if(!c || !Object.keys(c.dates||{}).length){ toast('먼저 기준일(출발일·마친 날 등)을 넣어 주세요.'); return; }
-  if(typeof window._wmemoGet!=='function'){ toast('일정관리를 사용할 수 없습니다.'); return; }
-  const m=window._wmemoGet(); let n=0;
+  const ev=[];
   (p.steps||[]).forEach((s,i)=>{ const due=stepDue(s,c.dates); if(!due || (c.checks&&c.checks[i])) return;
-    const t=`[서무] ${shortTitle(p.title)} — ${s.t.replace(/[.。]$/,'').slice(0,40)}`;
-    if((m.events||[]).some(e=>e.title===t && String(e.date||'').slice(0,10)===due)) return;
-    m.events.push({id:window._memoId?window._memoId():uid(), title:t, date:due, time:'', place:''}); n++; });
-  if(!n){ toast('새로 담을 기한이 없습니다(이미 담았거나 완료).'); return; }
-  window._wmemoSave(m); toast(`📅 기한 ${n}건을 일정관리 › 일정에 담았습니다.`, 3600);
+    const d=due.replace(/-/g,''); const nx=addDays(due,1).replace(/-/g,'');
+    ev.push(['BEGIN:VEVENT','UID:'+c.id+'-'+i+'@koat-secretary','DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z',
+      'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${shortTitle(p.title)} — ${s.t.replace(/[.。]$/,'').slice(0,50)}`),
+      'DESCRIPTION:'+icsEsc(deadlineText(s)+(s.basis&&s.basis.length?' / 근거: '+s.basis.map(basisLabel).join(', '):'')),'END:VEVENT'].join('\r\n')); });
+  if(!ev.length){ toast('남은 기한이 없습니다(완료했거나 기준일이 필요한 단계가 없음).'); return; }
+  const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//KOAT//Secretary//KO','CALSCALE:GREGORIAN',...ev,'END:VCALENDAR'].join('\r\n');
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
+  a.download=`서무비서_${shortTitle(p.title)}_기한.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast(`📅 기한 ${ev.length}건을 캘린더 파일로 받았습니다. Outlook·구글 캘린더에서 열어 추가하세요.`, 4200);
 }
 function download(name, obj){ const blob=new Blob([JSON.stringify(obj,null,1)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
 function readJsonFile(input, cb){ const f=input.files&&input.files[0]; if(!f) return; const r=new FileReader();
@@ -559,13 +627,12 @@ function bind(panel){
   if(panel._secBound) return; panel._secBound=true;
   panel.addEventListener('submit', e=>{ const f=e.target.closest('[data-a="askform"]'); if(!f) return; e.preventDefault(); const q=document.getElementById('secQ'); ask(q?q.value:''); });
   panel.addEventListener('click', e=>{
-    if(window._assistMode!=='secretary') return;
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','pimport','askform'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','pimport','askform','formsin'].includes(a)) return;
     e.preventDefault();
     switch(a){
-      case 'retry': openSecretary(); break;
+      case 'retry': start(); break;
       case 'view': S.view=D.v; if(D.v==='home'){ S.procId=null; S.query=''; S.matches=[]; } render(); break;
       case 'ask': ask(D.q); break;
       case 'proc': selectProc(D.id, {keepQuery:!!D.keep}); break;
@@ -575,8 +642,7 @@ function bind(panel){
       case 'form': openForm(D.reg, D.label); break;
       case 'openreg': openReg(D.reg, D.art, D.q); break;
       case 'draft': openDraft(D.d); break;
-      case 'act': runAct(D.k, D.id, D.q); break;
-      case 'search': runAct('search','',D.q); break;
+      case 'formsq': S.formsQ=D.q||''; S.view='forms'; render(); break;
       case 'tocal': addDeadlinesToCalendar(); break;
       case 'newcase': S.caseId=null; render(); toast('새 건으로 시작합니다. 체크하거나 기준일을 넣으면 저장돼요.'); break;
       case 'casedone': ensureCase(); updateCase(c=>{ c.status='done'; c.doneAt=today(); }); toast('완료 처리했습니다. 처리 이력에서 다시 볼 수 있어요.'); render(); break;
@@ -602,7 +668,6 @@ function bind(panel){
     }
   });
   panel.addEventListener('change', e=>{
-    if(window._assistMode!=='secretary') return;
     const el=e.target; const a=el.dataset&&el.dataset.a;
     if(a==='date'){ ensureCase(); updateCase(c=>{ c.dates=c.dates||{}; if(el.value) c.dates[el.dataset.k]=el.value; else delete c.dates[el.dataset.k]; }); render(); }
     else if(a==='lay'){ S.editLayer=el.value; render(); }
@@ -616,8 +681,8 @@ function bind(panel){
       if(d.notes) per.notes=Object.assign({}, per.notes, d.notes); savePersonal(per); toast(`개인 절차 ${d.procedures.length}건을 가져왔습니다.`); render(); });
   });
   panel.addEventListener('input', e=>{
-    if(window._assistMode!=='secretary') return;
     const el=e.target; const a=el.dataset&&el.dataset.a;
+    if(a==='formsin'){ S.formsQ=el.value; renderFormsList(); return; }
     if(a==='pnote'){ const per=personal(); if(el.value.trim()) per.notes[S.procId]=el.value; else delete per.notes[S.procId]; savePersonal(per); }
     else if(a==='cnote'){ updateCase(c=>{ c.note=el.value; }); }
     else if(a==='ef' || (a==='es' && el.type!=='checkbox' && el.tagName!=='SELECT')) editorField(el);
@@ -625,11 +690,7 @@ function bind(panel){
 }
 
 // ── 공개 ─────────────────────────────────────────────────────────────────
-window.openSecretary=openSecretary;
-window.secretaryAsk=function(q){ openSecretary({q}); };
-window._secDeadlines=function(){   // 일정관리 '오늘' 등에서 쓸 수 있는 다가오는 서무 기한
-  return openCasesWithNext().filter(x=>x.next&&x.next.due).map(x=>({title:x.c.title, step:x.next.s.t, due:x.next.due, id:x.c.id}));
-};
+window.Secretary={start, ask:q=>ask(q), openReg};
 window._secMatch=function(q){ return match(q).map(m=>({id:m.p.id, title:m.p.title, score:m.sc})); };   // 시험·디버그용
 window._secLoad=load;
 // 기본 화면이므로 스크립트가 읽히자마자 절차를 미리 받는다 — 본문 스크립트의 법령 확인 요청들보다
