@@ -3607,6 +3607,20 @@ def serve_regulation_file(subpath):
                         status=404, mimetype="text/html; charset=utf-8")
 
 
+@app.route("/assets/<path:subpath>")
+def serve_asset_file(subpath):
+    """정적 리소스(서무비서 스크립트·엑셀 서식 등) 서빙 — 로컬 실행용. Vercel은 vercel.json이 정적 처리."""
+    from flask import send_from_directory
+    if any(part.startswith(".") for part in subpath.replace("\\", "/").split("/")):
+        return Response("Not found", status=404)
+    try:
+        resp = send_from_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"), subpath)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+    except Exception:
+        return Response("Not found", status=404)
+
+
 @app.route("/upload")
 @app.route("/upload.html")
 def upload_page():
@@ -6251,6 +6265,312 @@ def expense_hwpx():
                         headers={"Content-Disposition": "attachment; filename*=UTF-8''" + _q(fname)})
     except Exception as e:
         return jsonify({"success": False, "error": f"HWPX 생성 실패: {e}"}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 서무비서 — 서무 규정·지침·서식을 담아 두고, 상황을 말하면 절차·기한·서식·근거를 안내
+#   공통(secretary/procedures.json, 저장소 기본 탑재) → 기관(secretary/org.json, 관리자 등록)
+#   → 개인 보충(브라우저 localStorage) 세 층으로 관리한다. 근거 조문은 번들 내규 원문에서 뽑는다.
+# ══════════════════════════════════════════════════════════════════════════
+SEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secretary")
+SEC_COMMON_PATH = os.path.join(SEC_DIR, "procedures.json")
+SEC_ORG_PATH = os.path.join(SEC_DIR, "org.json")
+SEC_ORG_REPO_PATH = "secretary/org.json"
+_SEC_ORG_CACHE: dict = {"ts": 0.0, "data": None}
+_SEC_CHUNKS = None            # [(title, no, art_title, body)] — 근거 조문·관련 조문 검색용(모듈 캐시)
+_SEC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{1,47}$")
+_SEC_ACT_KINDS = {"expense", "service", "company", "forms", "memo", "proc", "search"}
+
+
+def _sec_read_json(path: str, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _sec_org_load(force: bool = False) -> dict:
+    """기관 층. GitHub 연동 시 저장소 최신본(60초 캐시) — 배포 전에도 방금 저장한 내용이 보이게."""
+    if not force and _SEC_ORG_CACHE["data"] is not None and time.time() - _SEC_ORG_CACHE["ts"] < 60:
+        return _SEC_ORG_CACHE["data"]
+    data = None
+    if _gh_enabled():
+        raw = _gh_file(SEC_ORG_REPO_PATH)
+        if raw:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                data = None
+    if data is None:
+        data = _sec_read_json(SEC_ORG_PATH, {})
+    data = data if isinstance(data, dict) else {}
+    data.setdefault("procedures", [])
+    data.setdefault("drafts", {})
+    _SEC_ORG_CACHE.update({"ts": time.time(), "data": data})
+    return data
+
+
+def _sec_clean_str(v, n: int = 400) -> str:
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v or "")).strip()[:n]
+
+
+def _sec_clean_proc(p: dict) -> dict | None:
+    """관리자가 보낸 절차 1건 정규화. 허용된 필드·길이만 남긴다(화면에서 실행되는 값은 화이트리스트)."""
+    if not isinstance(p, dict):
+        return None
+    pid = _sec_clean_str(p.get("id"), 48).lower()
+    title = _sec_clean_str(p.get("title"), 80)
+    if not _SEC_ID_RE.match(pid) or not title:
+        return None
+
+    def ref_list(arr, n=6):
+        out = []
+        for b in (arr or [])[:n]:
+            if not isinstance(b, dict) or not _sec_clean_str(b.get("reg"), 80):
+                continue
+            r = {"reg": _sec_clean_str(b.get("reg"), 80)}
+            for k in ("art", "q", "label", "title"):
+                if b.get(k):
+                    r[k] = _sec_clean_str(b.get(k), 60)
+            out.append(r)
+        return out
+
+    def act(a):
+        if not isinstance(a, dict) or a.get("k") not in _SEC_ACT_KINDS:
+            return None
+        r = {"k": a["k"], "l": _sec_clean_str(a.get("l"), 30) or "바로가기"}
+        if a.get("id"):
+            r["id"] = _sec_clean_str(a.get("id"), 48)
+        if a.get("q"):
+            r["q"] = _sec_clean_str(a.get("q"), 60)
+        return r
+
+    steps = []
+    for s in (p.get("steps") or [])[:20]:
+        if not isinstance(s, dict) or not _sec_clean_str(s.get("t")):
+            continue
+        st = {"t": _sec_clean_str(s.get("t"), 400)}
+        for k in ("when", "draft"):
+            if s.get(k):
+                st[k] = _sec_clean_str(s.get(k), 60)
+        if s.get("optional"):
+            st["optional"] = True
+        if isinstance(s.get("docs"), list):
+            st["docs"] = [_sec_clean_str(d, 80) for d in s["docs"][:10] if _sec_clean_str(d)]
+        dl = s.get("deadline")
+        if isinstance(dl, dict) and dl.get("ref"):
+            try:
+                st["deadline"] = {"ref": _sec_clean_str(dl.get("ref"), 12),
+                                  "days": max(-365, min(365, int(dl.get("days") or 0)))}
+                if dl.get("label"):
+                    st["deadline"]["label"] = _sec_clean_str(dl.get("label"), 40)
+            except (TypeError, ValueError):
+                pass
+        if s.get("basis"):
+            st["basis"] = ref_list(s.get("basis"))
+        if isinstance(s.get("form"), dict):
+            f = ref_list([s["form"]], 1)
+            if f:
+                st["form"] = f[0]
+        a = act(s.get("act"))
+        if a:
+            st["act"] = a
+        steps.append(st)
+    out = {
+        "id": pid, "title": title,
+        "icon": _sec_clean_str(p.get("icon"), 4) or "📌",
+        "category": _sec_clean_str(p.get("category"), 20) or "기타",
+        "summary": _sec_clean_str(p.get("summary"), 300),
+        "approval": _sec_clean_str(p.get("approval"), 200),
+        "triggers": [_sec_clean_str(t, 30) for t in (p.get("triggers") or [])[:40] if _sec_clean_str(t)],
+        "dates": [{"k": _sec_clean_str(d.get("k"), 12), "l": _sec_clean_str(d.get("l"), 30)}
+                  for d in (p.get("dates") or [])[:3] if isinstance(d, dict) and d.get("k")],
+        "steps": steps,
+        "forms": ref_list(p.get("forms"), 12),
+        "tips": [_sec_clean_str(t, 300) for t in (p.get("tips") or [])[:10] if _sec_clean_str(t)],
+    }
+    if p.get("hidden"):
+        out["hidden"] = True          # 기관 층에서 공통 절차를 숨길 때(같은 id + hidden)
+    return out
+
+
+def _sec_chunks():
+    global _SEC_CHUNKS
+    if _SEC_CHUNKS is None:
+        try:
+            import reg_chunks
+            _SEC_CHUNKS = [(c["title"], c["no"], c["art_title"], c["text"])
+                           for c in reg_chunks.iter_chunks(max_chars=4000) if not c["boiler"]]
+        except Exception as e:
+            print(f"[secretary] 조문 색인 실패: {e}")
+            _SEC_CHUNKS = []
+    return _SEC_CHUNKS
+
+
+def _sec_reg_text(title: str) -> str:
+    m = _find_reg_exact(title) or {}
+    slug = m.get("slug") or title.replace(" ", "_")
+    path = os.path.join(REG_DIR, slug, "index.html")
+    try:
+        import reg_chunks
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return reg_chunks.html_to_text(f.read())
+    except Exception:
+        return ""
+
+
+@app.route("/api/secretary/procedures")
+def secretary_procedures():
+    """서무비서 절차 — 공통 층 + 기관 층. 개인 층은 브라우저가 합친다."""
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": [], "drafts": {}})
+    org = _sec_org_load(force=request.args.get("fresh") == "1")
+    return jsonify({
+        "success": True,
+        "common": {"procedures": common.get("procedures", []), "drafts": common.get("drafts", {}),
+                   "updated": common.get("updated", "")},
+        "org": {"procedures": org.get("procedures", []), "drafts": org.get("drafts", {}),
+                "updated": org.get("updated", ""), "updated_by": org.get("updated_by", "")},
+        "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
+                  "github": _gh_enabled()},
+    })
+
+
+@app.route("/api/secretary/basis")
+def secretary_basis():
+    """근거 조문 본문. reg+art 이면 해당 조문, reg+q 이면 규정 안에서 q 가 들어간 단락."""
+    reg = (request.args.get("reg") or "").strip()
+    art = (request.args.get("art") or "").strip().replace("제", "").replace("조", "")
+    q = (request.args.get("q") or "").strip()
+    if not reg or not (art or q):
+        return jsonify({"error": "reg 와 art 또는 q 가 필요합니다."}), 400
+    meta = _find_reg_exact(reg) or {}
+    title = meta.get("title") or reg
+    if art:
+        key = _norm_key(title)
+        for t, no, at, text in _sec_chunks():
+            if _norm_key(t) == key and no == art:
+                return jsonify({"success": True, "reg": t, "art": no, "art_title": at, "text": text,
+                                "revision": meta.get("revision", "")})
+        return jsonify({"success": False, "error": f"「{title}」 제{art}조를 찾지 못했습니다."})
+    text = _sec_reg_text(title)
+    if not text:
+        return jsonify({"success": False, "error": f"「{title}」 원문을 찾지 못했습니다."})
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.split("\n")]
+    lines = [ln for ln in lines if ln]
+    ql = _norm_key(q)
+    picks, used = [], set()
+    for i, ln in enumerate(lines):
+        if ql in _norm_key(ln) and i not in used:
+            seg = [j for j in range(i, min(i + 4, len(lines))) if j not in used]
+            used.update(seg)
+            picks.append("\n".join(lines[j] for j in seg))
+        if len(picks) >= 3:
+            break
+    if not picks:
+        return jsonify({"success": False, "error": f"「{title}」에서 '{q}'를 찾지 못했습니다."})
+    snippet = "\n…\n".join(picks)[:1800]
+    return jsonify({"success": True, "reg": title, "q": q, "text": snippet,
+                    "revision": meta.get("revision", "")})
+
+
+@app.route("/api/secretary/related")
+def secretary_related():
+    """등록된 절차가 없을 때 — 상황 문장과 관련 있는 내규 조문(키워드 + 가능하면 의미 검색)."""
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"success": True, "items": []})
+    words = [w for w in re.split(r"[\s,.!?~·]+", q) if len(w) >= 2]
+    # 조사·어미를 대충 떼어 낸 어간도 함께 본다("정산해야" → "정산")
+    stems = set()
+    for w in words:
+        stems.add(w)
+        s = re.sub(r"(해야|하려면|하고|해서|했는데|하는|할|해요|합니다|에서|으로|에게|까지|부터|이랑|를|을|이|가|은|는|에|로|와|과|도|만)$", "", w)
+        if len(s) >= 2:
+            stems.add(s)
+    scored = []
+    for t, no, at, text in _sec_chunks():
+        head = (t + " " + (at or ""))
+        sc = 0
+        for s in stems:
+            if s in head:
+                sc += 3
+            c = text.count(s)
+            if c:
+                sc += min(c, 4)
+        if sc:
+            scored.append((sc, t, no, at, text))
+    scored.sort(key=lambda x: -x[0])
+    items, seen = [], set()
+    for sc, t, no, at, text in scored[:40]:
+        k = (t, no)
+        if k in seen:
+            continue
+        seen.add(k)
+        items.append({"reg": t, "art": no, "art_title": at, "preview": text[:220], "score": sc, "src": "keyword"})
+        if len(items) >= 8:
+            break
+    for h in _semantic_for_search(q, top_k=6):
+        k = (h["title"], h["no"])
+        if k in seen:
+            continue
+        seen.add(k)
+        items.append({"reg": h["title"], "art": h["no"], "art_title": h["art_title"],
+                      "preview": h["preview"][:220], "score": h["score"], "src": "semantic"})
+    return jsonify({"success": True, "items": items[:12]})
+
+
+@app.route("/api/secretary/org", methods=["POST"])
+def secretary_org_save():
+    """기관 층 저장(관리자). 내규 업로드와 같은 토큰을 쓰고, GitHub 연동 시 저장소에 커밋한다."""
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    body = request.get_json(silent=True) or {}
+    raw = body.get("procedures")
+    if not isinstance(raw, list) or len(raw) > 200:
+        return jsonify({"success": False, "error": "procedures 목록(최대 200건)이 필요합니다."}), 400
+    procs = [_sec_clean_proc(x) for x in raw]
+    if any(p is None for p in procs):
+        # 잘못된 항목을 조용히 버리고 저장하면 기존 기관 절차가 유실될 수 있으므로 거부한다
+        return jsonify({"success": False, "error": "id(영문 소문자·숫자·하이픈)나 제목이 올바르지 않은 절차가 있습니다."}), 400
+    ids = [p["id"] for p in procs]
+    if len(ids) != len(set(ids)):
+        return jsonify({"success": False, "error": "같은 id 의 절차가 두 번 들어 있습니다."}), 400
+    drafts = {}
+    for k, d in (body.get("drafts") or {}).items():
+        k = _sec_clean_str(k, 48).lower()
+        if not _SEC_ID_RE.match(k) or not isinstance(d, dict) or not d.get("template"):
+            continue
+        drafts[k] = {"title": _sec_clean_str(d.get("title"), 60) or k,
+                     "template": _sec_clean_str(d.get("template"), 4000),
+                     "fields": [{"k": _sec_clean_str(f.get("k"), 24), "l": _sec_clean_str(f.get("l"), 40),
+                                 "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {})}
+                                for f in (d.get("fields") or [])[:20] if isinstance(f, dict) and f.get("k")]}
+    data = {"version": 1, "layer": "org",
+            "updated": datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M"),
+            "updated_by": _sec_clean_str(body.get("editor"), 40),
+            "procedures": procs, "drafts": drafts}
+    payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
+    try:
+        if _gh_enabled():
+            sha = _gh_commit_files({SEC_ORG_REPO_PATH: payload},
+                                   f"서무비서 기관 절차 갱신: {len(procs)}건")
+            where = f"저장소에 커밋했습니다({sha[:7]}). 배포가 끝나면 모든 사용자에게 반영됩니다."
+        else:
+            os.makedirs(SEC_DIR, exist_ok=True)
+            tmp = SEC_ORG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, SEC_ORG_PATH)
+            where = "서버에 저장했습니다."
+    except OSError:
+        return jsonify({"success": False, "error": "이 서버는 파일을 쓸 수 없습니다(읽기 전용 배포). "
+                                                   "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다."}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    _SEC_ORG_CACHE.update({"ts": time.time(), "data": data})
+    return jsonify({"success": True, "count": len(procs), "message": where, "org": data})
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────

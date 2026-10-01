@@ -106,23 +106,6 @@ body.dark .rw-item.chg{background:rgba(239,68,68,.08);border-color:rgba(239,68,6
 .favm-ltype{font-size:10px;font-weight:800;color:var(--mu);background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:1px 7px;}
 .favm-ltype.int{color:var(--gd);background:var(--gl);border-color:transparent;}
 /* 업무 가이드 */
-.guide-list{display:flex;flex-direction:column;gap:8px;}
-.guide-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;border:1px solid var(--bd);border-radius:10px;padding:12px 14px;background:var(--sf);cursor:pointer;font-family:var(--font);transition:.12s;}
-.guide-card:hover{border-color:var(--g);background:var(--gl);}
-.guide-ic{font-size:20px;flex-shrink:0;}
-.guide-tt{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0;}
-.guide-name{font-size:13.5px;font-weight:700;color:var(--tx);}
-.guide-sub{font-size:11.5px;color:var(--mu);}
-.guide-go{color:var(--ht);font-size:18px;}
-.guide-detail-h{font-size:15px;font-weight:800;color:var(--tx);margin:10px 0 12px;}
-.guide-steps{display:flex;flex-direction:column;gap:8px;}
-.guide-step{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--bd);border-radius:9px;}
-.guide-step.done{background:var(--gl);border-color:transparent;}
-.guide-chk{flex-shrink:0;width:24px;height:24px;border:2px solid var(--bd);border-radius:6px;background:var(--sf);color:var(--g);font-weight:900;cursor:pointer;font-size:13px;line-height:1;}
-.guide-step.done .guide-chk{background:var(--g);color:#fff;border-color:var(--g);}
-.guide-step-t{flex:1;font-size:13px;color:var(--tx);line-height:1.5;}
-.guide-step.done .guide-step-t{color:var(--mu);text-decoration:line-through;}
-.guide-foot{margin-top:12px;display:flex;justify-content:flex-end;}
 /* 서식 라이브러리 */
 .forms-search{margin-bottom:10px;}
 .forms-q{width:100%;box-sizing:border-box;border:1px solid var(--bd);border-radius:9px;padding:9px 12px;font-size:13px;font-family:var(--font);background:var(--bg);color:var(--tx);}
@@ -2564,6 +2547,8 @@ body.dark .reg-art{border-left-color:rgba(37,110,244,.35);}
   .art-go{display:none;}
 }
 </style>
+<link rel="stylesheet" href="/assets/secretary.css">
+<script src="/assets/secretary.js"></script>
 </head>
 <body>
 <!-- 자주 찾는 법령 편집 모달 -->
@@ -2951,7 +2936,7 @@ body.dark .reg-art{border-left-color:rgba(37,110,244,.35);}
   <div>
     <span class="brand"><span class="brand-full">KOAT Work Place</span><span class="brand-short">KOAT</span></span>
     <span class="brand-en" style="font-size:10px;color:#9ca3af;margin-left:6px;font-weight:500;letter-spacing:.5px;">Work Assistant</span><br>
-    <span class="brand-sub">내규똑똑 · 법령 · 기업 · 특허 · 지원사업 · 조달 통합 지원</span>
+    <span class="brand-sub">서무비서 · 내규똑똑 · 법령 · 서식 · 공공DB 통합 업무 지원</span>
   </div>
   <div class="tb-tools">
     <button class="tb-tool" id="tbFav" onclick="toggleFavTab()" title="즐겨찾기"><span class="tb-ic" data-icon="fav"></span><span class="tb-tl">즐겨찾기</span><span id="tbFavCount" class="tb-cnt"></span></button>
@@ -2965,6 +2950,11 @@ body.dark .reg-art{border-left-color:rgba(37,110,244,.35);}
   <!-- 좌측 메뉴 패널: 내규똑똑(메인)·법령·시나리오 + 공공조회 + 도구 -->
   <aside class="side-menu" id="sideMenu" aria-label="주요 메뉴">
     <div class="sm-sec sm-primary">
+      <div class="sm-group">
+        <span class="sm-glabel">서무</span>
+        <button class="sm-item" id="smSecretary" onclick="openSecretary()" title="서무비서 — 상황을 말하면 절차·기한·서식·근거를 안내하고 문서 초안까지"><span class="sm-ic" aria-hidden="true">🗂</span><span>서무비서</span></button>
+      </div>
+      <span class="sm-div" aria-hidden="true"></span>
       <div class="sm-group">
         <span class="sm-glabel">규정조회</span>
         <button class="sm-item active" id="smInternal" onclick="setMode('internal')" title="사내 규정(내규) 스마트 검색"><span class="sm-ic" data-icon="internal"></span><span>내규똑똑</span></button>
@@ -2983,7 +2973,6 @@ body.dark .reg-art{border-left-color:rgba(37,110,244,.35);}
         <button class="sm-item" id="smHome" onclick="openDashboard()" title="일정관리 — 오늘 요약·할 일·일정·연락처·메모를 한곳에서(내 PC에만 저장)"><span class="sm-ic" aria-hidden="true">📅</span><span>일정관리</span></button>
         <button class="sm-item" id="smExpense" onclick="openExpense()" title="지출결의서 본문 작성"><span class="sm-ic" data-icon="expense"></span><span>지출결의서</span></button>
         <button class="sm-item" id="smService" onclick="openService()" title="용역도우미 — 용역 여부·심의 판단, 금액별 필요서류 체크리스트·절차"><span class="sm-ic" aria-hidden="true">🧰</span><span>용역도우미</span></button>
-        <button class="sm-item" id="smGuides" onclick="openGuides()" title="업무 절차 가이드 — 출장정산·물품구매·업무추진비·용역 단계별 체크리스트"><span class="sm-ic" aria-hidden="true">🧭</span><span>업무가이드</span></button>
         <button class="sm-item" id="smForms" onclick="openForms()" title="서식 라이브러리 — 규정 별표·별지 서식 검색·열람"><span class="sm-ic" aria-hidden="true">📎</span><span>서식</span></button>
         <button class="sm-item" id="smRevWatch" onclick="openRevWatch()" title="개정 모니터링 — 관심 규정·법령의 개정 변동 확인"><span class="sm-ic" aria-hidden="true">🔔</span><span>개정알림</span><span class="sm-badge" id="revWatchBadge" style="display:none"></span></button>
       </div>
@@ -4336,6 +4325,7 @@ function closeAssist(){
   const mm=document.getElementById('smMemo'); if(mm) mm.classList.remove('active');
   const hm=document.getElementById('smHome'); if(hm) hm.classList.remove('active');
   const sv=document.getElementById('smService'); if(sv) sv.classList.remove('active');
+  const sc=document.getElementById('smSecretary'); if(sc) sc.classList.remove('active');
 }
 // ══════════════════════════════════════════════════════════════════════════
 // 일정관리 '오늘' 탭(개인 홈 대시보드) — 마감 임박·할 일·일정·최근 검색을 한 화면에.
@@ -8493,6 +8483,8 @@ function _cmdkBuild(){
   act('내규똑똑 검색','모드',()=>{ if(_assistMode)closeAssist(); setMode('internal'); document.getElementById('q').focus(); });
   act('법령 조회','모드',()=>{ if(_assistMode)closeAssist(); setMode('law'); document.getElementById('q').focus(); });
   act('AI 시나리오 검색','모드',()=>{ if(_assistMode)closeAssist(); setMode('scenario'); });
+  act('서무비서 — 상황 말하고 절차 안내받기','서무',()=>openSecretary());
+  act('서무비서 — 처리 이력','서무',()=>openSecretary({view:'history'}));
   act('일정관리','도구',openDashboard);
   act('업무 메모 — 할 일','도구',()=>_dashOpenMemo('todo'));
   act('업무 메모 — 포스트잇 메모','도구',()=>_dashOpenMemo('note'));
@@ -9578,60 +9570,9 @@ function _revOpen(type,name){ _wpClose('revWatchModal'); if(_assistMode&&typeof 
 function _revAck(k,cur){ const o=_revWatchGet(); if(o[k]){ o[k].seenRev=cur; _revWatchSet(o); } _revWatchRefreshBadge(); openRevWatch(); }
 function _revRemove(k){ const o=_revWatchGet(); delete o[k]; _revWatchSet(o); _revWatchRefreshBadge(); openRevWatch(); }
 
-// ── ⑤ 업무 절차 가이드 ──────────────────────────────────────────────
-const WP_GUIDES=[
-  {id:'general', icon:'💳', title:'일반 지출(물품·용역 대금)', steps:[
-    {t:'거래처 확인 및 사업자 상태 조회(계속/휴업/폐업)', act:{l:'기업조회',f:"openAssist('company')"}},
-    {t:'지출 근거·예산과목 확인(계약·품의)', act:{l:'내규 검색',f:"setMode('internal')"}},
-    {t:'지출결의서 작성(거래처·금액·과목·지급방식)', act:{l:'지출결의서',f:'openExpense()'}},
-    {t:'증빙 첨부(세금계산서·거래명세서·견적서)'},
-    {t:'결재 상신 및 지급 요청'} ]},
-  {id:'travel', icon:'🧳', title:'출장·여비 정산', steps:[
-    {t:'출장 명령/승인 확인'},
-    {t:'여비 지급 기준(등급·지역·일수) 확인', act:{l:'여비 규정',f:"wsOpen('여비업무 처리지침','internal')"}},
-    {t:'여비 자동 계산 + 증빙 사진으로 엑셀 작성', act:{l:'지출결의서(여비)',f:'openExpense()'}},
-    {t:'교통비·숙박비 증빙 첨부'},
-    {t:'정산서 상신'} ]},
-  {id:'promo', icon:'🍽️', title:'업무추진비 집행', steps:[
-    {t:'집행 목적·대상(외부/내부) 정리'},
-    {t:'집행 한도·기준 확인', act:{l:'내규 검색',f:"setMode('internal')"}},
-    {t:'지출결의서(업무추진비) 작성 — 집행대상 구분·1인당 계산', act:{l:'지출결의서',f:'openExpense()'}},
-    {t:'영수증·참석자 명단 등 증빙 첨부'},
-    {t:'결재 상신'} ]},
-  {id:'service', icon:'🧰', title:'용역 계약(용역 여부 판단)', steps:[
-    {t:'용역 여부·심의 대상 판단', act:{l:'용역도우미',f:'openService()'}},
-    {t:'금액 구간별 필요 서류·절차 확인', act:{l:'용역도우미',f:'openService()'}},
-    {t:'계약 근거 규정 확인', act:{l:'내규 검색',f:"setMode('internal')"}},
-    {t:'계약·검수 후 대금 지출결의서 작성', act:{l:'지출결의서',f:'openExpense()'}},
-    {t:'결재 상신'} ]},
-];
-const _GUIDE_KEY='koat_guide_prog';
-function _guideProg(){ try{ return JSON.parse(localStorage.getItem(_GUIDE_KEY)||'{}')||{}; }catch(e){ return {}; } }
-function _guideProgSet(o){ try{ localStorage.setItem(_GUIDE_KEY, JSON.stringify(o)); }catch(e){} }
-function openGuides(){
-  const body=_wpModal('guidesModal','🧭 업무 절차 가이드', '', true);
-  if(body) body.innerHTML=`<div class="wp-note">자주 하는 업무의 단계별 절차입니다. 각 단계를 체크하면 진행 상황이 저장됩니다.</div>`+
-    `<div class="guide-list">`+WP_GUIDES.map(g=>{
-      const pr=_guideProg()[g.id]||[]; const done=g.steps.filter((_,i)=>pr[i]).length;
-      return `<button class="guide-card" onclick="_guideOpen('${g.id}')"><span class="guide-ic">${g.icon}</span>`+
-        `<span class="guide-tt"><span class="guide-name">${escHtml(g.title)}</span>`+
-        `<span class="guide-sub">${g.steps.length}단계 · ${done}/${g.steps.length} 완료</span></span><span class="guide-go">›</span></button>`;
-    }).join('')+`</div>`;
-}
-function _guideOpen(gid){
-  const g=WP_GUIDES.find(x=>x.id===gid); if(!g) return;
-  const body=document.getElementById('guidesModal_b'); if(!body) return;
-  const pr=_guideProg()[gid]||[];
-  body.innerHTML=`<button class="wp-btn ghost" onclick="openGuides()">← 목록</button>`+
-    `<div class="guide-detail-h">${g.icon} ${escHtml(g.title)}</div>`+
-    `<div class="guide-steps">`+g.steps.map((s,i)=>`<div class="guide-step${pr[i]?' done':''}">`+
-      `<button class="guide-chk" onclick="_guideToggle('${gid}',${i})" aria-pressed="${!!pr[i]}">${pr[i]?'✓':''}</button>`+
-      `<span class="guide-step-t">${escHtml(s.t)}</span>`+
-      `${s.act?`<button class="wp-btn sm" onclick="_wpClose('guidesModal');${s.act.f}">${escHtml(s.act.l)}</button>`:''}</div>`).join('')+`</div>`+
-    `<div class="guide-foot"><button class="wp-btn ghost" onclick="_guideReset('${gid}')">진행 초기화</button></div>`;
-}
-function _guideToggle(gid,i){ const o=_guideProg(); const a=o[gid]||[]; a[i]=!a[i]; o[gid]=a; _guideProgSet(o); _guideOpen(gid); }
-function _guideReset(gid){ const o=_guideProg(); delete o[gid]; _guideProgSet(o); _guideOpen(gid); }
+// ── ⑤ 업무 절차 가이드 → 서무비서(assets/secretary.js)로 통합 ────────────
+// 예전 호출부 호환: 서무비서 절차 목록을 연다.
+function openGuides(){ openSecretary({view:'list'}); }
 
 // ── ⑥ 서식(별표·별지) 라이브러리 ────────────────────────────────────
 let _formsCache=null;
@@ -13076,8 +13017,11 @@ try{ updateAiStatusUI(migrateAiSettings()); }catch{}
 try{
   const _p=new URLSearchParams(location.search);
   const _q=(_p.get('q')||'').trim();
-  if(_q){
-    const _m=_p.get('mode');
+  const _m=_p.get('mode');
+  if(_m==='secretary' || (!_q && !_m)){
+    // 기본 화면: 서무비서(?mode=secretary&q=상황 으로 바로 안내받기도 가능)
+    if(typeof openSecretary==='function') openSecretary(_q?{q:_q}:undefined);
+  } else if(_q){
     if(_m&&['internal','law','scenario'].includes(_m)) setMode(_m);
     const _inp=document.getElementById('q');
     if(_inp){ _inp.value=_q; setTimeout(()=>doSearch(),120); }
@@ -13636,7 +13580,7 @@ async function scoreAndReorderAsync(laws, keywords){
       <span style="font-weight:700;color:var(--g);font-size:14px;">KOAT Work Place</span>
     </div>
     <div style="margin-bottom:6px;">
-      내규똑똑 · 국가법령 · 기업 · 특허 · 지원사업 · 조달 통합 업무 지원
+      서무비서 · 내규똑똑 · 국가법령 · 기업 · 특허 · 지원사업 · 조달 통합 업무 지원
     </div>
     <div style="line-height:1.7;max-width:760px;margin:0 auto;">
       © 2026 <strong>kimjs</strong> · Powered by
