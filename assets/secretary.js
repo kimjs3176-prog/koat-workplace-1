@@ -29,6 +29,9 @@ let S={ loaded:false, loading:null, common:{procedures:[],drafts:{}}, org:{proce
         view:'home', query:'', formsQ:'', forms:null, regs:null,
         cfg:{org:{},service:{},terms:{},reg_aliases:{},holidays:{}}, holidays:{}, status:{}, pstatus:{}, regCount:0, dateNote:'', ai:{available:false}, aiRes:null, calYM:null, rcBusy:0, matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
         basisOpen:{}, basisCache:{}, catFilter:'' };
+// 브라우저 확장(ERP 옆 사이드 패널) 안에서 열렸는지 — ?embed=ext 이고 다른 창(확장 패널)에 담겨 있을 때
+const EMBED=(()=>{ try{ return new URLSearchParams(location.search).get('embed')==='ext' && window.parent!==window; }catch(e){ return false; } })();
+function toExt(msg){ if(EMBED) try{ window.parent.postMessage(Object.assign({src:'koat-sec'}, msg), '*'); }catch(e){} }
 
 // ── 저장소 ────────────────────────────────────────────────────────────────
 function _ls(k, d){ try{ const v=JSON.parse(localStorage.getItem(k)||'null'); return v==null?d:v; }catch(e){ return d; } }
@@ -223,6 +226,17 @@ function openCasesWithNext(){
 async function start(opts){
   opts=opts||{};
   const w=document.getElementById('secWrap'); if(!w) return;
+  if(EMBED){ document.body.classList.add('embed');
+    // 확장 → 앱: ERP 화면에서 감지한 업무로 바로 안내(패널을 다시 읽지 않아 진행 상태가 유지됨)
+    window.addEventListener('message', e=>{ const m=e.data; if(e.source!==window.parent || !m || m.src!=='koat-sec-ext') return;
+      if(m.type==='ask' && m.q){ S.view='home'; ask(String(m.q).slice(0,200)); }
+      else if(m.type==='inserted'){
+        if(m.ok){ toast('ERP 입력란에 넣었습니다. 내용을 확인하세요.', 4200); return; }
+        // 넣을 칸을 못 찾으면 클립보드로 — ERP에서 Ctrl+V
+        const t=S._lastInsert||''; const done=()=>toast((m.error?m.error+' ':'ERP에서 넣을 칸을 찾지 못했습니다. ')+'초안을 복사해 두었으니 ERP 입력란에 붙여넣기(Ctrl+V) 하세요.', 5200);
+        (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(done).catch(()=>toast(m.error||'ERP 입력란을 먼저 한 번 누른 뒤 다시 시도하세요.', 4200)); }
+    });
+    toExt({type:'ready'}); }
   bind(w); bindViewer();
   try{ await load(); }
   catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
@@ -750,12 +764,13 @@ function openDraft(key){
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
-    `<div class="sec-row"><button class="sec-btn primary" data-da="copy">📋 복사</button><button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button><button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 화면에서 마지막으로 누른 입력란(본문·제목 등)에 넣습니다">📥 ERP 입력란에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button><button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button><button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
   const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
   body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ S._draft.vals[el.dataset.dk]=el.value; out(); }));
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
     if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
+    else if(b.dataset.da==='erp'){ S._lastInsert=txt; toExt({type:'insert', text:txt}); }
     else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
     else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
     else if(b.dataset.da==='keep'){ updateCase(cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); }); toast('처리 이력에 초안 입력값을 저장했습니다.'); }

@@ -145,6 +145,16 @@ python scripts/import_regs.py ./우리기관_내규 --reset     # 기존(KOAT) �
 - `config.json`의 `"insights": {"enabled": false}`로 끄고, `"min_n": 5`처럼 통계를 보일 최소 표본을 올릴 수 있습니다(기본 3).
 - 공유된 반려 사유는 **👥 기관 집단 지식** 카드에서 관리자가 **점검 항목으로** 올리거나 **삭제**합니다.
 
+## 7-4. ERP 옆에서 쓰기 — 브라우저 확장
+
+```bash
+python scripts/build_extension.py --server https://<우리 서무비서 주소> --erp https://<우리 그룹웨어 주소> --name "○○공단 서무비서"
+```
+- 만들어진 `dist/*.zip`을 Chrome 웹 스토어나 Edge 추가 기능에 조직 한정으로 올리거나, 그룹 정책으로 일괄 설치합니다.
+- ERP 화면 제목으로 업무를 알아보는 규칙은 `extension/config.js`의 `SEC_RULES`에서 우리 기관 메뉴 이름에 맞춥니다.
+- 서무비서 서버 앞단에서 `X-Frame-Options`를 붙이고 있으면, 패널이 열리지 않습니다. `Content-Security-Policy: frame-ancestors 'self' chrome-extension: extension:`으로 바꿉니다.
+- 자세한 내용은 [extension/README.md](../extension/README.md)를 보세요.
+
 ## 8. 개인정보·저장 위치
 
 | 데이터 | 저장 위치 | 공유 범위 |

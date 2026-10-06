@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "서무비서 — ERP 옆에서 절차·서식·근거 안내",
+  "short_name": "서무비서",
+  "version": "1.0.0",
+  "description": "그룹웨어·ERP 화면 옆 사이드 패널에서 서무 절차·기한·서식·근거를 안내하고, 작성한 초안을 ERP 입력란에 넣어 줍니다.",
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "action": {
+    "default_title": "서무비서 열기",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "contextMenus",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://kerp.koat.or.kr/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://kerp.koat.or.kr/*"
+      ],
+      "js": [
+        "config.js",
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle",
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "서무비서 열기"
+    }
+  }
+}

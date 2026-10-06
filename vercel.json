@@ -52,7 +52,7 @@
       "dest": "/index.html",
       "headers": {
         "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self' chrome-extension: extension: moz-extension:",
         "Referrer-Policy": "strict-origin-when-cross-origin"
       }
     }
