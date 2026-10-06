@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>서무비서 확장 설정</title>
+<link rel="stylesheet" href="panel.css">
+<style>
+body{display:block;max-width:640px;margin:0 auto;padding:24px 16px 40px;line-height:1.6}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--mu);font-size:13px;margin:0 0 20px}
+label{display:block;font-weight:700;font-size:14px;margin:18px 0 6px}
+label span{display:block;font-weight:400;color:var(--mu);font-size:12.5px}
+input[type=url],textarea{width:100%;border:1px solid var(--bd);border-radius:9px;padding:9px 11px;font-size:14px;background:var(--bg);color:var(--tx);font-family:inherit}
+textarea{min-height:84px}
+.chk{display:flex;gap:8px;align-items:center;font-weight:400;margin-top:16px}
+.row{display:flex;gap:10px;align-items:center;margin-top:20px;flex-wrap:wrap}
+#msg{font-size:13px;color:var(--mu)}
+.box{margin-top:28px;padding:12px 14px;border:1px solid var(--bd);border-radius:10px;font-size:13px;color:var(--mu)}
+.box b{color:var(--tx)}
+</style>
+</head>
+<body>
+<h1>🗂 서무비서 확장 설정</h1>
+<p class="sub">ERP·그룹웨어 화면 옆에서 서무비서를 엽니다. 설정은 이 브라우저 계정에 저장됩니다.</p>
+
+<label for="server">서무비서 주소
+  <span>기관에서 운영하는 서무비서 웹 주소. 예) https://secretary.koat.or.kr</span></label>
+<input type="url" id="server" placeholder="https://" autocomplete="off">
+
+<label for="hosts">서무비서를 붙일 ERP·그룹웨어 주소
+  <span>한 줄에 하나. 예) https://kerp.koat.or.kr/* — 새 주소를 넣고 저장하면 브라우저가 그 사이트 접근 허용을 묻습니다.</span></label>
+<textarea id="hosts" spellcheck="false"></textarea>
+
+<label class="chk"><input type="checkbox" id="floating"> ERP 화면 오른쪽 아래에 🗂 버튼과 '이 업무 안내 보기'를 표시</label>
+
+<div class="row"><button class="btn" id="save" type="button">저장</button><span id="msg" role="status" aria-live="polite"></span></div>
+
+<div class="box">
+  <b>사용법</b><br>
+  · 도구 모음의 🗂 아이콘(또는 <b>Alt+Shift+S</b>)을 누르면 오른쪽에 서무비서가 열립니다.<br>
+  · ERP에서 출장·휴가·지출결의 같은 화면을 열면 🗂 버튼 위에 <b>이 업무 안내 보기</b>가 나타납니다.<br>
+  · ERP의 글자를 드래그하고 오른쪽 클릭 → <b>서무비서에 묻기</b>.<br>
+  · 서무비서에서 초안을 만든 뒤 ERP 본문 칸을 한 번 누르고 <b>📥 ERP 입력란에 넣기</b>를 누르면 그 칸에 들어갑니다.<br><br>
+  <b>개인정보</b> — 확장은 ERP 화면의 제목 문구로 업무 종류만 판단하며, ERP 내용을 서버로 보내지 않습니다. 처리 이력은 서무비서 패널 안(이 브라우저)에만 저장됩니다.
+</div>
+<script src="config.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

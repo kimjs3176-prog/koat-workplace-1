@@ -4,7 +4,19 @@
     {
       "src": "api/index.py",
       "use": "@vercel/python",
-      "config": { "maxLambdaSize": "50mb" }
+      "config": {
+        "maxLambdaSize": "50mb",
+        "excludeFiles": "{node_modules/**,extension/**,forms/**,dist/**}"
+      }
+    },
+    {
+      "src": "api/forms.mjs",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": [
+          "node_modules/kordoc/templates/**"
+        ]
+      }
     },
     {
       "src": "index.html",
@@ -24,11 +36,20 @@
     }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.py" },
+    {
+      "src": "/api/secretary/forms/([a-z-]+)",
+      "dest": "/api/forms.mjs?action=$1"
+    },
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/index.py"
+    },
     {
       "src": "/assets/(.*)",
       "dest": "/assets/$1",
-      "headers": { "X-Content-Type-Options": "nosniff" }
+      "headers": {
+        "X-Content-Type-Options": "nosniff"
+      }
     },
     {
       "src": "/regulations/(.*)",
@@ -52,7 +73,7 @@
       "dest": "/index.html",
       "headers": {
         "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self' chrome-extension: extension: moz-extension:",
         "Referrer-Policy": "strict-origin-when-cross-origin"
       }
     }

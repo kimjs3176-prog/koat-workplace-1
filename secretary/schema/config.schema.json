@@ -3,21 +3,190 @@
  "$id": "https://koat-secretary/schema/config.schema.json",
  "title": "서무비서 기관 설정(secretary/config.json)",
  "type": "object",
- "required": ["org"],
+ "required": [
+  "org"
+ ],
  "properties": {
-  "schema_version": {"type": "integer"},
-  "org": {"type": "object", "required": ["name"], "properties": {
-   "name": {"type": "string", "description": "기관 정식 명칭"}, "short": {"type": "string", "description": "영문 약칭"}, "abbr": {"type": "string", "description": "줄임말"}}},
-  "service": {"type": "object", "properties": {
-   "title": {"type": "string"}, "icon": {"type": "string", "maxLength": 4}, "primary": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
-   "tagline": {"type": "string"}, "footer": {"type": "string"}}},
-  "terms": {"type": "object", "description": "절차 문장 [[키]] 자리표시의 기관 명칭",
-            "properties": {"erp": {"type": "string"}, "portal": {"type": "string"}, "accounting": {"type": "string"}, "approval": {"type": "string"}}},
-  "reg_aliases": {"type": "object", "description": "절차가 참조하는 규정명 → 우리 기관 규정명", "additionalProperties": {"type": "string"}},
-  "holidays": {"type": "object", "properties": {
-   "extra": {"type": "array", "items": {"type": "object", "required": ["date"], "properties": {"date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}, "name": {"type": "string"}}}},
-   "exclude": {"type": "array", "items": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}}}},
-  "updated": {"type": "string"},
-  "updated_by": {"type": "string"}
+  "schema_version": {
+   "type": "integer"
+  },
+  "org": {
+   "type": "object",
+   "required": [
+    "name"
+   ],
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "기관 정식 명칭"
+    },
+    "short": {
+     "type": "string",
+     "description": "영문 약칭"
+    },
+    "abbr": {
+     "type": "string",
+     "description": "줄임말"
+    }
+   }
+  },
+  "service": {
+   "type": "object",
+   "properties": {
+    "title": {
+     "type": "string"
+    },
+    "icon": {
+     "type": "string",
+     "maxLength": 4
+    },
+    "primary": {
+     "type": "string",
+     "pattern": "^#[0-9a-fA-F]{6}$"
+    },
+    "tagline": {
+     "type": "string"
+    },
+    "footer": {
+     "type": "string"
+    }
+   }
+  },
+  "terms": {
+   "type": "object",
+   "description": "절차 문장 [[키]] 자리표시의 기관 명칭",
+   "properties": {
+    "erp": {
+     "type": "string"
+    },
+    "portal": {
+     "type": "string"
+    },
+    "accounting": {
+     "type": "string"
+    },
+    "approval": {
+     "type": "string"
+    }
+   }
+  },
+  "reg_aliases": {
+   "type": "object",
+   "description": "절차가 참조하는 규정명 → 우리 기관 규정명",
+   "additionalProperties": {
+    "type": "string"
+   }
+  },
+  "holidays": {
+   "type": "object",
+   "properties": {
+    "extra": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "date"
+      ],
+      "properties": {
+       "date": {
+        "type": "string",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+       },
+       "name": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "exclude": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+     }
+    }
+   }
+  },
+  "audit": {
+   "type": "object",
+   "description": "결재 전 사전 감사 기준(생략하면 기본값). 숙박비 상한·추가지급 비율·근거·초안 필수 항목",
+   "properties": {
+    "lodging_caps": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "name",
+       "cap"
+      ],
+      "properties": {
+       "name": {
+        "type": "string"
+       },
+       "cap": {
+        "type": "integer",
+        "minimum": 0
+       }
+      }
+     }
+    },
+    "lodging_extra_ratio": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "lodging_basis": {
+     "type": "array",
+     "items": {
+      "type": "object"
+     }
+    },
+    "card_basis": {
+     "type": "object"
+    },
+    "trip_procs": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "draft_required": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "object",
+      "properties": {
+       "fields": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "basis": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  },
+  "insights": {
+   "type": "object",
+   "description": "기관 집단 지식(익명 통계) 설정",
+   "properties": {
+    "enabled": {
+     "type": "boolean"
+    },
+    "min_n": {
+     "type": "integer",
+     "minimum": 1
+    }
+   }
+  },
+  "updated": {
+   "type": "string"
+  },
+  "updated_by": {
+   "type": "string"
+  }
  }
 }

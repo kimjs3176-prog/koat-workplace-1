@@ -1930,6 +1930,7 @@ def _sec_holidays(cfg: dict) -> dict:
 def _sec_public_config(cfg: dict) -> dict:
     return {"org": cfg.get("org", {}), "service": cfg.get("service", {}), "terms": cfg.get("terms", {}),
             "reg_aliases": cfg.get("reg_aliases", {}), "holidays": cfg.get("holidays", {}),
+            "audit": cfg.get("audit") or {}, "insights": cfg.get("insights") or {},
             "updated": cfg.get("updated", "")}
 
 
@@ -1963,6 +1964,13 @@ def secretary_procedures():
         "config": _sec_public_config(cfg),
         "holidays": _sec_holidays(cfg),
         "regs": len(_load_reg_manifest()),
+        # 화면으로 개정본이 올라와 이전본과 비교할 수 있는 규정(개정 영향 분석 대상)
+        "revised": [{"title": m.get("title", ""), "revision": m.get("revision", ""),
+                     "from": (m.get("history") or [{}])[0].get("revision", ""),
+                     "at": (m.get("history") or [{}])[0].get("replaced_at", "")}
+                    for m in _load_reg_manifest() if m.get("history")][:60],
+        "ai": _sec_ai_status(),
+        "insights": {"available": bool(_sec_ins_backend()), "min_n": max(1, int(_sec_ins_cfg().get("min_n") or 3))},
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
                   "github": _gh_enabled()},
     })
@@ -2192,6 +2200,12 @@ def secretary_config_save():
         "updated": _now_kst(),
         "updated_by": _sec_clean_str((request.get_json(silent=True) or {}).get("editor"), 40),
     }
+    # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다
+    cur = _sec_config(force=True)
+    for k in ("audit", "insights"):
+        v = body.get(k) if isinstance(body.get(k), dict) else cur.get(k)
+        if isinstance(v, dict) and v and len(json.dumps(v, ensure_ascii=False)) < 20000:
+            cfg[k] = v
     payload = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     try:
         where = _sec_save_repo_file(SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, payload,
@@ -2202,6 +2216,1183 @@ def secretary_config_save():
         return jsonify({"success": False, "error": str(e)}), 502
     _SEC_CFG_CACHE.update({"ts": time.time(), "data": cfg})
     return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config())})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 서무비서 AI — 영수증 인식 · 상황 이해 (기관이 키를 설정한 경우에만)
+#   ANTHROPIC_API_KEY 가 있으면 Claude, 없고 GEMINI_API_KEY 가 있으면 Gemini 를 쓴다
+#   (SECRETARY_AI_PROVIDER=claude|gemini 로 고정 가능). 키가 없으면 화면은 수동 입력으로 동작한다.
+#   AI 는 절차를 '고르기'와 영수증 '읽기'에만 쓰고, 규정 내용을 만들어 내게 하지 않는다.
+# ══════════════════════════════════════════════════════════════════════════
+SEC_AI_MAX_IMAGE = 5 * 1024 * 1024          # 영수증 이미지 최대 크기(바이트, 디코딩 후)
+_SEC_AI_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_SEC_AI_HITS: dict = {}                      # IP → [시각] — 기관 키 남용을 막는 간단한 속도 제한
+_SEC_AI_LIMIT = int(os.environ.get("SECRETARY_AI_RATE", "40") or 40)   # IP 당 10분에 허용할 요청 수
+
+
+def _sec_ai_provider() -> str:
+    p = (os.environ.get("SECRETARY_AI_PROVIDER") or "").strip().lower()
+    if p in ("claude", "gemini"):
+        return p if _sec_ai_key(p) else ""
+    if _sec_ai_key("claude"):
+        return "claude"
+    if _sec_ai_key("gemini"):
+        return "gemini"
+    return ""
+
+
+def _sec_ai_key(provider: str) -> str:
+    return _env_clean("ANTHROPIC_API_KEY" if provider == "claude" else "GEMINI_API_KEY")
+
+
+def _sec_ai_model(provider: str) -> str:
+    m = _env_clean("SECRETARY_AI_MODEL")
+    if m:
+        return m
+    return "claude-opus-5-5" if provider == "claude" else (_env_clean("GEMINI_MODEL") or "gemini-2.5-flash")
+
+
+def _sec_ai_status() -> dict:
+    p = _sec_ai_provider()
+    return {"available": bool(p), "provider": p, "model": _sec_ai_model(p) if p else ""}
+
+
+def _sec_ai_rate_ok() -> bool:
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    hits = [t for t in _SEC_AI_HITS.get(ip, []) if now - t < 600]
+    if len(hits) >= _SEC_AI_LIMIT:
+        _SEC_AI_HITS[ip] = hits
+        return False
+    hits.append(now)
+    _SEC_AI_HITS[ip] = hits
+    if len(_SEC_AI_HITS) > 5000:             # 메모리 보호
+        _SEC_AI_HITS.clear()
+    return True
+
+
+class _SecAIError(Exception):
+    pass
+
+
+def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str = "low") -> dict:
+    """AI 에 구조화된 JSON 응답을 요청한다. image=(media_type, base64 문자열)."""
+    provider = _sec_ai_provider()
+    if not provider:
+        raise _SecAIError("AI 키가 설정되어 있지 않습니다.")
+    model = _sec_ai_model(provider)
+    if provider == "claude":
+        try:
+            import anthropic
+        except ImportError:
+            raise _SecAIError("서버에 anthropic 패키지가 설치되어 있지 않습니다.")
+        content = []
+        if image:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": image[0], "data": image[1]}})
+        content.append({"type": "text", "text": text})
+        client = anthropic.Anthropic(api_key=_sec_ai_key("claude"), timeout=60.0, max_retries=2)
+        try:
+            resp = client.beta.messages.create(
+                model=model,
+                max_tokens=16000,
+                system=system,
+                messages=[{"role": "user", "content": content}],
+                # 추출·분류는 low, 감사·영향 분석처럼 대조가 필요한 작업은 호출 쪽에서 올린다. 응답은 스키마로 고정.
+                output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+                # 안전 분류기가 거절하면 서버가 권장 모델로 다시 실행한다
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+            )
+        except anthropic.AuthenticationError:
+            raise _SecAIError("AI 키(ANTHROPIC_API_KEY)가 올바르지 않습니다.")
+        except anthropic.RateLimitError:
+            raise _SecAIError("AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도하세요.")
+        except anthropic.BadRequestError as e:
+            raise _SecAIError(f"AI 요청 오류: {e.message}")
+        except anthropic.APIStatusError as e:
+            raise _SecAIError(f"AI 서버 오류({e.status_code}). 잠시 후 다시 시도하세요.")
+        except anthropic.APIConnectionError:
+            raise _SecAIError("AI 서버에 연결하지 못했습니다.")
+        if resp.stop_reason == "refusal":
+            raise _SecAIError("AI 가 이 요청을 처리하지 않았습니다.")
+        if resp.stop_reason == "max_tokens":
+            raise _SecAIError("AI 응답이 너무 길어 끊겼습니다.")
+        out = next((b.text for b in resp.content if b.type == "text"), "")
+    else:
+        parts = []
+        if image:
+            parts.append({"inline_data": {"mime_type": image[0], "data": image[1]}})
+        parts.append({"text": text + "\n\n다음 JSON 스키마를 따르는 JSON 하나만 출력:\n"
+                      + json.dumps(schema, ensure_ascii=False)})
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent"
+        try:
+            r = _SESSION.post(url, params={"key": _sec_ai_key("gemini")}, timeout=60, json={
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0}})
+        except req_lib.RequestException:
+            raise _SecAIError("AI 서버에 연결하지 못했습니다.")
+        if r.status_code >= 400:
+            raise _SecAIError(f"AI 서버 오류({r.status_code}).")
+        try:
+            out = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            raise _SecAIError("AI 응답을 읽지 못했습니다.")
+    try:
+        data = json.loads(out)
+    except Exception:
+        m = re.search(r"\{.*\}", out or "", re.S)
+        if not m:
+            raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
+        data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
+    return data
+
+
+_SEC_RECEIPT_KINDS = ["운임", "숙박", "식비", "회의비", "물품", "기타"]
+_SEC_RECEIPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "date": {"type": "string", "description": "거래(이용) 날짜 YYYY-MM-DD. 모르면 빈 문자열"},
+        "end_date": {"type": "string", "description": "숙박 체크아웃·이용 종료일 YYYY-MM-DD. 없으면 빈 문자열"},
+        "amount": {"type": "integer", "description": "총 결제 금액(부가세 포함, 원). 모르면 0"},
+        "vendor": {"type": "string", "description": "가맹점·상호(예: 코레일, ○○호텔)"},
+        "kind": {"type": "string", "enum": _SEC_RECEIPT_KINDS},
+        "payment": {"type": "string", "enum": ["법인카드", "개인카드", "현금", "기타", "알수없음"]},
+        "nights": {"type": "integer", "description": "숙박이면 박 수, 아니면 0"},
+        "route": {"type": "string", "description": "운임이면 구간(예: 서울→오송), 아니면 빈 문자열"},
+        "items": {"type": "string", "description": "주요 품목·내역을 짧게"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "note": {"type": "string", "description": "흐림·잘림 등 확인이 필요한 점. 없으면 빈 문자열"},
+    },
+    "required": ["date", "end_date", "amount", "vendor", "kind", "payment", "nights", "route", "items",
+                 "confidence", "note"],
+    "additionalProperties": False,
+}
+_SEC_RECEIPT_SYSTEM = (
+    "당신은 한국 공공기관의 경비 정산을 돕는 서무 비서입니다. 영수증·승차권·숙박 영수증·카드 매출전표 이미지에서 "
+    "정산에 필요한 항목만 정확히 읽습니다. 이미지에 실제로 보이는 값만 쓰고, 보이지 않거나 흐린 값은 추측하지 말고 "
+    "빈 문자열이나 0으로 두세요. 카드번호·전화번호·주민등록번호 같은 개인정보는 어떤 칸에도 옮겨 적지 마세요. "
+    "금액은 총 결제액(부가세 포함)을 원 단위 정수로 씁니다. kind 는 철도·버스·항공·택시·통행료·주차는 '운임', "
+    "숙박업소는 '숙박', 음식점은 '식비', 다과·회의 장소는 '회의비', 물품 구입은 '물품', 그 밖은 '기타'로 고릅니다."
+)
+
+
+@app.route("/api/secretary/ai/status")
+def secretary_ai_status():
+    return jsonify({"success": True, **_sec_ai_status()})
+
+
+@app.route("/api/secretary/ai/receipt", methods=["POST"])
+def secretary_ai_receipt():
+    """영수증 이미지 → 날짜·금액·가맹점·종류. 이미지는 저장하지 않고 AI 분석에만 쓴다."""
+    if not _sec_ai_provider():
+        return jsonify({"success": False, "need_key": True,
+                        "error": "AI 영수증 인식이 설정되어 있지 않습니다. 날짜·금액을 직접 입력하세요."}), 503
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요."}), 429
+    body = request.get_json(silent=True) or {}
+    m = re.match(r"^data:(image/[a-z+.-]+);base64,(.+)$", str(body.get("image") or ""), re.S)
+    if not m or m.group(1) not in _SEC_AI_IMAGE_TYPES:
+        return jsonify({"success": False, "error": "JPG·PNG·WEBP 이미지만 올릴 수 있습니다."}), 400
+    b64 = re.sub(r"\s+", "", m.group(2))
+    try:
+        size = len(base64.b64decode(b64, validate=True))
+    except Exception:
+        return jsonify({"success": False, "error": "이미지를 읽지 못했습니다."}), 400
+    if size > SEC_AI_MAX_IMAGE:
+        return jsonify({"success": False, "error": "이미지가 너무 큽니다(최대 5MB)."}), 413
+    ctx = _sec_clean_str(body.get("context"), 120)
+    year = _sec_clean_str(body.get("year"), 4)
+    prompt = ("이 증빙 이미지를 읽어 주세요."
+              + (f" 처리 중인 업무: {ctx}." if ctx else "")
+              + (f" 연도가 인쇄되지 않았으면 {year}년으로 봅니다." if re.match(r"^\d{4}$", year or "") else ""))
+    try:
+        data = _sec_ai_json(_SEC_RECEIPT_SYSTEM, prompt, _SEC_RECEIPT_SCHEMA, image=(m.group(1), b64))
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    # 응답 정리: 날짜 형식·금액 범위·열거값을 다시 확인한다(AI 출력은 데이터로만 다룬다)
+    def _d(v):
+        v = str(v or "").strip()
+        return v if re.match(r"^\d{4}-\d{2}-\d{2}$", v) else ""
+    def _i(v, hi):
+        try:
+            return max(0, min(hi, int(v)))
+        except (TypeError, ValueError):
+            return 0
+    rc = {
+        "date": _d(data.get("date")), "end_date": _d(data.get("end_date")),
+        "amount": _i(data.get("amount"), 100_000_000), "nights": _i(data.get("nights"), 60),
+        "vendor": _sec_clean_str(data.get("vendor"), 60), "route": _sec_clean_str(data.get("route"), 60),
+        "items": _sec_clean_str(data.get("items"), 120), "note": _sec_clean_str(data.get("note"), 160),
+        "kind": data.get("kind") if data.get("kind") in _SEC_RECEIPT_KINDS else "기타",
+        "payment": data.get("payment") if data.get("payment") in ("법인카드", "개인카드", "현금", "기타") else "알수없음",
+        "confidence": data.get("confidence") if data.get("confidence") in ("high", "medium", "low") else "low",
+    }
+    return jsonify({"success": True, "receipt": rc, "provider": _sec_ai_provider()})
+
+
+_SEC_UNDERSTAND_SYSTEM = (
+    "당신은 한국 공공기관 서무 담당자를 돕는 비서입니다. 사용자가 말한 업무 상황을 읽고, 주어진 '절차 목록'에서 "
+    "이 상황에 필요한 절차를 고릅니다. 여러 업무가 섞여 있으면 실제로 처리할 순서대로 모두 고르세요(최대 4개). "
+    "목록에 없는 절차를 지어내거나 규정·기한을 추측해 쓰지 마세요. 맞는 절차가 없으면 빈 목록을 돌려주세요. "
+    "summary 에는 상황을 어떻게 이해했는지 한두 문장으로, uncovered 에는 목록으로 처리되지 않는 부분을 적습니다."
+)
+
+
+@app.route("/api/secretary/ai/understand", methods=["POST"])
+def secretary_ai_understand():
+    """상황 문장 → 해당 절차(복수 가능). 절차 목록 안에서만 고르게 해 근거 없는 안내를 막는다."""
+    if not _sec_ai_provider():
+        return jsonify({"success": False, "need_key": True, "error": "AI 상황 이해가 설정되어 있지 않습니다."}), 503
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요."}), 429
+    body = request.get_json(silent=True) or {}
+    q = _sec_clean_str(body.get("q"), 400)
+    if len(q) < 2:
+        return jsonify({"success": False, "error": "상황을 입력하세요."}), 400
+    procs = []
+    for p in (body.get("procedures") or [])[:80]:
+        if not isinstance(p, dict):
+            continue
+        pid = _sec_clean_str(p.get("id"), 48).lower()
+        if _SEC_ID_RE.match(pid):
+            procs.append({"id": pid, "title": _sec_clean_str(p.get("title"), 80),
+                          "summary": _sec_clean_str(p.get("summary"), 200),
+                          "keywords": [_sec_clean_str(t, 20) for t in (p.get("triggers") or [])[:15]]})
+    if not procs:
+        return jsonify({"success": False, "error": "절차 목록이 비어 있습니다."}), 400
+    ids = [p["id"] for p in procs]
+    schema = {
+        "type": "object",
+        "properties": {
+            "procedure_ids": {"type": "array", "items": {"type": "string", "enum": ids}},
+            "summary": {"type": "string"},
+            "uncovered": {"type": "string"},
+        },
+        "required": ["procedure_ids", "summary", "uncovered"],
+        "additionalProperties": False,
+    }
+    text = ("절차 목록(JSON):\n" + json.dumps(procs, ensure_ascii=False)
+            + "\n\n사용자 상황:\n" + q)
+    try:
+        data = _sec_ai_json(_SEC_UNDERSTAND_SYSTEM, text, schema)
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    seen, pick = set(), []
+    for i in data.get("procedure_ids") or []:
+        if i in ids and i not in seen:
+            seen.add(i); pick.append(i)
+    return jsonify({"success": True, "procedure_ids": pick[:4],
+                    "summary": _sec_clean_str(data.get("summary"), 300),
+                    "uncovered": _sec_clean_str(data.get("uncovered"), 200),
+                    "provider": _sec_ai_provider()})
+
+
+# ── 문서 초안 → 한글(.hwpx) ────────────────────────────────────────────────
+# 기관 서식이 있으면 secretary/template.hwpx(첫 문단의 쪽 설정·글꼴을 그대로 씀), 없으면 내장 최소 서식.
+SEC_HWPX_TEMPLATE = os.path.join(SEC_DIR, "template.hwpx")
+
+
+def _sec_hwpx_base() -> bytes | None:
+    if os.path.exists(SEC_HWPX_TEMPLATE):
+        with open(SEC_HWPX_TEMPLATE, "rb") as f:
+            return f.read()
+    try:
+        import hwpx_base
+        return base64.b64decode(hwpx_base.BASE_HWPX_B64)
+    except Exception:
+        return None
+
+
+def _sec_xesc(s) -> str:
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _sec_hwpx_para(text: str, char_pr: str = "0", size: int = 1000) -> str:
+    run = f'<hp:run charPrIDRef="{char_pr}">' + (f"<hp:t>{_sec_xesc(text)}</hp:t>" if text else "") + "</hp:run>"
+    return ('<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">' + run +
+            f'<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="{size}" textheight="{size}" '
+            f'baseline="{int(size * 0.85)}" spacing="600" horzpos="0" horzsize="47628" flags="393216"/>'
+            '</hp:linesegarray></hp:p>')
+
+
+def _sec_hwpx_build(title: str, text: str) -> bytes:
+    base = _sec_hwpx_base()
+    if not base:
+        raise RuntimeError("HWPX 기본 서식을 찾을 수 없습니다.")
+    zin = zipfile.ZipFile(_io.BytesIO(base), "r")
+    sec = zin.read("Contents/section0.xml").decode("utf-8", "ignore")
+    m = re.search(r"<hs:sec\b[^>]*>", sec)
+    if not m:
+        raise RuntimeError("HWPX 서식의 본문 구조를 읽지 못했습니다.")
+    body = sec[m.end():]
+    pi = body.find("<hp:p")
+    pj = body.find("</hp:p>", pi) + len("</hp:p>")
+    first = re.sub(r"<hp:t>.*?</hp:t>", "<hp:t></hp:t>", body[pi:pj], flags=re.S)   # 쪽 설정(secPr) 문단만 유지
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    if title and lines and lines[0].strip() == title.strip():
+        lines = lines[1:]
+    paras = ([_sec_hwpx_para(title, "3", 1300), _sec_hwpx_para("")] if title else [])
+    paras += [_sec_hwpx_para(ln.rstrip()) for ln in lines]
+    new_sec = sec[:m.end()] + first + "".join(paras) + "</hs:sec>"
+    out = _io.BytesIO()
+    zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    zout.writestr(zipfile.ZipInfo("mimetype"), "application/hwp+zip", compress_type=zipfile.ZIP_STORED)
+    for n in zin.namelist():
+        if n in ("mimetype", "Preview/PrvImage.png"):
+            continue
+        if n == "Contents/section0.xml":
+            zout.writestr(n, new_sec.encode("utf-8"))
+        elif n == "Preview/PrvText.txt":
+            zout.writestr(n, (title + "\n" + text)[:1000].encode("utf-8"))
+        else:
+            zout.writestr(n, zin.read(n))
+    zout.close(); zin.close()
+    return out.getvalue()
+
+
+@app.route("/api/secretary/draft/hwpx", methods=["POST"])
+def secretary_draft_hwpx():
+    """문서 초안(텍스트) → 한글(.hwpx) 파일. 줄마다 한 문단."""
+    body = request.get_json(silent=True) or request.form or {}      # 화면은 폼 전송(파일명 유지), JSON 도 받음
+    title = _sec_clean_str(body.get("title"), 80)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(body.get("text") or ""))[:20000]
+    if not text.strip():
+        return jsonify({"success": False, "error": "초안 내용이 비어 있습니다."}), 400
+    try:
+        data = _sec_hwpx_build(title, text)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"한글 파일을 만들지 못했습니다: {e}"}), 500
+    fname = re.sub(r'[\\/:*?"<>|]+', "", title or "초안")[:60] + ".hwpx"
+    return Response(data, mimetype="application/hwp+zip",
+                    headers={"Content-Disposition": 'attachment; filename="draft.hwpx"; '
+                                                    "filename*=UTF-8''" + quote(fname)})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ② 결재 전 사전 감사 — 규칙 감사(항상) + AI 감사(키가 있을 때)
+#   규칙 감사: 기한 경과·임박, 숙박비 상한, 증빙 누락·기간 밖·결제수단, 초안 필수 기재사항
+#   AI 감사: 절차·사실관계·초안을 '제공한 조문'과 대조. 근거는 제공한 조문 목록(enum)에서만 고른다.
+# ══════════════════════════════════════════════════════════════════════════
+_SEC_AUDIT_DEFAULT = {
+    # 「여비업무 처리지침」 국내 숙박비 상한(제2호) — 기관 설정 audit.lodging_caps 로 바꿀 수 있다
+    "lodging_caps": [{"name": "서울특별시", "cap": 100000}, {"name": "광역시·제주", "cap": 80000},
+                     {"name": "그 밖의 지역", "cap": 70000}],
+    "lodging_extra_ratio": 0.3,
+    "lodging_basis": [{"reg": "여비업무 처리지침", "q": "상한액: 서울특별시"}, {"reg": "여비규정", "art": "15"}],
+    "card_basis": {"reg": "여비규정", "art": "8"},
+    "trip_procs": ["domestic-trip", "training"],
+    # 초안별로 비면 반려되는 칸(근거 포함)
+    "draft_required": {
+        "card-evidence": {"fields": ["purpose", "date", "place", "reason", "target"],
+                          "basis": {"reg": "법인카드 운영요령", "art": "12"}},
+        "trip-report": {"fields": ["purpose", "content"], "basis": {"reg": "복무규정", "art": "8"}},
+    },
+}
+
+
+def _sec_audit_cfg() -> dict:
+    cfg = dict(_SEC_AUDIT_DEFAULT)
+    cfg.update((_sec_config().get("audit") or {}))
+    return cfg
+
+
+def _sec_ref_text(r: dict, limit: int = 1500) -> tuple[str, str]:
+    """근거 참조 → (표시 이름, 조문 본문). 우리 기관 규정으로 해석해 찾는다."""
+    m, _ = _sec_resolve_reg(r.get("reg", ""))
+    if not m:
+        return "", ""
+    title = m.get("title", "")
+    if r.get("art"):
+        hit = _sec_art(title, r["art"])
+        if hit:
+            return f"{title} 제{hit[1]}조", re.sub(r"\s+", " ", hit[3])[:limit]
+        return "", ""
+    if r.get("q"):
+        text = _sec_reg_text(title)
+        ql = _norm_key(r["q"])
+        for ln in text.split("\n"):
+            if ql in _norm_key(ln):
+                return f"{title} · {r['q']}", re.sub(r"\s+", " ", ln)[:limit]
+    return "", ""
+
+
+def _sec_won(n) -> str:
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _sec_audit_rules(p: dict, case: dict, today: str) -> list:
+    """결정적 규칙 감사. [{id, severity, title, detail, basis, fix, source:'rule'}]"""
+    out = []
+    ac = _sec_audit_cfg()
+    dates = case.get("dates") or {}
+    checks = {str(k) for k, v in (case.get("checks") or {}).items() if v}
+
+    def add(fid, sev, title, detail, basis=None, fix=""):
+        if basis and not _sec_resolve_reg(basis.get("reg", ""))[0]:
+            basis = None                          # 우리 기관에 없는 규정이면 근거 버튼을 달지 않는다
+        out.append({"id": fid, "severity": sev, "title": title, "detail": detail,
+                    "basis": basis, "fix": fix, "source": "rule"})
+
+    def addd(base, n):
+        try:
+            return (datetime.strptime(base, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+
+    # 1) 단계 기한 — 지났거나 이틀 안
+    for i, s in enumerate(p.get("steps") or []):
+        dl = s.get("deadline") or {}
+        base = dates.get(dl.get("ref", ""))
+        if not base or str(i) in checks:
+            continue
+        due = addd(base, int(dl.get("days") or 0))
+        if not due:
+            continue
+        b = (s.get("basis") or [None])[0]
+        if due < today and not s.get("optional"):
+            add(f"due-{i}", "high", f"{i + 1}단계 기한이 지났습니다({due})", s["t"], b,
+                "지금 처리할 수 있는지 담당 부서에 먼저 확인하고, 늦어진 사유를 남겨 두세요.")
+        elif today <= due <= addd(today, 2):
+            add(f"soon-{i}", "medium", f"{i + 1}단계 기한이 {due}입니다", s["t"], b, "기한 안에 처리하세요.")
+
+    rs = [r for r in (case.get("receipts") or []) if isinstance(r, dict)]
+    trip = p.get("id") in ac["trip_procs"]
+    # 2) 숙박비 상한(국내 출장)
+    if trip:
+        caps = sorted((c for c in ac["lodging_caps"] if isinstance(c, dict) and c.get("cap")),
+                      key=lambda c: -int(c["cap"]))
+        top = caps[0] if caps else None
+        ratio = float(ac.get("lodging_extra_ratio") or 0)
+        lb = (ac.get("lodging_basis") or [None])[0]
+        for r in rs:
+            if r.get("kind") != "숙박" or not r.get("amount"):
+                continue
+            nights = max(1, int(r.get("nights") or 1))
+            per = int(r["amount"]) // nights
+            region = next((c for c in caps if c.get("name") == r.get("region")), None)
+            name = r.get("vendor") or "숙박 영수증"
+            if region:
+                cap = int(region["cap"])
+                if per > cap * (1 + ratio):
+                    add(f"lodge-{r.get('id')}", "high", f"{name}: 1박 {_sec_won(per)}원 — 상한·추가지급 한도 초과",
+                        f"{region['name']} 상한 {_sec_won(cap)}원, 추가지급 한도 {_sec_won(cap * (1 + ratio))}원을 넘습니다. 초과분은 본인 부담입니다.",
+                        lb, "초과분을 빼고 정산하세요.")
+                elif per > cap:
+                    add(f"lodge-{r.get('id')}", "medium", f"{name}: 1박 {_sec_won(per)}원 — {region['name']} 상한 {_sec_won(cap)}원 초과",
+                        f"업무상 부득이하면 상한의 {int(ratio * 100)}% 안에서 추가지급을 받을 수 있습니다(출장 마친 다음 날부터 1주일 안에 별도 신청).",
+                        lb, "부득이한 사유와 세부 내역을 붙여 추가지급을 신청하거나, 초과분을 빼고 정산하세요.")
+            elif top and per > int(top["cap"]):
+                add(f"lodge-{r.get('id')}", "high" if per > int(top["cap"]) * (1 + ratio) else "medium",
+                    f"{name}: 1박 {_sec_won(per)}원 — 가장 높은 상한({top['name']} {_sec_won(top['cap'])}원)도 넘음",
+                    "어느 지역이든 상한을 넘는 금액입니다. 숙박 지역을 지정하면 정확히 계산합니다.", lb,
+                    "초과분 본인 부담 또는 추가지급 신청 여부를 정하세요.")
+            elif caps and per > int(caps[-1]["cap"]):
+                add(f"lodge-{r.get('id')}", "low", f"{name}: 1박 {_sec_won(per)}원 — 지역에 따라 상한 초과",
+                    " · ".join(f"{c['name']} {_sec_won(c['cap'])}원" for c in caps) + ". 숙박 지역을 지정해 확인하세요.", lb)
+    # 3) 증빙 — 결제수단·누락·기간 밖
+    if p.get("id") in ("domestic-trip", "overseas-trip", "corp-card", "event"):
+        non = [r for r in rs if r.get("payment") in ("개인카드", "현금")]
+        if non:
+            add("pay", "medium", f"법인카드가 아닌 결제 {len(non)}건",
+                ", ".join((r.get("vendor") or "증빙") for r in non[:4]) + " — 법인카드를 쓰지 못한 특별한 사유가 필요합니다.",
+                ac.get("card_basis"), "사유를 정산 신청서(또는 메모)에 적으세요.")
+    if trip or p.get("id") == "overseas-trip":
+        if rs and not any(r.get("kind") == "운임" for r in rs):
+            add("no-fare", "medium", "운임 증빙이 없습니다", "승차권·항공권 등 운임 증빙을 확인하세요.",
+                {"reg": "여비규정", "art": "8"})
+        s, e = dates.get("start"), dates.get("end")
+        if s and e and s < e and rs and not any(r.get("kind") == "숙박" for r in rs):
+            add("no-lodge", "low", "숙박 증빙이 없습니다", "1박 이상 출장입니다. 자가·친지집 숙박이면 사유를 적어 두세요.",
+                (ac.get("lodging_basis") or [None])[0])
+        if s and e:
+            for r in rs:
+                d = r.get("date") or ""
+                if d and (d < addd(s, -1) or d > addd(e, 1)):
+                    add(f"out-{r.get('id')}", "medium", f"{r.get('vendor') or '증빙'}: 출장 기간 밖 이용일({d})",
+                        f"출장 기간 {s} ~ {e}와 맞지 않습니다.", None, "날짜를 확인하거나 이 증빙을 빼세요.")
+    # 4) 초안 필수 기재사항
+    for key, rule in (ac.get("draft_required") or {}).items():
+        vals = (case.get("draft_values") or {}).get(key)
+        if not isinstance(vals, dict):
+            continue
+        miss = [f for f in rule.get("fields", []) if not str(vals.get(f) or "").strip()]
+        if miss:
+            add(f"draft-{key}", "high" if key == "card-evidence" else "medium",
+                f"초안 필수 항목 {len(miss)}개가 비었습니다", "빈 항목: " + ", ".join(miss), rule.get("basis"),
+                "초안을 열어 빈 칸을 채우세요.")
+    return out
+
+
+_SEC_AUDIT_SYSTEM = (
+    "당신은 한국 공공기관의 내부 감사관입니다. 서무 담당자가 결재를 올리기 전에, 처리 내용이 '제공된 조문'에 맞는지 점검합니다. "
+    "반드시 제공된 조문과 절차에 근거해서만 지적하고, 제공되지 않은 규정·금액·기한을 지어내지 마세요. "
+    "근거가 되는 조문은 basis 에서 고르고, 제공된 조문으로 판단할 수 없으면 basis 를 '없음'으로 두고 severity 는 low 로 하세요. "
+    "이미 확인된 항목(규칙 감사)과 같은 내용은 다시 쓰지 마세요. 실제 문제가 없으면 findings 를 비우세요. "
+    "각 지적은 담당자가 바로 고칠 수 있게 짧고 구체적인 한국어로 씁니다."
+)
+
+
+@app.route("/api/secretary/audit", methods=["POST"])
+def secretary_audit():
+    """결재 전 사전 감사. 처리 건의 사실관계(날짜·체크·증빙·초안)를 절차·조문과 대조한다."""
+    body = request.get_json(silent=True) or {}
+    p = _sec_clean_proc(body.get("procedure") or {})
+    if not p or p.get("hidden"):
+        return jsonify({"success": False, "error": "절차 정보가 올바르지 않습니다."}), 400
+    case = body.get("case") if isinstance(body.get("case"), dict) else {}
+    today = str(body.get("today") or "")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", today):
+        today = datetime.now(_KST).strftime("%Y-%m-%d")
+    rules = _sec_audit_rules(p, case, today)
+    result = {"success": True, "findings": rules, "ai_used": False, "ai_error": "", "summary": ""}
+
+    if body.get("ai") and _sec_ai_provider():
+        if not _sec_ai_rate_ok():
+            result["ai_error"] = "요청이 너무 많아 AI 감사는 건너뛰었습니다."
+        else:
+            refs, seen = [], set()
+            for _, r in _sec_proc_refs(p):
+                k = (r.get("reg"), r.get("art"), r.get("q"))
+                if k in seen or ("label" in r and not r.get("art") and not r.get("q")):
+                    continue
+                seen.add(k)
+                name, text = _sec_ref_text(r)
+                if name and text and name not in {x[0] for x in refs}:
+                    refs.append((name, text, r))
+                if len(refs) >= 14:
+                    break
+            for c in (_sec_audit_cfg().get("lodging_basis") or []):
+                name, text = _sec_ref_text(c)
+                if name and text and name not in {x[0] for x in refs}:
+                    refs.append((name, text, c))
+            keys = [x[0] for x in refs] + ["없음"]
+            facts = {
+                "기준일": case.get("dates") or {},
+                "완료한 단계": sorted(int(k) + 1 for k, v in (case.get("checks") or {}).items()
+                                 if v and str(k).isdigit()),
+                "증빙": [{k: r.get(k) for k in ("date", "end_date", "amount", "vendor", "kind", "payment",
+                                               "nights", "region", "route", "items") if r.get(k)}
+                       for r in (case.get("receipts") or [])[:20] if isinstance(r, dict)],
+                "메모": _sec_clean_str(case.get("note"), 400),
+                "오늘": today,
+            }
+            drafts = {k: _sec_clean_str(v, 3000) for k, v in list((case.get("drafts") or {}).items())[:4]}
+            text = ("[절차]\n" + json.dumps({"title": p["title"], "steps": [s["t"] + (f" ({s['when']})" if s.get("when") else "")
+                                                                          for s in p["steps"]],
+                                              "pitfalls": [x["t"] for x in p.get("pitfalls", [])]}, ensure_ascii=False)
+                    + "\n\n[제공된 조문]\n" + "\n".join(f"- {n}: {t}" for n, t, _ in refs)
+                    + "\n\n[처리 사실관계]\n" + json.dumps(facts, ensure_ascii=False)
+                    + "\n\n[작성한 초안]\n" + (json.dumps(drafts, ensure_ascii=False) if drafts else "(없음)")
+                    + "\n\n[이미 확인된 항목(규칙 감사)]\n" + "\n".join("- " + f["title"] for f in rules))
+            schema = {
+                "type": "object",
+                "properties": {
+                    "findings": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                            "title": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "basis": {"type": "string", "enum": keys},
+                            "fix": {"type": "string"},
+                        },
+                        "required": ["severity", "title", "detail", "basis", "fix"],
+                        "additionalProperties": False}},
+                    "summary": {"type": "string"},
+                },
+                "required": ["findings", "summary"],
+                "additionalProperties": False,
+            }
+            try:
+                data = _sec_ai_json(_SEC_AUDIT_SYSTEM, text, schema, effort="medium")
+                by_name = {n: r for n, _, r in refs}
+                for i, f in enumerate((data.get("findings") or [])[:12]):
+                    if not isinstance(f, dict) or not _sec_clean_str(f.get("title")):
+                        continue
+                    b = by_name.get(f.get("basis"))
+                    sev = f.get("severity") if f.get("severity") in ("high", "medium", "low") else "low"
+                    if not b:
+                        sev = "low"                     # 근거 조문이 없는 지적은 참고 수준으로만
+                    result["findings"].append({
+                        "id": f"ai-{i}", "severity": sev, "title": _sec_clean_str(f.get("title"), 120),
+                        "detail": _sec_clean_str(f.get("detail"), 400), "fix": _sec_clean_str(f.get("fix"), 200),
+                        "basis": {k: v for k, v in (b or {}).items() if k in ("reg", "art", "q")} or None,
+                        "source": "ai"})
+                result["ai_used"] = True
+                result["summary"] = _sec_clean_str(data.get("summary"), 300)
+            except _SecAIError as e:
+                result["ai_error"] = str(e)
+    order = {"high": 0, "medium": 1, "low": 2}
+    result["findings"].sort(key=lambda f: order.get(f["severity"], 3))
+    result["counts"] = {k: sum(1 for f in result["findings"] if f["severity"] == k) for k in order}
+    return jsonify(result)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ③ 규정 개정 영향 분석 — 이전 개정본과 조문 단위로 비교해, 영향받는 절차 단계와 고칠 안을 제시한다
+#   이전본: 로컬은 업로드 때 보관한 regulations/.backup, GitHub 배포는 개정 직전 커밋
+#   제안: 규칙(조문 번호 이동·기한 일수 변경·조문 삭제) + AI(키가 있을 때, 단계 문장 갱신안)
+#   적용은 관리자가 화면에서 골라 기관 층으로 저장(저장 시점 개정 정보가 기록되어 '재확인' 알림이 사라짐)
+# ══════════════════════════════════════════════════════════════════════════
+def _sec_prev_reg_text(m: dict, idx: int = 0) -> tuple[str, str]:
+    """manifest 항목의 이전 개정본 평문과 개정 라벨. 없으면 ('', '')."""
+    hist = m.get("history") or []
+    if idx >= len(hist):
+        return "", ""
+    h = hist[idx] or {}
+    label = h.get("revision") or (h.get("entry") or {}).get("revision") or "이전 개정"
+    html = ""
+    if h.get("backup"):
+        path = os.path.join(REG_BACKUP_DIR, os.path.basename(h["backup"]), "index.html")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                html = f.read()
+        except OSError:
+            html = ""
+    if not html and _gh_enabled() and idx == 0:
+        ref = _gh_prev_commit(f"regulations/{m.get('slug')}/index.html")
+        data = _gh_file(f"regulations/{m.get('slug')}/index.html", ref) if ref else None
+        html = data.decode("utf-8", "replace") if data else ""
+    if not html and idx == 0:
+        html = _sec_git_prev(f"regulations/{m.get('slug')}/index.html")
+    if not html:
+        return "", label
+    import reg_chunks
+    return reg_chunks.html_to_text(html), label
+
+
+def _sec_git_prev(path: str) -> str:
+    """로컬 git 저장소(온프레미스 등)에서 '내규 등록/개정' 커밋 직전의 파일 내용. 실패하면 ''."""
+    import subprocess
+    root = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return ""
+    try:
+        log = subprocess.run(["git", "log", "--format=%H %s", "-n", "10", "--", path], cwd=root,
+                             capture_output=True, text=True, timeout=10).stdout.splitlines()
+        for ln in log:
+            sha, _, msg = ln.partition(" ")
+            if msg.startswith(("내규 등록:", "내규 개정:")):
+                r = subprocess.run(["git", "show", f"{sha}^:{path}"], cwd=root,
+                                   capture_output=True, timeout=10)
+                return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except Exception:
+        pass
+    return ""
+
+
+def _sec_arts(text: str) -> dict:
+    import reg_chunks
+    out = {}
+    for a in reg_chunks.split_articles(text):
+        if not a["boiler"] and a["no"] not in out:
+            out[a["no"]] = {"title": a["art_title"], "body": a["body"]}
+    return out
+
+
+_SEC_DAYS_RE = re.compile(r"(\d+)\s*(일|주일|개월)\s*(?:이내|안|전|까지|내)")
+
+
+def _sec_day_nums(t: str) -> list:
+    out = []
+    for n, u in _SEC_DAYS_RE.findall(t or ""):
+        n = int(n)
+        out.append(n * 7 if u == "주일" else n * 30 if u == "개월" else n)
+    return out
+
+
+def _sec_days_repl(t: str, d0: int, nd: int) -> str:
+    """문장 속 'd0일'·'(d0/7)주일' → 새 일수."""
+    rep = f"{nd // 7}주일" if nd % 7 == 0 and nd < 28 else f"{nd}일"
+    t = re.sub(rf"(?<!\d){d0}\s*일", rep, t or "")
+    if d0 % 7 == 0:
+        t = re.sub(rf"(?<!\d){d0 // 7}\s*주일", rep, t)
+    return t
+
+
+def _sec_sent_diff(a: str, b: str) -> list:
+    """바뀐 문장만 [{'old','new'}] (최대 6개)."""
+    import difflib
+    sa = [x.strip() for x in re.split(r"(?<=[.다])\s+|(?=[①-⑳])", a or "") if x.strip()]
+    sb = [x.strip() for x in re.split(r"(?<=[.다])\s+|(?=[①-⑳])", b or "") if x.strip()]
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, sa, sb, autojunk=False).get_opcodes():
+        if op != "equal":
+            out.append({"old": " ".join(sa[i1:i2])[:400], "new": " ".join(sb[j1:j2])[:400]})
+    return out[:6]
+
+
+def _sec_reg_diff(old: str, new: str) -> dict:
+    import difflib
+    A, B = _sec_arts(old), _sec_arts(new)
+    norm = lambda s: re.sub(r"\s+|<[^>]*>", "", s or "")   # noqa: E731 — 개정 표시(<개정 …>)·공백 차이는 무시
+    changed, added, removed, moved = {}, [], [], {}
+    for no, a in A.items():
+        b = B.get(no)
+        if b and norm(a["body"]) == norm(b["body"]):
+            continue
+        # 같은 번호가 없거나 내용이 크게 다르면 → 다른 번호로 옮겨 갔는지 본다(조문 신설·삭제로 번호가 밀린 경우)
+        best, score = None, 0.0
+        for no2, b2 in B.items():
+            if no2 == no:
+                continue
+            r = difflib.SequenceMatcher(None, norm(a["body"])[:1500], norm(b2["body"])[:1500], autojunk=False).ratio()
+            if r > score:
+                best, score = no2, r
+        same = difflib.SequenceMatcher(None, norm(a["body"])[:1500], norm(b["body"])[:1500], autojunk=False).ratio() if b else 0
+        if best and score >= 0.85 and score > same + 0.1 and a["title"] == B[best]["title"]:
+            moved[no] = best
+            if norm(a["body"]) != norm(B[best]["body"]):
+                changed[no] = {"to": best, "title": a["title"], "old": a["body"], "new": B[best]["body"],
+                               "sents": _sec_sent_diff(a["body"], B[best]["body"])}
+        elif b:
+            changed[no] = {"to": no, "title": b["title"], "old": a["body"], "new": b["body"],
+                           "sents": _sec_sent_diff(a["body"], b["body"])}
+        else:
+            removed.append({"no": no, "title": a["title"]})
+    targets = set(moved.values()) | {c["to"] for c in changed.values()}
+    for no, b in B.items():
+        if no not in A and no not in targets:
+            added.append({"no": no, "title": b["title"]})
+    return {"changed": changed, "moved": moved, "added": added, "removed": removed}
+
+
+def _sec_line_with(text: str, q: str) -> str:
+    ql = _norm_key(q)
+    return next((re.sub(r"\s+", " ", ln).strip() for ln in (text or "").split("\n") if ql and ql in _norm_key(ln)), "")
+
+
+def _sec_impact(m: dict, old: str, new: str, procs: list) -> dict:
+    """procs: [(layer, p)]. 영향받는 절차 단계와 규칙 기반 제안."""
+    diff = _sec_reg_diff(old, new)
+    title_key = _norm_key(m.get("title", ""))
+    removed = {x["no"] for x in diff["removed"]}
+    items = []
+    for layer, p in procs:
+        if p.get("hidden"):
+            continue
+        hits = []
+        locs = [("step", i, s, b) for i, s in enumerate(p.get("steps") or []) for b in (s.get("basis") or [])]
+        locs += [("pitfall", i, pf, b) for i, pf in enumerate(p.get("pitfalls") or []) for b in (pf.get("basis") or [])]
+        locs += [("form", i, s, s["form"]) for i, s in enumerate(p.get("steps") or []) if s.get("form")]
+        for where, i, obj, r in locs:
+            mm, _ = _sec_resolve_reg(r.get("reg", ""))
+            if not mm or _norm_key(mm.get("title", "")) != title_key:
+                continue
+            hit = {"where": where, "i": i, "text": obj.get("t", ""), "ref": r, "kind": "", "proposals": []}
+            art = str(r.get("art") or "")
+            if where == "form":
+                continue
+            if art and art in diff["moved"]:
+                hit["kind"] = "moved"
+                hit["proposals"].append({"type": "art", "from": art, "to": diff["moved"][art],
+                                         "why": f"제{art}조 내용이 제{diff['moved'][art]}조로 옮겨졌습니다."})
+            if art and art in removed:
+                hit["kind"] = "removed"
+            if art and art in diff["changed"]:
+                c = diff["changed"][art]
+                hit["kind"] = hit["kind"] or "changed"
+                hit["sents"] = c["sents"]
+                # 이전 조문에서 사라진 기한 일수 ↔ 새로 생긴 일수(순서대로 짝) → 기한·문장 갱신 제안
+                on, nn = _sec_day_nums(c["old"]), _sec_day_nums(c["new"])
+                gone = list(dict.fromkeys(x for x in on if x not in nn))
+                fresh = list(dict.fromkeys(x for x in nn if x not in on))
+                pairs = list(zip(gone, fresh))
+                dl = obj.get("deadline") if where == "step" else None
+                if dl and dl.get("days") is not None:
+                    d0 = abs(int(dl["days"]))
+                    nd = next((n for o, n in pairs if o == d0), None)
+                    if d0 and nd is not None:
+                        nd = -nd if int(dl["days"]) < 0 else nd
+                        hit["proposals"].append({"type": "days", "from": int(dl["days"]), "to": nd,
+                                                 "why": f"조문의 기한이 {d0}일 → {abs(nd)}일로 바뀌었습니다."})
+                for fld in ("t", "when"):
+                    t0 = obj.get(fld, "")
+                    t2 = t0
+                    for o, n in pairs:
+                        t2 = _sec_days_repl(t2, o, n)
+                    if t0 and t2 != t0:
+                        hit["proposals"].append({"type": "text" if fld == "t" else "when", "from": t0, "to": t2,
+                                                 "why": "문장 속 일수를 개정 조문에 맞춥니다." if fld == "t"
+                                                 else "기한 안내 문구도 함께 고칩니다."})
+            if not art and r.get("q"):
+                lo, ln = _sec_line_with(old, r["q"]), _sec_line_with(new, r["q"])
+                if lo != ln:
+                    hit["kind"] = "changed" if ln else "removed"
+                    hit["sents"] = [{"old": lo[:400], "new": ln[:400]}]
+            if hit["kind"]:
+                hits.append(hit)
+        if hits:
+            items.append({"id": p["id"], "title": p.get("title", ""), "icon": p.get("icon", ""), "layer": layer, "hits": hits})
+    # 사전 감사 기준(숙박비 상한 등)이 이 규정을 근거로 쓰면 함께 알린다
+    audit = []
+    for c in (_sec_audit_cfg().get("lodging_basis") or []):
+        mm, _ = _sec_resolve_reg(c.get("reg", ""))
+        if mm and _norm_key(mm.get("title", "")) == title_key:
+            lo = _sec_line_with(old, c["q"]) if c.get("q") else ""
+            ln = _sec_line_with(new, c["q"]) if c.get("q") else ""
+            a = str(c.get("art") or "")
+            if (c.get("q") and lo != ln) or (a and (a in diff["changed"] or a in removed or a in diff["moved"])):
+                audit.append({"ref": c, "old": lo, "new": ln})
+    out = {k: v for k, v in diff.items() if k != "changed"}
+    out["changed"] = [{"no": k, **{x: v[x] for x in ("to", "title", "sents")}} for k, v in diff["changed"].items()]
+    out["procedures"] = items
+    out["audit"] = audit
+    return out
+
+
+_SEC_IMPACT_SYSTEM = (
+    "당신은 공공기관 내규 담당자입니다. 규정이 개정되어, 그 규정을 근거로 하는 업무 절차 단계 문장을 고쳐야 하는지 판단합니다. "
+    "반드시 제공된 '개정 전/후 조문'에 근거해서만 판단하고, 조문에 없는 내용을 지어내지 마세요. "
+    "고칠 필요가 없으면 그 단계는 결과에 넣지 마세요. 새 문장은 원래 문장의 말투·길이를 유지하고, 바뀐 기한·대상·금액만 반영합니다."
+)
+
+
+@app.route("/api/secretary/impact")
+def secretary_impact():
+    """규정 개정 영향 분석. ?reg=규정명[&h=이력 순번][&ai=1]"""
+    name = (request.args.get("reg") or "").strip()
+    m, _ = _sec_resolve_reg(name)
+    if not m:
+        return jsonify({"success": False, "error": "규정을 찾을 수 없습니다."}), 404
+    try:
+        h = max(0, min(19, int(request.args.get("h") or 0)))
+    except ValueError:
+        h = 0
+    old, label = _sec_prev_reg_text(m, h)
+    if not old:
+        why = ("이전 개정본 원문을 찾지 못했습니다(보관본이 없음)." if label
+               else "비교할 이전 개정본이 없습니다 — 화면(/upload)으로 개정본을 올리면 이전본이 보관되어 비교할 수 있습니다.")
+        return jsonify({"success": False, "error": why}), 404
+    new = _sec_reg_text(m["title"])
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": []}).get("procedures", [])
+    org = _sec_org_load().get("procedures", [])
+    org_ids = {p["id"] for p in org}
+    procs = [("org", p) for p in org] + [("common", p) for p in common if p["id"] not in org_ids]
+    res = _sec_impact(m, old, new, procs)
+    res.update({"success": True, "reg": m["title"], "from": label, "to": m.get("revision", ""),
+                "ai_used": False, "ai_error": ""})
+
+    hits = [(it, hit) for it in res["procedures"] for hit in it["hits"] if hit["where"] == "step"]
+    if request.args.get("ai") == "1" and hits and _sec_ai_provider():
+        if not _sec_ai_rate_ok():
+            res["ai_error"] = "요청이 너무 많아 AI 제안은 건너뛰었습니다."
+        else:
+            keys = [f"{it['id']}#{hit['i']}" for it, hit in hits][:30]
+            arts = "\n".join(f"- 제{c['no']}조({c['title']}){' → 제' + c['to'] + '조' if c['to'] != c['no'] else ''}\n"
+                             + "\n".join(f"  개정 전: {s['old']}\n  개정 후: {s['new']}" for s in c["sents"])
+                             for c in res["changed"])[:12000]
+            q_changes = "\n".join(f"- {hit['ref'].get('q')}: {s['old']} → {s['new']}"
+                                  for _, hit in hits if hit["ref"].get("q") for s in hit.get("sents", []))
+            steps = "\n".join(f"- [{it['id']}#{hit['i']}] {hit['text']} (근거: {hit['ref'].get('reg')} "
+                              f"{'제' + str(hit['ref'].get('art')) + '조' if hit['ref'].get('art') else hit['ref'].get('q', '')})"
+                              for it, hit in hits[:30])
+            text = (f"[규정] {m['title']} ({label} → {m.get('revision', '')})\n\n[바뀐 조문]\n{arts}\n{q_changes}\n\n"
+                    f"[영향받는 절차 단계]\n{steps}")
+            schema = {"type": "object", "properties": {
+                "updates": {"type": "array", "items": {"type": "object", "properties": {
+                    "key": {"type": "string", "enum": keys},
+                    "new_text": {"type": "string"},
+                    "reason": {"type": "string"}},
+                    "required": ["key", "new_text", "reason"], "additionalProperties": False}}},
+                "required": ["updates"], "additionalProperties": False}
+            try:
+                data = _sec_ai_json(_SEC_IMPACT_SYSTEM, text, schema, effort="medium")
+                by = {f"{it['id']}#{hit['i']}": hit for it, hit in hits}
+                for u in (data.get("updates") or [])[:30]:
+                    hit = by.get(u.get("key"))
+                    nt = _sec_clean_str(u.get("new_text"), 300)
+                    if not hit or not nt or nt == hit["text"]:
+                        continue
+                    hit["proposals"] = [x for x in hit["proposals"] if x["type"] != "text"]
+                    hit["proposals"].append({"type": "text", "from": hit["text"], "to": nt, "ai": True,
+                                             "why": _sec_clean_str(u.get("reason"), 200)})
+                res["ai_used"] = True
+            except _SecAIError as e:
+                res["ai_error"] = str(e)
+    res["counts"] = {"articles": len(res["changed"]) + len(res["moved"]) + len(res["removed"]) + len(res["added"]),
+                     "procedures": len(res["procedures"]),
+                     "proposals": sum(len(h["proposals"]) for it in res["procedures"] for h in it["hits"])}
+    return jsonify(res)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ④ 기관 집단 지식 — 담당자들이 처리한 건의 '익명 숫자'를 모아 다음 담당자에게 돌려준다
+#   모으는 것: 완료까지 걸린 일수, 기한을 넘긴 단계, 사전 감사에서 걸린 항목 종류(정해진 목록),
+#             담당자가 '기관에 공유'를 직접 고른 반려 사유 문장. 이름·금액·메모·초안 내용은 모으지 않는다.
+#   저장소: Upstash Redis(=Vercel KV) REST 가 설정되면 그곳, 아니면 서버 로컬 파일(쓰기 가능할 때)
+#   통계는 표본이 insights.min_n(기본 3)건 이상일 때만 보여 준다.
+# ══════════════════════════════════════════════════════════════════════════
+SEC_INS_FILE = os.environ.get("SECRETARY_INSIGHTS_FILE", "").strip() or os.path.join(SEC_DIR, "insights.json")
+_SEC_KV_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL") or "").strip().rstrip("/")
+_SEC_KV_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN") or "").strip()
+_SEC_INS_LOCK = threading.Lock()
+_SEC_INS_HITS: dict = {}
+_SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft")
+
+
+def _sec_ins_cfg() -> dict:
+    c = {"enabled": True, "min_n": 3}
+    c.update(_sec_config().get("insights") or {})
+    return c
+
+
+def _sec_ins_backend() -> str:
+    if not _sec_ins_cfg().get("enabled", True):
+        return ""
+    if _SEC_KV_URL and _SEC_KV_TOKEN:
+        return "redis"
+    d = os.path.dirname(SEC_INS_FILE) or "."
+    if (os.path.exists(SEC_INS_FILE) and os.access(SEC_INS_FILE, os.W_OK)) or \
+       (not os.path.exists(SEC_INS_FILE) and os.access(d, os.W_OK)):
+        return "file"
+    return ""
+
+
+def _sec_kv(cmds: list) -> list:
+    """해시 명령 묶음 실행. cmds: [["HINCRBY", key, field, n] | ["HGETALL", key] | ["HDEL", key, field] | ["KEYS", pattern]]"""
+    be = _sec_ins_backend()
+    if be == "redis":
+        r = _SESSION.post(f"{_SEC_KV_URL}/pipeline", json=cmds, timeout=8,
+                          headers={"Authorization": f"Bearer {_SEC_KV_TOKEN}"})
+        r.raise_for_status()
+        out = []
+        for x, c in zip(r.json(), cmds):
+            v = x.get("result")
+            if c[0] == "HGETALL" and isinstance(v, list):      # [f1, v1, f2, v2 …] → dict
+                v = {v[i]: v[i + 1] for i in range(0, len(v) - 1, 2)}
+            out.append(v)
+        return out
+    if be != "file":
+        raise RuntimeError("집단 지식 저장소가 없습니다.")
+    with _SEC_INS_LOCK:
+        db = _sec_read_json(SEC_INS_FILE, {}) or {}
+        out, dirty = [], False
+        for c in cmds:
+            op, key = c[0], c[1]
+            h = db.setdefault(key, {}) if op == "HINCRBY" else db.get(key, {})
+            if op == "HINCRBY":
+                h[c[2]] = int(h.get(c[2], 0)) + int(c[3]); out.append(h[c[2]]); dirty = True
+            elif op == "HGETALL":
+                out.append(dict(h))
+            elif op == "HDEL":
+                out.append(1 if h.pop(c[2], None) is not None else 0); dirty = True
+            elif op == "KEYS":
+                pre = key.rstrip("*")
+                out.append([k for k in db if k.startswith(pre)])
+        if dirty:
+            tmp = SEC_INS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(db, f, ensure_ascii=False)
+            os.replace(tmp, SEC_INS_FILE)
+        return out
+
+
+def _sec_ins_rate_ok() -> bool:
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    hits = [t for t in _SEC_INS_HITS.get(ip, []) if now - t < 3600]
+    if len(hits) >= 60:
+        _SEC_INS_HITS[ip] = hits
+        return False
+    _SEC_INS_HITS[ip] = hits + [now]
+    if len(_SEC_INS_HITS) > 5000:
+        _SEC_INS_HITS.clear()
+    return True
+
+
+_SEC_PII = [(re.compile(r"(?<!\d)\d{2,3}[-. ]?\d{3,4}[-. ]?\d{4}(?!\d)"), "○○○"),             # 전화번호
+            (re.compile(r"(?<!\d)\d{6}[- ]?\d{7}(?!\d)"), "○○○"),                              # 주민번호
+            (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "○○○"),                           # 메일
+            (re.compile(r"\d[\d,]{3,}\s*원"), "○○원"),                                 # 금액
+            (re.compile(r"(?<![가-힣])(?!담당|해당|회계|소속|부서|감사|관계|업무|총괄|계약|예산|인사|출장|정산|결재)[가-힣]{2,3}\s?(?=(?:주무관|사무관|대리|주임|선임|책임|님|씨)(?![가-힣]{2}))"), "○○○ ")]
+
+
+def _sec_scrub(t: str) -> str:
+    t = _sec_clean_str(t, 200)
+    for rx, rep in _SEC_PII:
+        t = rx.sub(rep, t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _sec_pid_ok(pid: str) -> bool:
+    return bool(_SEC_ID_RE.match(pid or "")) and len(pid) <= 48
+
+
+@app.route("/api/secretary/insights/event", methods=["POST"])
+def secretary_insights_event():
+    """익명 사건 기록. {type:'done'|'reject', procedure, days?, late?:[단계], ontime?:[단계], audit?:[종류], text?}"""
+    if not _sec_ins_backend():
+        return jsonify({"success": False, "error": "집단 지식 저장소가 설정되지 않았습니다."}), 503
+    if not _sec_ins_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다."}), 429
+    b = request.get_json(silent=True) or {}
+    pid = str(b.get("procedure") or "")
+    if not _sec_pid_ok(pid):
+        return jsonify({"success": False, "error": "절차 id 가 올바르지 않습니다."}), 400
+    key = f"sec:ins:{pid}"
+    cmds = []
+    if b.get("type") == "done":
+        cmds.append(["HINCRBY", key, "n", 1])
+        try:
+            days = int(b.get("days"))
+            if 0 <= days <= 400:
+                cmds.append(["HINCRBY", key, f"d:{min(days, 120)}", 1])
+        except (TypeError, ValueError):
+            pass
+        idx = lambda xs: sorted({int(x) for x in (xs or []) if str(x).isdigit() and int(x) < 40})  # noqa: E731
+        for i in idx(b.get("late")):
+            cmds += [["HINCRBY", key, f"late:{i}", 1], ["HINCRBY", key, f"due:{i}", 1]]
+        for i in idx(b.get("ontime")):
+            cmds.append(["HINCRBY", key, f"due:{i}", 1])
+        for k in sorted({str(x) for x in (b.get("audit") or []) if str(x) in _SEC_AUDIT_KINDS}):
+            cmds.append(["HINCRBY", key, f"au:{k}", 1])
+    elif b.get("type") == "reject":
+        t = _sec_scrub(b.get("text"))
+        if len(t) < 4:
+            return jsonify({"success": False, "error": "반려 사유가 너무 짧습니다."}), 400
+        cmds.append(["HINCRBY", f"sec:rj:{pid}", t, 1])
+    else:
+        return jsonify({"success": False, "error": "type 이 올바르지 않습니다."}), 400
+    try:
+        _sec_kv(cmds)
+    except Exception as e:
+        print(f"[secretary] 집단 지식 기록 실패: {e}")
+        return jsonify({"success": False, "error": "기록하지 못했습니다."}), 502
+    return jsonify({"success": True})
+
+
+def _sec_ins_summary(h: dict, rj: dict, min_n: int) -> dict:
+    h = {k: int(v) for k, v in (h or {}).items() if str(v).lstrip("-").isdigit()}
+    n = h.get("n", 0)
+    out = {"n": n, "enough": n >= min_n, "reasons": sorted(({"t": k, "c": int(v)} for k, v in (rj or {}).items()),
+                                                          key=lambda x: -x["c"])[:8]}
+    if n < min_n:
+        return out
+    hist = sorted((int(k[2:]), v) for k, v in h.items() if k.startswith("d:"))
+    tot = sum(v for _, v in hist)
+
+    def pct(q):
+        acc = 0
+        for d, v in hist:
+            acc += v
+            if acc >= q * tot:
+                return d
+        return None
+    if tot >= min_n:
+        out["days"] = {"median": pct(0.5), "p80": pct(0.8), "n": tot}
+    steps = []
+    for k, v in h.items():
+        if k.startswith("due:") and v >= min_n:
+            i = int(k[4:])
+            steps.append({"i": i, "late": h.get(f"late:{i}", 0), "n": v, "rate": round(h.get(f"late:{i}", 0) / v, 2)})
+    out["late"] = sorted((s for s in steps if s["late"]), key=lambda s: -s["rate"])[:3]
+    out["audit"] = sorted(({"k": k[3:], "c": v} for k, v in h.items() if k.startswith("au:")), key=lambda x: -x["c"])[:4]
+    return out
+
+
+@app.route("/api/secretary/insights")
+def secretary_insights():
+    """?procedure=id → 그 절차의 집단 지식. 없으면 전체 요약(관리 화면용)."""
+    be = _sec_ins_backend()
+    min_n = max(1, int(_sec_ins_cfg().get("min_n") or 3))
+    if not be:
+        return jsonify({"success": True, "available": False, "min_n": min_n})
+    pid = request.args.get("procedure") or ""
+    try:
+        if pid:
+            if not _sec_pid_ok(pid):
+                return jsonify({"success": False, "error": "절차 id 가 올바르지 않습니다."}), 400
+            h, rj = _sec_kv([["HGETALL", f"sec:ins:{pid}"], ["HGETALL", f"sec:rj:{pid}"]])
+            return jsonify({"success": True, "available": True, "min_n": min_n, "backend": be,
+                            "procedure": pid, **_sec_ins_summary(h, rj, min_n)})
+        keys = (_sec_kv([["KEYS", "sec:ins:*"]])[0] or []) + (_sec_kv([["KEYS", "sec:rj:*"]])[0] or [])
+        pids = sorted({k.split(":", 2)[2] for k in keys if k.count(":") >= 2})[:200]
+        res = _sec_kv([c for p in pids for c in (["HGETALL", f"sec:ins:{p}"], ["HGETALL", f"sec:rj:{p}"])]) if pids else []
+        items = {p: _sec_ins_summary(res[2 * i], res[2 * i + 1], min_n) for i, p in enumerate(pids)}
+        return jsonify({"success": True, "available": True, "min_n": min_n, "backend": be, "procedures": items})
+    except Exception as e:
+        print(f"[secretary] 집단 지식 조회 실패: {e}")
+        return jsonify({"success": True, "available": False, "min_n": min_n, "error": "저장소에 연결하지 못했습니다."})
+
+
+@app.route("/api/secretary/insights/reason", methods=["DELETE"])
+def secretary_insights_reason_delete():
+    """공유된 반려 사유 삭제(관리자) — 부적절한 문장 정리, 또는 점검 항목으로 올린 뒤 정리."""
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    b = request.get_json(silent=True) or {}
+    pid, t = str(b.get("procedure") or ""), str(b.get("text") or "")
+    if not _sec_pid_ok(pid) or not t:
+        return jsonify({"success": False, "error": "procedure·text 가 필요합니다."}), 400
+    try:
+        n = _sec_kv([["HDEL", f"sec:rj:{pid}", t]])[0]
+    except Exception:
+        return jsonify({"success": False, "error": "저장소에 연결하지 못했습니다."}), 502
+    return jsonify({"success": True, "deleted": int(n or 0)})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 한글 서식 작성(kordoc) — 로컬·내부 서버: node forms/cli.mjs 를 불러 쓴다.
+#   Vercel 에서는 같은 경로(/api/secretary/forms/*)를 Node 함수 api/forms.mjs 가 받는다(vercel.json).
+#   node 나 kordoc 이 없으면 status 가 available:false 이고, 화면은 기존 내장 .hwpx 초안을 쓴다.
+# ══════════════════════════════════════════════════════════════════════════
+_FORMS_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forms", "cli.mjs")
+
+
+def _forms_node() -> str:
+    import shutil
+    node = shutil.which("node")
+    root = os.path.dirname(os.path.abspath(__file__))
+    if node and os.path.isfile(_FORMS_CLI) and os.path.isdir(os.path.join(root, "node_modules", "kordoc")):
+        return node
+    return ""
+
+
+@app.route("/api/secretary/forms/<action>", methods=["GET", "POST"])
+def secretary_forms(action):
+    import subprocess
+    if action not in ("status", "generate", "gian", "inspect", "fill"):
+        return jsonify({"success": False, "error": "알 수 없는 요청입니다."}), 404
+    node = _forms_node()
+    if action == "status":
+        return jsonify({"success": True, "available": bool(node), "engine": "kordoc" if node else ""})
+    if request.method != "POST":
+        return jsonify({"success": False, "error": "POST 로 요청하세요."}), 405
+    if not node:
+        return jsonify({"success": False, "error": "서버에 한글 서식 엔진(kordoc)이 설치되어 있지 않습니다."}), 503
+    if (request.content_length or 0) > 8 * 1024 * 1024:
+        return jsonify({"success": False, "error": "요청이 너무 큽니다."}), 413
+    body = request.get_json(silent=True) or {}
+    try:
+        p = subprocess.run([node, _FORMS_CLI], input=json.dumps({"action": action, "body": body}),
+                           capture_output=True, text=True, timeout=90, cwd=os.path.dirname(_FORMS_CLI))
+        out = json.loads(p.stdout or "{}")
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "error": "서식 작성 시간이 초과되었습니다."}), 504
+    except Exception as e:
+        print(f"[forms] 실행 실패: {e}")
+        return jsonify({"success": False, "error": "서식을 만들지 못했습니다."}), 500
+    if not out.get("ok"):
+        if p.stderr:
+            print(f"[forms] {p.stderr[:2000]}")
+        return jsonify({"success": False, "error": out.get("error") or "서식을 만들지 못했습니다."}), int(out.get("status") or 500)
+    if not out.get("data"):
+        return jsonify({"success": True, **(out.get("report") or {})})
+    name = re.sub(r'[\\/:*?"<>|\r\n]', "", str(body.get("filename") or "서식"))[:80] or "서식"
+    resp = app.response_class(base64.b64decode(out["data"]), mimetype="application/hwp+zip")
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"form.hwpx\"; filename*=UTF-8''{quote(name)}.hwpx"
+    resp.headers["X-Form-Report"] = quote(json.dumps(out.get("report") or {}, ensure_ascii=False))
+    resp.headers["Access-Control-Expose-Headers"] = "X-Form-Report, Content-Disposition"
+    return resp
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
