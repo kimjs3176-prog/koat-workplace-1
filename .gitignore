@@ -3,7 +3,8 @@ __pycache__/
 .env
 regulations/.backup/
 .agents/
-.claude/
+.claude/*
+!.claude/skills/
 skills-lock.json
 secretary/insights.json
 dist/
