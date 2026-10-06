@@ -1,0 +1,5 @@
+서무비서에 포함·사용된 오픈소스
+
+- kordoc (https://github.com/chrisryugj/kordoc) — MIT License, Copyright (c) 2026 chrisryugj
+  한글(HWPX) 공문 서식 생성·기안문 누름틀 채우기·사용자 서식 채우기에 사용(npm 의존성, forms/).
+  kordoc 패키지에 포함된 표준 간이기안문·일반기안문 서식(templates/)을 그대로 읽어 씁니다.

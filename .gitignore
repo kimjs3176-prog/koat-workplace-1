@@ -7,3 +7,4 @@ regulations/.backup/
 skills-lock.json
 secretary/insights.json
 dist/
+node_modules/

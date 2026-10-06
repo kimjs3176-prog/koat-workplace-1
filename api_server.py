@@ -3340,6 +3340,61 @@ def secretary_insights_reason_delete():
     return jsonify({"success": True, "deleted": int(n or 0)})
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 한글 서식 작성(kordoc) — 로컬·내부 서버: node forms/cli.mjs 를 불러 쓴다.
+#   Vercel 에서는 같은 경로(/api/secretary/forms/*)를 Node 함수 api/forms.mjs 가 받는다(vercel.json).
+#   node 나 kordoc 이 없으면 status 가 available:false 이고, 화면은 기존 내장 .hwpx 초안을 쓴다.
+# ══════════════════════════════════════════════════════════════════════════
+_FORMS_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forms", "cli.mjs")
+
+
+def _forms_node() -> str:
+    import shutil
+    node = shutil.which("node")
+    root = os.path.dirname(os.path.abspath(__file__))
+    if node and os.path.isfile(_FORMS_CLI) and os.path.isdir(os.path.join(root, "node_modules", "kordoc")):
+        return node
+    return ""
+
+
+@app.route("/api/secretary/forms/<action>", methods=["GET", "POST"])
+def secretary_forms(action):
+    import subprocess
+    if action not in ("status", "generate", "gian", "inspect", "fill"):
+        return jsonify({"success": False, "error": "알 수 없는 요청입니다."}), 404
+    node = _forms_node()
+    if action == "status":
+        return jsonify({"success": True, "available": bool(node), "engine": "kordoc" if node else ""})
+    if request.method != "POST":
+        return jsonify({"success": False, "error": "POST 로 요청하세요."}), 405
+    if not node:
+        return jsonify({"success": False, "error": "서버에 한글 서식 엔진(kordoc)이 설치되어 있지 않습니다."}), 503
+    if (request.content_length or 0) > 8 * 1024 * 1024:
+        return jsonify({"success": False, "error": "요청이 너무 큽니다."}), 413
+    body = request.get_json(silent=True) or {}
+    try:
+        p = subprocess.run([node, _FORMS_CLI], input=json.dumps({"action": action, "body": body}),
+                           capture_output=True, text=True, timeout=90, cwd=os.path.dirname(_FORMS_CLI))
+        out = json.loads(p.stdout or "{}")
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "error": "서식 작성 시간이 초과되었습니다."}), 504
+    except Exception as e:
+        print(f"[forms] 실행 실패: {e}")
+        return jsonify({"success": False, "error": "서식을 만들지 못했습니다."}), 500
+    if not out.get("ok"):
+        if p.stderr:
+            print(f"[forms] {p.stderr[:2000]}")
+        return jsonify({"success": False, "error": out.get("error") or "서식을 만들지 못했습니다."}), int(out.get("status") or 500)
+    if not out.get("data"):
+        return jsonify({"success": True, **(out.get("report") or {})})
+    name = re.sub(r'[\\/:*?"<>|\r\n]', "", str(body.get("filename") or "서식"))[:80] or "서식"
+    resp = app.response_class(base64.b64decode(out["data"]), mimetype="application/hwp+zip")
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"form.hwpx\"; filename*=UTF-8''{quote(name)}.hwpx"
+    resp.headers["X-Form-Report"] = quote(json.dumps(out.get("report") or {}, ensure_ascii=False))
+    resp.headers["Access-Control-Expose-Headers"] = "X-Form-Report, Content-Disposition"
+    return resp
+
+
 # ── 실행 ─────────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 5100))
 

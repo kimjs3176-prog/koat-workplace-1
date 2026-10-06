@@ -1,0 +1,9 @@
+{
+  "name": "koat-secretary-forms",
+  "private": true,
+  "description": "서무비서 한글 서식 작성(kordoc) — Vercel Node 함수 api/forms.mjs 와 로컬 forms/cli.mjs",
+  "engines": {"node": ">=20"},
+  "dependencies": {
+    "kordoc": "4.18.13"
+  }
+}

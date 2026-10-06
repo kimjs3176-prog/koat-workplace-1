@@ -26,7 +26,7 @@ const EXAMPLES=[
 ];
 
 let S={ loaded:false, loading:null, common:{procedures:[],drafts:{}}, org:{procedures:[],drafts:{}}, admin:{},
-        view:'home', query:'', formsQ:'', forms:null, regs:null,
+        view:'home', query:'', formsQ:'', forms:null, kd:null, regs:null,
         cfg:{org:{},service:{},terms:{},reg_aliases:{},holidays:{}}, holidays:{}, status:{}, pstatus:{}, regCount:0, dateNote:'', ai:{available:false}, aiRes:null, calYM:null, rcBusy:0, matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
         basisOpen:{}, basisCache:{}, catFilter:'' };
 // 브라우저 확장(ERP 옆 사이드 패널) 안에서 열렸는지 — ?embed=ext 이고 다른 창(확장 패널)에 담겨 있을 때
@@ -237,7 +237,7 @@ async function start(opts){
         (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(done).catch(()=>toast(m.error||'ERP 입력란을 먼저 한 번 누른 뒤 다시 시도하세요.', 4200)); }
     });
     toExt({type:'ready'}); }
-  bind(w); bindViewer();
+  bind(w); bindViewer(); loadFormsStatus();
   try{ await load(); }
   catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
   if(opts.reg) openReg(opts.reg);
@@ -764,15 +764,21 @@ function openDraft(key){
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
-    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 화면에서 마지막으로 누른 입력란(본문·제목 등)에 넣습니다">📥 ERP 입력란에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button><button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button><button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 화면에서 마지막으로 누른 입력란(본문·제목 등)에 넣습니다">📥 ERP 입력란에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div id="secFormsRow">${formsRow(key)}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
   const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
   body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ S._draft.vals[el.dataset.dk]=el.value; out(); }));
+  body.addEventListener('change', e=>{ const el=e.target; if(el.dataset.da!=='ffile') return; const f=el.files&&el.files[0]; el.value=''; if(f) formsUpload(key, d, f); });
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
     if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
     else if(b.dataset.da==='erp'){ S._lastInsert=txt; toExt({type:'insert', text:txt}); }
     else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
     else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
+    else if(b.dataset.da==='fgen'){ formsGenerate(d, S._draft.vals); }
+    else if(b.dataset.da==='fgian'){ formsGian(d, S._draft.vals); }
+    else if(b.dataset.da==='fmine'){ formsFill(key, d, S._draft.vals); }
+    else if(b.dataset.da==='fforget'){ myForms(key, null); document.getElementById('secFormsRow').innerHTML=formsRow(key); toast('이 초안의 내 서식을 지웠습니다.'); }
     else if(b.dataset.da==='keep'){ updateCase(cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); }); toast('처리 이력에 초안 입력값을 저장했습니다.'); }
   });
   out();
@@ -1440,6 +1446,94 @@ async function promoteReason(pid, t){
   if(!p){ const c=[...(raw.common.procedures||[])].find(x=>x.id===pid); if(!c){ toast('기관·공통 절차에서만 올릴 수 있습니다.'); return; } p=JSON.parse(JSON.stringify(c)); list.push(p); }
   p.pitfalls=p.pitfalls||[]; if(!p.pitfalls.some(x=>norm(x.t)===norm(t))) p.pitfalls.push({t});
   if(await saveOrg(list)){ await deleteReason(pid, t, true); toast('기관 점검 항목으로 올렸습니다.'); render(); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑥ 한글 서식 작성(kordoc) — 공문 '보고서' 서식 생성 · 표준 간이기안문 · 우리 기관 서식(.hwpx)에 채우기
+//    서버에 kordoc 이 있을 때만 켜진다(없으면 위의 내장 .hwpx 초안).
+// ═══════════════════════════════════════════════════════════════════════════
+const LS_FORMS='koat_sec_forms';   // {초안키: {name, b64}} — 내 서식(브라우저에만)
+// 기관 서식의 칸 이름이 초안 항목 이름과 다를 때를 위한 다른 이름들(정확히 같은 라벨만 채운다)
+const FIELD_ALIASES={name:['출장자','성명','이름','신청자','작성자','강사'], dept:['소속','부서','소속부서','소속(부서)'], period:['출장기간','기간','일시','출장일시','교육기간','휴가기간'],
+  place:['출장지','장소','출장장소','행사장소'], purpose:['출장목적','목적','사유'], content:['주요내용','출장내용','내용','결과','주요 내용'], follow:['향후조치','조치사항','향후계획','건의사항','향후 조치'],
+  amount:['금액','합계','사용금액'], date:['일자','사용일','사용일자'], reason:['사유','사용사유'], fare:['운임'], lodging:['숙박비'], evid:['증빙서류','증빙'], card:['결제수단']};
+function loadFormsStatus(){
+  if(S.kd) return; S.kd={available:false};
+  fetch('/api/secretary/forms/status').then(r=>r.ok?r.json():{}).then(d=>{ S.kd={available:!!d.available}; }).catch(()=>{});
+}
+function myForms(key, v){
+  const all=_ls(LS_FORMS,{}); if(v===undefined) return all[key]||null;
+  if(v) all[key]=v; else delete all[key];
+  if(!_lsPut(LS_FORMS, all)){ toast('브라우저 저장 공간이 부족해 서식을 기억하지 못했습니다.'); return null; } return v;
+}
+function formsRow(key){
+  if(!(S.kd||{}).available) return '';
+  const mine=myForms(key);
+  return `<div class="sec-forms-row"><span class="sec-sub">한글 서식</span>`+
+    `<button class="sec-btn primary sm" data-da="fgen" title="공문 보고서 서식(표·항목 번호)으로 만듭니다">📄 공문 서식(.hwpx)</button>`+
+    `<button class="sec-btn sm" data-da="fgian" title="표준 간이기안문(결재란·제목·요약)에 채웁니다">📑 간이기안문</button>`+
+    (mine?`<button class="sec-btn sm" data-da="fmine" title="기억해 둔 내 서식에 채웁니다">📂 ${esc(mine.name.slice(0,24))}에 채우기</button><button class="sec-x" data-da="fforget" aria-label="내 서식 지우기" title="내 서식 지우기">✕</button>`:'')+
+    `<label class="sec-btn ghost sm" title="우리 기관 출장복명서 등 .hwpx 서식을 올리면 칸 이름(라벨·누름틀)을 찾아 채웁니다">📂 우리 서식에 채우기<input type="file" accept=".hwpx" data-da="ffile" hidden></label>`+
+    `</div>`;
+}
+function draftRows(d, vals){
+  // 비워 둔 항목은 템플릿의 기본값({{follow|list|해당 없음}})을 쓴다
+  const def={}; String(d.template||'').replace(/\{\{(\w+)\|\w+\|([^}]*)\}\}/g,(m,k,v)=>{ def[k]=v; return m; });
+  return (d.fields||[]).map(f=>({label:f.l, value:String(vals[f.k]||'').trim()||def[f.k]||'', multi:!!f.multi}));
+}
+function draftClosing(d, vals){
+  // 템플릿에서 마지막 항목 뒤의 맺음말(위와 같이 … 보고합니다 / 붙임 … 끝)
+  const lines=String(d.template||'').split('\n'); let last=-1; lines.forEach((l,i)=>{ if(/\{\{/.test(l)) last=i; });
+  return lines.slice(last+1).map(l=>fillTemplate(l, vals).trim()).filter(Boolean);
+}
+async function formsCall(action, body, fname){
+  toast('한글 서식을 만드는 중...');
+  try{
+    const r=await fetch('/api/secretary/forms/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({filename:fname}, body))});
+    if(!r.ok){ let m='서식을 만들지 못했습니다.'; try{ m=(await r.json()).error||m; }catch(e){} toast(m, 4200); return null; }
+    let rep={}; try{ rep=JSON.parse(decodeURIComponent(r.headers.get('X-Form-Report')||'%7B%7D')); }catch(e){}
+    const blob=await r.blob(); const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download=String(fname||'서식').replace(/[\\/:*?"<>|]/g,'')+'.hwpx'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+    return rep;
+  }catch(e){ toast('서버에 연결하지 못했습니다.'); return null; }
+}
+async function formsGenerate(d, vals){
+  const rep=await formsCall('generate', {title:d.title.replace(/\(.*\)$/,'').trim()||d.title, rows:draftRows(d, vals), closing:draftClosing(d, vals)}, d.title);
+  if(rep) toast('공문 서식(.hwpx)을 받았습니다. 한글에서 열어 확인하세요.', 4200);
+}
+async function formsGian(d, vals){
+  const o=S.cfg.org||{}; const one=draftRows(d, vals).filter(r=>!r.multi && r.value);
+  const t=new Date(); const today=`${t.getFullYear()}. ${t.getMonth()+1}. ${t.getDate()}.`;
+  const subj=d.title.replace(/\(.*\)$/,'').trim()+(vals.purpose?` — ${String(vals.purpose).slice(0,40)}`:'');
+  const values={'제목':subj, '요약설명':one.slice(0,4).map(r=>`${r.label}: ${r.value}`).join(' / ').slice(0,300), '작성일':today,
+    '작성기관':[o.name, vals.dept].filter(Boolean).join(' '), '공개구분':'비공개'};
+  const rep=await formsCall('gian', {template:'gian-simple', values}, d.title+'_간이기안문');
+  if(rep) toast('간이기안문(.hwpx)을 받았습니다. 본문은 공문 서식으로 붙이세요.', 4200);
+}
+function formValues(d, vals){
+  const out={};
+  (d.fields||[]).forEach(f=>{ const v=String(vals[f.k]||'').trim(); if(!v) return;
+    [f.l, f.l.replace(/\s+/g,''), ...(FIELD_ALIASES[f.k]||[])].forEach(k=>{ if(!(k in out)) out[k]=v; }); });
+  return out;
+}
+async function formsFill(key, d, vals){
+  const mine=myForms(key); if(!mine) return;
+  const rep=await formsCall('fill', {form:mine.b64, values:formValues(d, vals)}, d.title);
+  if(!rep) return;
+  const got=new Set(rep.filled||[]);
+  const miss=(d.fields||[]).filter(f=>String(vals[f.k]||'').trim() && ![f.l, f.l.replace(/\s+/g,''), ...(FIELD_ALIASES[f.k]||[])].some(k=>got.has(k))).map(f=>f.l);
+  toast(got.size?`서식에 ${(d.fields||[]).length-miss.length-(d.fields||[]).filter(f=>!String(vals[f.k]||'').trim()).length}개 항목을 채웠습니다.${miss.length?' 못 찾은 칸: '+miss.join(', '):''}`
+    :'서식에서 같은 이름의 칸을 찾지 못했습니다. 서식의 칸 이름(예: 출장자·출장기간)을 확인하세요.', 6000);
+}
+function formsUpload(key, d, file){
+  if(!/\.hwpx$/i.test(file.name)){ toast('한글 .hwpx 서식만 올릴 수 있습니다. .hwp 는 한글에서 다른 이름으로 저장 → .hwpx 로 바꿔 주세요.', 5200); return; }
+  if(file.size>5*1024*1024){ toast('서식 파일은 5MB까지입니다.'); return; }
+  const r=new FileReader();
+  r.onload=()=>{ const b64=String(r.result).replace(/^data:[^,]*,/,'');
+    myForms(key, {name:file.name.replace(/\.hwpx$/i,''), b64});
+    const row=document.getElementById('secFormsRow'); if(row) row.innerHTML=formsRow(key);
+    formsFill(key, d, S._draft.vals); };
+  r.readAsDataURL(file);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
