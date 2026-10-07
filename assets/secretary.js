@@ -40,7 +40,7 @@ function _lsPut(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); return t
 function personal(){ const p=_ls(LS_PERSONAL,{}); p.procedures=Array.isArray(p.procedures)?p.procedures:[]; p.notes=p.notes||{}; return p; }
 function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
-function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); }
+function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); if(typeof syncDeadlines==='function') syncDeadlines(); }
 let _toastT=null;
 function toast(m,ms){ const el=document.getElementById('toast'); if(!el) return; el.textContent=m; el.classList.add('show');
   clearTimeout(_toastT); _toastT=setTimeout(()=>el.classList.remove('show'), ms||2600); }
@@ -243,6 +243,7 @@ async function start(opts){
   bind(w); bindViewer(); loadFormsStatus();
   try{ await load(); }
   catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
+  syncDeadlines();
   if(opts.reg) openReg(opts.reg);
   if(opts.q){ ask(opts.q); return; }
   if(opts.view && ['list','history','forms','manage','cal','ext'].includes(opts.view)) S.view=opts.view;
@@ -281,7 +282,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['ext','🧩 ERP 확장'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -318,7 +319,36 @@ function homeView(){
     cats.map(([cat,ps])=>`<div class="sec-cat"><div class="sec-cat-h">${esc(cat)}</div>`+ps.map(p=>`<button class="sec-proc-l" data-a="proc" data-id="${esc(p.id)}"><span>${esc(p.icon||'📌')}</span><span>${esc(shortTitle(p.title))}</span>${p._layer!=='common'?`<span class="sec-layer ${p._layer}">${LAYER_LABEL[p._layer]}</span>`:''}</button>`).join('')+`</div>`).join('')+
     `</div></div>`;
   const how=`<div class="sec-how"><b>서무비서는 이렇게 돕습니다</b> — ① 상황을 말하면 해당 절차를 찾고 ② 기준일을 넣으면 단계별 기한을 계산해 다음 할 일을 짚어 주며 ③ 단계마다 필요한 서식(원본)과 근거 조문, 문서 초안을 바로 꺼내 줍니다. 진행 상황은 <b>처리 이력</b>에 남아 담당자가 바뀌어도 이어갈 수 있어요.</div>`;
-  return ex+todo+grid+how;
+  return extHero()+ex+todo+grid+how;
+}
+// ── 확장이 메인: 웹 화면은 설치 안내·보조 ─────────────────────────────────
+// 확장이 설치되어 있으면 서무비서 웹 화면에 data-sec-ext(버전)를 달아 준다(확장의 marker.js).
+function extInstalled(){ return document.documentElement.getAttribute('data-sec-ext')||''; }
+function extHero(){
+  if(EMBED) return '';
+  const v=extInstalled();
+  if(v) return `<div class="sec-ext-ok"><span>🧩 <b>서무비서 확장 ${esc(v)}</b>이 설치되어 있습니다 — ERP 화면에서 <b>🗂</b>(또는 <b>Alt+Shift+S</b>)로 여세요. 상신 전 점검·기한 알림도 확장이 맡습니다.</span>`+
+    `<button class="sec-btn sm" data-a="extpanel">이 탭 옆에 패널 열기</button></div>`;
+  if(_ls('koat_sec_herox',0)>Date.now()) return '';
+  const b=browserKind();
+  return `<div class="sec-ext-cta"><div class="sec-ext-cta-m"><div class="sec-ext-cta-t">🧩 서무비서는 <b>ERP 옆에서</b> 쓰는 브라우저 확장이 기본입니다</div>`+
+    `<ul><li>ERP 화면을 열면 그 업무의 <b>절차·기한·반려 점검</b>을 옆 패널에 바로</li><li>만든 초안을 ERP의 <b>여러 칸에 한 번에</b> 입력</li><li><b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 확인</li><li>도구 모음 아이콘에 <b>다가오는 기한</b>, 당일 바탕화면 알림</li></ul></div>`+
+    `<div class="sec-ext-cta-a">${b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치할 수 있습니다</span>`:`<button class="sec-btn primary" data-a="view" data-v="ext">🧩 확장 설치하기</button>`}`+
+    `<button class="sec-linkbtn" data-a="herox">웹에서 계속 쓰기</button></div></div>`;
+}
+// 처리 중인 건의 다가오는 기한 → 확장(아이콘 배지·바탕화면 알림). 패널 안이면 패널로, 일반 탭이면 marker.js 로.
+let _dlTimer=null, _dlLast='';
+function syncDeadlines(){
+  if(!EMBED && !extInstalled()) return;
+  clearTimeout(_dlTimer);
+  _dlTimer=setTimeout(()=>{
+    const lo=addDays(today(),-60), hi=addDays(today(),60);
+    const items=allDeadlines().filter(d=>d.date>=lo && d.date<=hi).slice(0,200)
+      .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}));
+    const key=JSON.stringify(items); if(key===_dlLast) return; _dlLast=key;
+    if(EMBED) toExt({type:'deadlines', items});
+    else window.postMessage({src:'koat-sec', type:'deadlines', items}, location.origin);
+  }, 400);
 }
 function shortTitle(t){ return String(t||'').split(' — ')[0]; }
 function catGroups(){
@@ -955,6 +985,8 @@ function bind(panel){
       case 'insrj': promoteReason(D.id, D.t); break;
       case 'insdel': deleteReason(D.id, D.t); break;
       case 'insall': S.insAll=null; loadInsAll(); break;
+      case 'herox': _lsPut('koat_sec_herox', Date.now()+30*86400000); render(); break;
+      case 'extpanel': window.postMessage({src:'koat-sec', type:'openPanel'}, location.origin); toast('확장 패널을 엽니다. 열리지 않으면 도구 모음의 서무비서 아이콘을 누르세요.'); break;
       case 'copyext': { const t=D.t||''; (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast(t+' 를 복사했습니다. 주소창에 붙여넣으세요.')).catch(()=>toast('주소창에 '+t+' 를 직접 입력하세요.')); break; }
       case 'formsq': S.formsQ=D.q||''; S.view='forms'; render(); break;
       case 'tocal': addDeadlinesToCalendar(); break;
@@ -1573,7 +1605,9 @@ function extView(){
       `<ul class="sec-tips"><li>ERP·그룹웨어 화면 <b>옆 패널</b>에서 절차·기한·서식·근거·사전 감사를 봅니다.</li>`+
       `<li>ERP에서 출장·휴가·지출결의 같은 화면을 열면 <b>이 업무 안내</b>를 바로 띄웁니다.</li>`+
       `<li>만든 초안을 <b>ERP의 여러 칸에 한 번에</b> 넣습니다(제목·기간·출장지·본문…).</li>`+
-      `<li>어떤 ERP든 <b>🔧 ERP 맞춤</b>으로 화면 구조를 분석해 칸을 연결합니다.</li></ul></div></div>`+
+      `<li>어떤 ERP든 <b>🔧 ERP 맞춤</b>으로 화면 구조를 분석해 칸을 연결합니다.</li>`+
+      `<li>ERP에서 <b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 보여 줍니다.</li>`+
+      `<li>도구 모음 아이콘에 <b>다가오는 기한</b>을 표시하고, 오늘·내일 기한은 바탕화면으로 알립니다.</li></ul></div></div>`+
     (installed?`<div class="sec-notice ${verLt(S.extVersion,i.version)?'warn':'info'}">${verLt(S.extVersion,i.version)?`⚠ 설치된 확장 ${esc(S.extVersion)} — 새 버전 ${esc(i.version)}을 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.`:`✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).`}</div>`:'')+
     (b==='other'?`<div class="sec-notice warn">이 브라우저에서는 확장을 쓸 수 없습니다. <b>Chrome</b>이나 <b>Microsoft Edge</b>로 이 페이지를 여세요.</div>`:'')+
     `<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+

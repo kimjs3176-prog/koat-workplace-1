@@ -76,7 +76,7 @@ async function analyze() {
   let urlRule = ""; try { const u = new URL(main.url || r.url); urlRule = u.pathname.length > 1 ? u.pathname : ""; } catch (e) {}
   const ctx = r.context || {};
   const existing = ctx.screenId ? await findScreen(ctx.screenId) : null;
-  cur = existing ? JSON.parse(JSON.stringify(existing)) : { id: uid(), name: heads[0] || ctx.title || "", match: { url: urlRule, title: "" }, q: ctx.q || "", draft: ctx.draft || "", fields: [] };
+  cur = existing ? JSON.parse(JSON.stringify(existing)) : { id: uid(), name: heads[0] || ctx.title || "", match: { url: urlRule, title: "" }, q: ctx.q || "", proc: ctx.proc || "", draft: ctx.draft || "", fields: [] };
   cur._found = fields;
   cur._heads = heads;
   if (!existing) {
@@ -84,7 +84,13 @@ async function analyze() {
     const t = heads.find((h) => (globalThis.SEC_RULES || []).some(([rx]) => rx.test(h))) || heads[0] || "";
     if (t) { cur.match.title = t; cur.name = t; }
     const rule = (globalThis.SEC_RULES || []).find(([rx]) => rx.test(t));
-    if (rule && !cur.q) cur.q = rule[1];
+    if (rule && !cur.q) { cur.q = rule[1]; cur.proc = rule[2] || ""; }
+    if (!cur.draft && cur.proc && meta) {               // 그 절차의 초안이 하나뿐이거나 화면 이름에 맞으면 미리 고른다
+      const pr = (meta.procedures || []).find((x) => x.id === cur.proc);
+      const ds = ((pr && pr.drafts) || []).filter((k, i, a) => a.indexOf(k) === i);
+      const byName = ds.find((k) => { const d = meta.drafts.find((x) => x.key === k); return d && /복명|결과/.test(t) === /복명|결과/.test(d.title); });
+      cur.draft = (ds.length === 1 ? ds[0] : byName) || "";
+    }
     if (!cur.draft && meta) { const d = (meta.drafts || []).find((x) => norm(t).includes(norm(x.title).replace(/\(.*\)/, "")) || norm(x.title).includes(norm(t))); if (d) cur.draft = d.key; }
   }
   renderEdit();
@@ -133,7 +139,7 @@ function renderEdit() {
     ${cur._heads && cur._heads.length ? `<div class="sub">화면에서 찾은 제목 — 누르면 제목 글자로</div><div class="chips">${cur._heads.map((h) => `<button class="chip${h === cur.match.title ? " on" : ""}" data-head="${esc(h)}" type="button">${esc(h)}</button>`).join("")}</div>` : ""}
     <div class="sub">주소·제목 중 하나만 적어도 됩니다. 둘 다 적으면 둘 다 맞을 때만 이 화면으로 봅니다. /정규식/ 도 쓸 수 있습니다.</div>
     <div class="grid">
-      <label class="f">서무비서 업무<select id="scProc"><option value="">— 고르기 —</option>${procs.map((p) => `<option value="${esc(p.q)}"${p.q === cur.q ? " selected" : ""}>${esc(p.icon || "")} ${esc(p.title.split(" — ")[0])}</option>`).join("")}${cur.q && !procs.some((p) => p.q === cur.q) ? `<option value="${esc(cur.q)}" selected>${esc(cur.q)}</option>` : ""}</select></label>
+      <label class="f">서무비서 업무<select id="scProc"><option value="">— 고르기 —</option>${procs.map((p) => `<option value="${esc(p.id)}"${p.id === cur.proc || (!cur.proc && p.q === cur.q) ? " selected" : ""}>${esc(p.icon || "")} ${esc(p.title.split(" — ")[0])}</option>`).join("")}</select></label>
       <label class="f">이 화면에 넣을 초안<select id="scDraft"><option value="">— 없음 —</option>${drafts.map((d) => `<option value="${esc(d.key)}"${d.key === cur.draft ? " selected" : ""}>${esc(d.title)}</option>`).join("")}</select></label>
     </div>
     ${!meta ? `<div class="sub">⚠ 서무비서 주소가 설정되지 않아 업무·초안 목록을 불러오지 못했습니다(⚙ 설정).</div>` : ""}
@@ -172,13 +178,15 @@ function renderEdit() {
 }
 function collect() {
   cur.name = $("scName").value.trim(); cur.match = { url: $("scUrl").value.trim(), title: $("scTitle").value.trim() };
-  cur.q = $("scProc").value; cur.draft = $("scDraft").value;
+  cur.proc = $("scProc").value; cur.draft = $("scDraft").value;
+  const pr = ((meta && meta.procedures) || []).find((x) => x.id === cur.proc);
+  if (pr) cur.q = pr.q;
   const fields = (cur._rows || []).filter((r) => r.key).map((r) => {
     const o = { key: r.key }; for (const k of ["label", "sel", "name", "fid", "frame", "kind"]) if (r[k] !== undefined && r[k] !== "") o[k] = r[k];
     if (r.frame === "") o.frame = "";
     return o;
   });
-  return { id: cur.id, name: cur.name || cur.match.title || "화면", match: cur.match, q: cur.q, draft: cur.draft, fields };
+  return { id: cur.id, name: cur.name || cur.match.title || "화면", match: cur.match, q: cur.q, proc: cur.proc || "", draft: cur.draft, fields };
 }
 
 async function startPick() {

@@ -33,12 +33,15 @@ textarea{min-height:84px}
 <textarea id="hosts" spellcheck="false"></textarea>
 
 <label class="chk"><input type="checkbox" id="floating"> ERP 화면 오른쪽 아래에 🗂 버튼과 '이 업무 안내 보기'를 표시</label>
+<label class="chk"><input type="checkbox" id="guard"> ERP에서 <b>상신·결재요청</b> 버튼을 누르면 결재 전 점검(반려 점검 항목)을 먼저 보여 주기</label>
+<label class="chk"><input type="checkbox" id="autoAsk"> ERP 화면을 알아보면 열린 패널에서 바로 그 업무 안내</label>
+<label class="chk"><input type="checkbox" id="notify"> 기한 알림 — 도구 모음 아이콘에 다가오는 기한 수, 오늘·내일 기한은 바탕화면 알림</label>
 
 <div class="row"><button class="btn" id="save" type="button">저장</button><span id="msg" role="status" aria-live="polite"></span></div>
 
 <div class="box">
   <b>사용법</b><br>
-  · 도구 모음의 🗂 아이콘(또는 <b>Alt+Shift+S</b>)을 누르면 오른쪽에 서무비서가 열립니다.<br>
+  · 도구 모음의 🗂 아이콘(또는 <b>Alt+Shift+S</b>)을 누르면 오른쪽에 서무비서가 열립니다. 주소창에 <b>서무</b> + 띄어쓰기 + 상황(예: 서무 출장 정산)을 입력해도 됩니다.<br>
   · ERP에서 출장·휴가·지출결의 같은 화면을 열면 🗂 버튼 위에 <b>이 업무 안내 보기</b>가 나타납니다.<br>
   · ERP의 글자를 드래그하고 오른쪽 클릭 → <b>서무비서에 묻기</b>.<br>
   · 서무비서에서 초안을 만든 뒤 <b>📥 ERP에 넣기</b>를 누르면, 연결해 둔 칸들에 한 번에(연결이 없으면 마지막으로 누른 칸에) 들어갑니다.<br>

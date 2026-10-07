@@ -33,6 +33,9 @@ def build_zip(server: str = "", erps=None, name: str = "", version: str = "") ->
     pats = list(dict.fromkeys(pats)) or man["content_scripts"][0]["matches"]
     man["host_permissions"] = pats
     man["content_scripts"][0]["matches"] = pats
+    if server:
+        # 서무비서 웹 화면: 확장 설치 표시·기한 전달(marker.js)
+        man["content_scripts"].append({"matches": [server + "/*"], "js": ["marker.js"], "run_at": "document_start"})
     if name:
         man["name"] = name[:45]
         man["short_name"] = name[:12]

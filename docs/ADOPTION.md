@@ -154,6 +154,8 @@ python scripts/import_regs.py ./우리기관_내규 --reset     # 기존(KOAT) �
 
 ## 7-4. ERP 옆에서 쓰기 — 브라우저 확장
 
+서무비서는 **브라우저 확장이 메인**입니다. 직원들은 ERP 옆 패널에서 안내·초안 입력·상신 전 반려 점검·기한 알림을 받고, 웹 화면은 설치 안내와 관리(내규·절차·기관 설정)에 씁니다.
+
 ```bash
 python scripts/build_extension.py --server https://<우리 서무비서 주소> --erp https://<우리 그룹웨어 주소> --name "○○공단 서무비서"
 ```

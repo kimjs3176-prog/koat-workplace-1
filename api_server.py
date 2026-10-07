@@ -3439,6 +3439,7 @@ def _sec_erp_clean(raw) -> list:
                     "name": _sec_clean_str(sc.get("name"), 60) or "화면",
                     "match": {"url": _sec_clean_str(m.get("url"), 300), "title": _sec_clean_str(m.get("title"), 120)},
                     "q": _sec_clean_str(sc.get("q"), 120), "draft": _sec_clean_str(sc.get("draft"), 48),
+                    "proc": _sec_clean_str(sc.get("proc"), 48),
                     "fields": fields}
             if item["match"]["url"] or item["match"]["title"]:
                 screens.append(item)
@@ -3484,6 +3485,12 @@ def secretary_erp_profiles():
     return jsonify({"success": True, "message": where, "profiles": data["profiles"], "updated": data["updated"]})
 
 
+def _sec_tx(text: str, cfg: dict) -> str:
+    """절차 문장의 [[erp]] 같은 자리표시 → 기관 명칭(화면의 tx() 와 같음)."""
+    terms = {**_SEC_CFG_DEFAULT["terms"], **{k: v for k, v in (cfg.get("terms") or {}).items() if v}}
+    return re.sub(r"\[\[(\w+)\]\]", lambda m: terms.get(m.group(1), m.group(0)), str(text or ""))
+
+
 @app.route("/api/secretary/erp/meta")
 def secretary_erp_meta():
     """ERP 맞춤 도구용: 초안 서식(항목)과 절차 목록."""
@@ -3497,7 +3504,12 @@ def secretary_erp_meta():
                     "drafts": [{"key": k, "title": d.get("title", k), "fields": [{"k": f.get("k"), "l": f.get("l")} for f in d.get("fields") or []]}
                                for k, d in drafts.items()],
                     "procedures": [{"id": p["id"], "title": p.get("title", ""), "icon": p.get("icon", ""),
-                                    "q": (p.get("triggers") or [p.get("title", "")])[0]}
+                                    "q": (p.get("triggers") or [p.get("title", "")])[0],
+                                    # 결재 전 점검(ERP 상신 버튼)용 반려 점검 항목과 근거
+                                    "pitfalls": [{"t": _sec_tx(x.get("t", ""), cfg),
+                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2]}
+                                                 for x in (p.get("pitfalls") or [])][:12],
+                                    "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
                                    for p in procs.values() if not p.get("hidden")],
                     "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", "")})
 

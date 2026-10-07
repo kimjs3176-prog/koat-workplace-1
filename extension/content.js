@@ -292,10 +292,11 @@
     const texts = candidates();
     const m = screenMatch(texts);
     let ctx = null;
-    if (m) ctx = { q: m.sc.q || m.sc.name, title: m.sc.name || m.hit, screenId: m.sc.id, profileId: m.p.id, draft: m.sc.draft || "" };
-    else for (const [rx, q] of globalThis.SEC_RULES || []) {
+    // rank: 저장된 화면 규칙(-1) > 기본 규칙 순서 — 여러 프레임이 서로 다른 업무를 알아보면 더 구체적인 쪽을 쓴다
+    if (m) ctx = { q: m.sc.q || m.sc.name, title: m.sc.name || m.hit, screenId: m.sc.id, profileId: m.p.id, draft: m.sc.draft || "", proc: m.sc.proc || "", rank: -1 };
+    else for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
       const hit = texts.find((t) => rx.test(t));
-      if (hit) { ctx = { q, title: hit.slice(0, 40) }; break; }
+      if (hit) { ctx = { q, title: hit.slice(0, 40), proc: proc || "", rank: i }; break; }
     }
     if (!ctx) return;
     const key = JSON.stringify(ctx);

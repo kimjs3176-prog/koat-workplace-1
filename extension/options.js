@@ -9,10 +9,11 @@ function normHost(line) {
 }
 
 async function load() {
-  const s = await chrome.storage.sync.get(["server", "erpHosts", "floating"]);
+  const s = await chrome.storage.sync.get(["server", "erpHosts", "floating", "guard", "autoAsk", "notify"]);
   $("server").value = s.server || SEC_DEFAULTS.server || "";
   $("hosts").value = (s.erpHosts || SEC_DEFAULTS.erpHosts).join("\n");
   $("floating").checked = s.floating !== undefined ? s.floating : SEC_DEFAULTS.floating;
+  for (const k of ["guard", "autoAsk", "notify"]) $(k).checked = s[k] !== undefined ? s[k] : SEC_DEFAULTS[k] !== false;
 }
 
 $("save").addEventListener("click", async () => {
@@ -37,7 +38,8 @@ $("save").addEventListener("click", async () => {
   if (need.length && !(await chrome.permissions.request({ origins: need }).catch(() => false))) {
     msg.textContent = "ERP 주소 접근이 허용되지 않아 저장하지 않았습니다."; return;
   }
-  await chrome.storage.sync.set({ server, erpHosts: hosts, floating: $("floating").checked });
+  await chrome.storage.sync.set({ server, erpHosts: hosts, floating: $("floating").checked,
+    guard: $("guard").checked, autoAsk: $("autoAsk").checked, notify: $("notify").checked });
   await chrome.runtime.sendMessage({ type: "hostsChanged" }).catch(() => {});
   msg.textContent = "저장했습니다. 열려 있는 ERP 탭은 새로고침하면 적용됩니다.";
 });

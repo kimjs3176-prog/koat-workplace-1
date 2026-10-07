@@ -74,7 +74,7 @@ button,input,textarea,select{font-family:inherit;}
 body.dark .toast{background:#e6e7ea;color:#111;}
 /* 브라우저 확장 사이드 패널 안 */
 body.embed .topbar{padding:8px 12px;}
-body.embed .brand-s, body.embed .tb-btn[href="/upload"], body.embed .foot{display:none;}
+body.embed .brand-s, body.embed .tb-btn[href="/upload"], body.embed .tb-ext, body.embed .foot{display:none;}
 body.embed .main{padding:10px 12px 24px;}
 </style>
 <link rel="stylesheet" href="/assets/secretary.css">
@@ -89,6 +89,7 @@ body.embed .main{padding:10px 12px 24px;}
     <span><span class="brand-t" id="brandT">KOAT 서무비서</span><br><span class="brand-s" id="brandS">출장·물품·행사·복무·결재 — 상황을 말하면 절차·기한·서식·근거 안내</span></span>
   </a>
   <span class="tb-sp"></span>
+  <a class="tb-btn tb-ext" href="/?view=ext" title="ERP 옆에서 쓰는 서무비서 브라우저 확장">🧩<span class="tb-tl"> 확장 설치</span></a>
   <a class="tb-btn" href="/upload" title="개정·신규 내규 문서를 업로드합니다(관리자)">⬆<span class="tb-tl"> 내규 업로드</span></a>
   <button class="tb-btn" id="darkBtn" type="button" aria-label="다크 모드 전환">🌙</button>
 </header>
