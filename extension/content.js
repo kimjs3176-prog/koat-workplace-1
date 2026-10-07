@@ -29,6 +29,9 @@
     return segs.join(">");
   }
   const MYPATH = framePath();
+  // 진단 기록: 서비스 워커로 보낸다(값은 보내지 않고 구조·결과만). 기록이 꺼져 있으면 서비스 워커가 버린다.
+  const dlog = (ev, data) => { try { chrome.runtime.sendMessage({ type: "log", src: TOP ? "content" : "content(frame)", ev, data: Object.assign({ frame: MYPATH }, data || {}) }).catch(() => {}); } catch (e) {} };
+  dlog("load", { url: location.pathname, title: document.title.slice(0, 60), designMode: document.designMode === "on", top: TOP });
 
   // ── 입력란 ────────────────────────────────────────────────
   const isTextInput = (el) => el.tagName === "INPUT" && /^(text|search|email|tel|number|date|)$/i.test(el.type || "");
@@ -109,20 +112,22 @@
     return f;
   }
   // 저장된 칸 정보 → 지금 화면의 요소 (선택자 → id → name → 칸 이름)
+  let lastHow = "";                              // 진단용: 칸을 무엇으로 찾았는지(sel·id·name·label·editor·none)
   function locate(f) {
+    lastHow = "none";
     if (f.frame !== undefined && f.frame !== MYPATH) return null;
     const tries = [];
-    if (f.sel) tries.push(() => document.querySelector(f.sel));
-    if (f.fid) tries.push(() => document.getElementById(f.fid));
-    if (f.name) tries.push(() => document.querySelector(`[name="${CSS.escape(f.name)}"]`));
-    for (const t of tries) { try { const el = t(); if (el) return el; } catch (e) {} }
+    if (f.sel) tries.push(["sel", () => document.querySelector(f.sel)]);
+    if (f.fid) tries.push(["id", () => document.getElementById(f.fid)]);
+    if (f.name) tries.push(["name", () => document.querySelector(`[name="${CSS.escape(f.name)}"]`)]);
+    for (const [how, t] of tries) { try { const el = t(); if (el) { lastHow = how; return el; } } catch (e) {} }
     if (f.label) {
       const want = clean(f.label).replace(/\s/g, "");
       for (const el of document.querySelectorAll("input,textarea,select,[contenteditable='true'],[contenteditable='']")) {
-        if (clean(labelOf(el)).replace(/\s/g, "") === want) return el;
+        if (clean(labelOf(el)).replace(/\s/g, "") === want) { lastHow = "label"; return el; }
       }
     }
-    if (f.kind === "editor" && document.designMode === "on") return document.body;
+    if (f.kind === "editor" && document.designMode === "on") { lastHow = "editor"; return document.body; }
     return null;
   }
 
@@ -170,14 +175,20 @@
 
   document.addEventListener("focusin", (e) => {
     const el = editable(e.target);
-    if (el) { lastEditable = el; chrome.runtime.sendMessage({ type: "focus" }).catch(() => {}); }
+    if (el) {
+      if (el !== lastEditable) dlog("focus", { kind: kindOf(el), label: labelOf(el), sel: cssPath(el) });
+      lastEditable = el; chrome.runtime.sendMessage({ type: "focus" }).catch(() => {});
+    }
   }, true);
   if (document.designMode === "on") document.addEventListener("click", () => { lastEditable = document.body; chrome.runtime.sendMessage({ type: "focus" }).catch(() => {}); }, true);
 
   function insertText(text) {
     const el = lastEditable && lastEditable.isConnected ? lastEditable : editable(document.activeElement);
-    if (!el) return { ok: false };
-    return { ok: setValue(el, text, "insert"), where: el.name || el.id || el.tagName.toLowerCase() };
+    if (!el) { dlog("insert", { ok: false, why: "누른 입력란 없음", active: document.activeElement && document.activeElement.tagName }); return { ok: false }; }
+    let ok = false, err = "";
+    try { ok = setValue(el, text, "insert"); } catch (e) { err = e.message; }
+    dlog("insert", { ok, kind: kindOf(el), label: labelOf(el), err, len: String(text).length });
+    return { ok, where: el.name || el.id || el.tagName.toLowerCase() };
   }
 
   // ── 구조 분석(ERP 맞춤 도구가 부름) ─────────────────────────────
@@ -194,6 +205,26 @@
     if (document.designMode === "on" || (document.body && document.body.isContentEditable && !TOP)) add(document.body);
     return { path: MYPATH, top: TOP, url: location.href.slice(0, 300), title: document.title.slice(0, 120),
       headings: candidates().slice(0, 30), fields: fields.slice(0, 80) };
+  };
+  // ── 진단 스냅샷: 화면 구조 + 버튼 이름 + 편집기·라이브러리 단서(값은 담지 않는다) ──────────
+  globalThis.__secSnapshot = () => {
+    const a = globalThis.__secAnalyze();
+    const btns = [];
+    document.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],[onclick]').forEach((el) => {
+      if (btns.length >= 80 || (el.offsetParent === null && el !== document.body)) return;
+      const t = String(el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").replace(/\s+/g, " ").trim();
+      if (t && t.length <= 20 && !btns.some((b) => b.t === t)) btns.push({ t, tag: el.tagName.toLowerCase(), id: el.id || "", cls: String(el.className || "").slice(0, 40) });
+    });
+    const frames = [...document.querySelectorAll("iframe,frame")].slice(0, 30).map((f) => {
+      let same = false, dm = "", ce = false;
+      try { same = !!f.contentDocument; dm = f.contentDocument.designMode; ce = !!(f.contentDocument.body && f.contentDocument.body.isContentEditable); } catch (e) {}
+      let src = f.getAttribute("src") || ""; try { if (src && !src.startsWith("about:")) { const u = new URL(src, location.href); src = u.pathname; } } catch (e) {}
+      return { id: f.id || "", name: f.name || "", src: src.slice(0, 120), sameOrigin: same, designMode: dm, editable: ce, w: f.clientWidth, h: f.clientHeight };
+    });
+    const scripts = [...document.scripts].map((x) => (x.src || "").split("?")[0].split("/").pop()).filter(Boolean);
+    const hints = scripts.filter((n) => /ckeditor|tinymce|dext|namo|smarteditor|se2|husky|quill|editor|jquery|ext-all|sencha|kendo|devextreme|nexacro|websquare|xplatform|miplatform/i.test(n)).slice(0, 20);
+    try { const u = new URL(location.href); a.url = u.origin + u.pathname + (u.search ? "?" + [...u.searchParams.keys()].join("&") : ""); } catch (e) {}
+    return Object.assign(a, { buttons: btns, iframes: frames, scriptHints: hints, scripts: scripts.length, contentEditable: document.querySelectorAll("[contenteditable]").length, forms: document.forms.length });
   };
   // ── 강조(눈으로 확인) ──────────────────────────────────────
   globalThis.__secHighlight = (f) => {
@@ -234,15 +265,18 @@
   // ── 매핑으로 여러 칸 채우기 ─────────────────────────────────
   //  payload: {fields:[{key,sel,name,fid,label,frame,kind}], values:{key:값}, test?:true}
   globalThis.__secFillMap = (payload) => {
-    const filled = [], missing = [];
+    const filled = [], missing = [], how = {};
     for (const f of (payload && payload.fields) || []) {
       if (f.frame !== undefined && f.frame !== MYPATH) continue;
       const v = payload.test ? `[시험] ${f.label || f.key}` : (payload.values || {})[f.key];
       if (v === undefined || v === null || String(v).trim() === "") continue;
       const el = locate(f);
-      if (el && setValue(el, v, "replace")) filled.push(f.key); else missing.push(f.key);
+      let ok = false;
+      try { ok = !!(el && setValue(el, v, "replace")); } catch (e) { how[f.key + ":err"] = e.message; }
+      how[f.key] = el ? lastHow + (ok ? "" : "(넣기 실패)") + ":" + kindOf(el) : "못 찾음(" + [f.sel, f.fid, f.name, f.label].filter(Boolean).join(" | ").slice(0, 120) + ")";
+      if (ok) filled.push(f.key); else missing.push(f.key);
     }
-    return { path: MYPATH, filled, missing };
+    return { path: MYPATH, filled, missing, how };
   };
 
   chrome.runtime.onMessage.addListener((m, _s, reply) => {
@@ -287,7 +321,7 @@
     }
     return null;
   }
-  let lastSent = "";
+  let lastSent = "", noneLogged = "";
   function detect() {
     const texts = candidates();
     const m = screenMatch(texts);
@@ -298,10 +332,14 @@
       const hit = texts.find((t) => rx.test(t));
       if (hit) { ctx = { q, title: hit.slice(0, 40), proc: proc || "", rank: i }; break; }
     }
-    if (!ctx) return;
+    if (!ctx) {
+      // 업무를 알아보지 못한 화면 — 어떤 제목 문구가 있었는지 남겨 규칙을 보강한다(주소마다 한 번)
+      if (texts.length && noneLogged !== location.pathname) { noneLogged = location.pathname; dlog("detect.none", { url: location.pathname, texts: texts.slice(0, 25) }); }
+      return;
+    }
     const key = JSON.stringify(ctx);
     // 어느 프레임에서 찾았든 서비스 워커가 맨 위 프레임의 🗂 버튼에 다시 알려 준다
-    if (key !== lastSent) { lastSent = key; chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
+    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: m ? "화면 규칙" : "기본 규칙", hit: m ? m.hit : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
   }
   let timer = null;
   const schedule = () => { clearTimeout(timer); timer = setTimeout(detect, 600); };

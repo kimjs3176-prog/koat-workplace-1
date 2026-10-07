@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>진단 센터 — 서무비서</title>
+<link rel="stylesheet" href="panel.css">
+<link rel="stylesheet" href="erp.css">
+<style>
+body{display:block;overflow:auto}
+.wrap{max-width:980px;margin:0 auto}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 10px 0}
+.top h1{font-size:19px;margin:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px}
+textarea{width:100%;min-height:70px;border:1px solid var(--bd);border-radius:8px;padding:8px;font:inherit;font-size:13px;background:var(--bg);color:var(--tx)}
+select{border:1px solid var(--bd);border-radius:8px;padding:5px 8px;background:var(--bg);color:var(--tx);font:inherit;font-size:13px;max-width:100%}
+.stat{display:flex;flex-wrap:wrap;gap:6px}
+.st{font-size:12px;border:1px solid var(--bd);border-radius:999px;padding:2px 8px}
+.st.err{border-color:#dc2626;color:#dc2626}
+.logw{overflow:auto;max-height:520px;border:1px solid var(--bd);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+td,th{border-bottom:1px solid var(--bd);padding:4px 6px;text-align:left;vertical-align:top}
+th{position:sticky;top:0;background:var(--bg)}
+td.t{white-space:nowrap;color:var(--mu);font-variant-numeric:tabular-nums}
+td.d{font-family:ui-monospace,Menlo,monospace;word-break:break-all;color:var(--mu)}
+tr.err td{background:rgba(220,38,38,.08)}
+tr.user td{background:var(--gl)}
+pre{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:280px;overflow:auto;border:1px solid var(--bd);border-radius:8px;padding:8px;margin:0}
+.ok{color:#047857}.bad{color:#b91c1c}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="top"><h1>🩺 서무비서 진단 센터</h1><span class="sub" id="ver"></span><span class="sp"></span>
+  <label class="sub"><input type="checkbox" id="on"> 진단 기록 켜기</label></div>
+<main class="wrap" style="padding:10px">
+  <section class="card">
+    <div class="h">실제 ERP 시험 순서</div>
+    <ol class="sub" style="margin:0;padding-left:18px;line-height:1.8">
+      <li>ERP 화면을 열고 평소처럼 서무비서를 써 봅니다(패널 안내, 🔧 ERP 맞춤, 📥 ERP에 넣기, 상신 버튼).</li>
+      <li>이상한 점이 보이면 그 화면에서 아래 <b>📸 화면 구조 기록</b>을 누르고, <b>메모</b>에 무엇을 했는데 어떻게 됐는지 적습니다.</li>
+      <li>시험이 끝나면 <b>보고서 받기</b>로 파일을 받아 Claude 대화에 첨부하거나, <b>서버로 보내기</b>를 누릅니다.</li>
+    </ol>
+    <div class="sub">기록하는 것: 화면 주소(경로)·제목·칸 이름과 종류·버튼 이름·프레임 구조·동작 결과. <b>기록하지 않는 것</b>: ERP와 초안에 입력한 내용, 주소의 값(사번·문서번호 등). 숫자가 길게 이어진 글자(전화·주민번호 모양)는 #으로 가립니다.</div>
+  </section>
+  <div class="grid2">
+    <section class="card">
+      <div class="h">📸 지금 ERP 화면 기록</div>
+      <select id="tabs" aria-label="기록할 탭"></select>
+      <div class="row"><button class="btn sm" id="snap" type="button">📸 화면 구조 기록</button></div>
+      <pre id="snapOut" class="sub">ERP 탭을 고르고 누르세요. 모든 프레임의 칸·버튼·편집기 구조를 기록합니다.</pre>
+    </section>
+    <section class="card">
+      <div class="h">📝 메모</div>
+      <textarea id="note" placeholder="예) 출장복명서 작성 화면에서 '결재상신'을 눌렀는데 점검 카드가 안 떴음 / 🔧 분석에서 출장지 칸을 못 찾음"></textarea>
+      <div class="row"><button class="btn sm" id="noteBtn" type="button">메모 남기기</button></div>
+      <div class="stat" id="stat"></div>
+    </section>
+  </div>
+  <section class="card">
+    <div class="h">보내기</div>
+    <div class="row">
+      <button class="btn" id="dl" type="button">⬇ 보고서 받기(.json)</button>
+      <button class="btn ghost" id="copy" type="button">📋 요약 복사</button>
+      <button class="btn ghost" id="up" type="button">☁ 서버로 보내기</button>
+      <button class="btn ghost" id="clear" type="button">기록 지우기</button>
+    </div>
+    <div class="sub" id="sendMsg">'서버로 보내기'는 관리자 토큰이 필요합니다. 보낸 보고서는 서무비서 저장소의 <code>diag/</code> 폴더에 쌓여 Claude가 바로 읽을 수 있습니다.</div>
+  </section>
+  <section class="card">
+    <div class="h">기록 <span class="sub" id="cnt"></span></div>
+    <div class="row"><select id="f" aria-label="기록 거르기"><option value="">전체</option><option value="err">오류·실패만</option><option value="user">메모·스냅샷</option><option value="detect">화면 감지</option><option value="fill">칸 넣기</option><option value="guard">결재 전 점검·버튼</option></select>
+      <button class="btn ghost sm" id="reload" type="button">↻ 새로고침</button></div>
+    <div class="logw"><table><thead><tr><th>시각</th><th>어디서</th><th>무엇</th><th>내용</th></tr></thead><tbody id="rows"></tbody></table></div>
+  </section>
+</main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="diag.js"></script>
+</body>
+</html>
