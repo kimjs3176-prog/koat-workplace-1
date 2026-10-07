@@ -160,6 +160,8 @@ python scripts/build_extension.py --server https://<우리 서무비서 주소> 
 - 만들어진 `dist/*.zip`을 Chrome 웹 스토어나 Edge 추가 기능에 조직 한정으로 올리거나, 그룹 정책으로 일괄 설치합니다.
 - ERP 화면 제목으로 업무를 알아보는 규칙은 `extension/config.js`의 `SEC_RULES`에서 우리 기관 메뉴 이름에 맞춥니다.
 - 서무비서 서버 앞단에서 `X-Frame-Options`를 붙이고 있으면, 패널이 열리지 않습니다. `Content-Security-Policy: frame-ancestors 'self' chrome-extension: extension:`으로 바꿉니다.
+- **가장 쉬운 배포**: 기관 설정의 **ERP·그룹웨어 주소**를 적어 두면 직원은 서무비서 **🧩 ERP 확장** 탭에서 우리 서버·ERP 주소가 들어간 확장을 받아 설치합니다.
+- **우리 ERP 화면 맞추기**: 관리자가 ERP의 주요 화면(출장복명서·여비 정산·휴가 신청·지출결의 등)마다 패널의 **🔧 ERP 맞춤**으로 구조를 분석해 칸을 연결하고 **기관 전체에 공유**합니다. 규칙은 `secretary/erp_profiles.json`에 저장되고, 모든 직원 확장이 30분 안에(또는 '기관 규칙 새로고침'으로 바로) 받습니다.
 - 자세한 내용은 [extension/README.md](../extension/README.md)를 보세요.
 
 ## 8. 개인정보·저장 위치

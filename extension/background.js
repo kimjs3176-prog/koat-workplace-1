@@ -53,6 +53,62 @@ async function openPanel(tab) {
     left: Math.max(0, (win.left || 0) + (win.width || 1200) - 440), top: win.top || 0 });
 }
 
+// ── ERP 프로필(화면 규칙·칸 매핑) — 기관 공유본(서버) + 내 브라우저본(로컬, 같은 화면 id 면 우선) ──
+async function serverProfiles(force) {
+  const { server } = await settings();
+  const { srvProfiles } = await chrome.storage.local.get("srvProfiles");
+  if (!server) return [];
+  if (!force && srvProfiles && Date.now() - srvProfiles.ts < 30 * 60 * 1000) return srvProfiles.list || [];
+  try {
+    const r = await fetch(server + "/api/secretary/erp/profiles", { cache: "no-store" });
+    const d = await r.json();
+    const list = (d && d.profiles) || [];
+    await chrome.storage.local.set({ srvProfiles: { ts: Date.now(), list, updated: d.updated || "" } });
+    return list;
+  } catch (e) { return (srvProfiles && srvProfiles.list) || []; }
+}
+async function allProfiles(force) {
+  const srv = await serverProfiles(force);
+  const { myProfiles } = await chrome.storage.local.get("myProfiles");
+  const mine = myProfiles || [];
+  const out = srv.map((p) => ({ ...p, screens: [...(p.screens || [])], source: "org" }));
+  for (const p of mine) {
+    const same = out.find((x) => x.hosts.some((h) => p.hosts.includes(h)));
+    if (!same) { out.push({ ...p, source: "mine" }); continue; }
+    for (const sc of p.screens || []) {
+      const i = same.screens.findIndex((x) => x.id === sc.id);
+      if (i >= 0) same.screens[i] = { ...sc, mine: true }; else same.screens.unshift({ ...sc, mine: true });
+    }
+  }
+  return out;
+}
+const hostMatch = (pat, url) => { try { const u = new URL(url); return pat.replace(/\/\*$/, "") === u.origin; } catch (e) { return false; } };
+async function profilesFor(url) { return (await allProfiles()).filter((p) => (p.hosts || []).some((h) => hostMatch(h, url))); }
+
+// 모든 프레임에서 내용 스크립트 함수 실행(같은 격리 공간이라 globalThis.__sec* 를 부를 수 있다)
+async function inFrames(tabId, fn, arg) {
+  const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true },
+    func: (name, a) => (typeof globalThis[name] === "function" ? globalThis[name](a) : null), args: [fn, arg ?? null] });
+  return res.map((r) => r.result).filter((x) => x !== null && x !== undefined);
+}
+
+// 초안 → 매핑된 칸들. 지금 감지된 화면 → 같은 초안을 쓰는 화면 순으로 고른다.
+async function fillMap(tabId, m) {
+  const tab = await chrome.tabs.get(tabId);
+  const ps = await profilesFor(tab.url || "");
+  const ctx = (state[tabId] || {}).context || {};
+  const screens = ps.flatMap((p) => p.screens || []);
+  let pick = screens.filter((sc) => sc.id === ctx.screenId && (sc.fields || []).length);
+  if (!pick.length && m.draft) pick = screens.filter((sc) => sc.draft === m.draft && (sc.fields || []).length);
+  if (m.screen) pick = [m.screen];
+  if (!pick.length) return { ok: false, mapped: false };
+  const fields = pick.flatMap((sc) => sc.fields || []);
+  const res = await inFrames(tabId, "__secFillMap", { fields, values: m.values || {}, test: !!m.test });
+  const filled = [...new Set(res.flatMap((r) => r.filled || []))];
+  const want = [...new Set(fields.map((f) => f.key))].filter((k) => m.test || String((m.values || {})[k] ?? "").trim());
+  return { ok: filled.length > 0, mapped: true, filled, missing: want.filter((k) => !filled.includes(k)), screen: pick[0].name };
+}
+
 function toPanel(msg) { chrome.runtime.sendMessage(Object.assign({ to: "panel" }, msg)).catch(() => {}); }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -90,6 +146,43 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     chrome.tabs.sendMessage(m.tabId, { type: "insert", text: m.text }, opts)
       .then((r) => reply(r || { ok: false }))
       .catch(() => reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }));
+    return true;
+  } else if (m.type === "getProfiles") {                 // 내용 스크립트: 이 사이트의 화면 규칙
+    profilesFor(m.url || (sender.tab && sender.tab.url) || "").then((profiles) => reply({ profiles }));
+    return true;
+  } else if (m.type === "allProfiles") {                  // ERP 맞춤 도구·설정
+    allProfiles(!!m.force).then(async (profiles) => {
+      const { myProfiles, srvProfiles } = await chrome.storage.local.get(["myProfiles", "srvProfiles"]);
+      reply({ profiles, mine: myProfiles || [], org: (srvProfiles && srvProfiles.list) || [], orgUpdated: (srvProfiles && srvProfiles.updated) || "" });
+    });
+    return true;
+  } else if (m.type === "profilesChanged") {              // 저장 후: 열린 ERP 탭에 새 규칙 전달
+    allProfiles(!!m.force).then(async () => {
+      for (const t of await chrome.tabs.query({})) {
+        if (!t.url || !/^https?:/.test(t.url)) continue;
+        const profiles = await profilesFor(t.url);
+        chrome.tabs.sendMessage(t.id, { type: "profiles", profiles }).catch(() => {});
+      }
+      reply({ ok: true });
+    });
+    return true;
+  } else if (m.type === "analyze") {                      // ERP 구조 분석(모든 프레임)
+    inFrames(m.tabId, "__secAnalyze").then(async (frames) => {
+      const tab = await chrome.tabs.get(m.tabId);
+      reply({ ok: true, url: tab.url, title: tab.title, frames, context: (state[m.tabId] || {}).context || null });
+    }).catch((e) => reply({ ok: false, error: "이 탭의 화면을 읽을 수 없습니다. ERP 주소가 확장 설정에 들어 있는지, 탭을 새로고침했는지 확인하세요. (" + e.message + ")" }));
+    return true;
+  } else if (m.type === "highlight") {
+    inFrames(m.tabId, "__secHighlight", m.field).then((r) => reply({ ok: r.some(Boolean) })).catch(() => reply({ ok: false }));
+    return true;
+  } else if (m.type === "pickStart") {
+    inFrames(m.tabId, "__secPick").then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: e.message }));
+    return true;
+  } else if (m.type === "picked" && sender.tab) {         // 어느 프레임에서 골랐으면 나머지 프레임의 고르기 끝내기
+    inFrames(sender.tab.id, "__secPickStop").catch(() => {});
+    toPanel({ type: "picked", tabId, field: m.field });
+  } else if (m.type === "fillmap") {                      // 패널: 초안 → 매핑된 칸들
+    fillMap(m.tabId, m).then(reply).catch((e) => reply({ ok: false, error: e.message }));
     return true;
   } else if (m.type === "settings") {
     settings().then(reply); return true;

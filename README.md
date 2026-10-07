@@ -68,7 +68,9 @@
 - ERP에서 출장·여비 정산·휴가·지출결의 같은 화면을 열면 **이 업무 안내 보기**가 뜹니다.
 - 서무비서에서 만든 초안은 **📥 ERP 입력란에 넣기**로 ERP 본문·제목 칸에 바로 넣습니다.
 - ERP의 글자를 드래그하고 오른쪽 클릭 → **서무비서에 묻기**로 안내를 받습니다.
-- 기관 배포본은 `python scripts/build_extension.py --server https://<서무비서 주소>`로 만듭니다.
+- **어떤 ERP든 맞춤**: 패널의 **🔧 ERP 맞춤**에서 화면 구조를 분석해 칸을 초안 항목과 연결합니다. 그러면 **📥 ERP에 넣기**가 제목·기간·출장지·본문 등 여러 칸을 한 번에 채웁니다. 관리자가 '기관 전체에 공유'하면 모든 직원이 같은 규칙을 씁니다.
+- **설치**: 서무비서 화면의 **🧩 ERP 확장** 탭에서 이 서버 주소와 기관 ERP 주소가 들어간 확장을 받아, 안내대로 설치합니다.
+- 기관 배포본은 🧩 ERP 확장 탭에서 바로 받거나 `python scripts/build_extension.py --server https://<서무비서 주소>`로 만듭니다.
 - 설치·배포 방법은 [extension/README.md](extension/README.md)를 보세요.
 
 ### 다른 기관에서 쓰기(호환성)
@@ -172,7 +174,8 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 ├── api_server.py              # Flask API 서버
 ├── api/index.py               # Vercel 서버리스 진입점
 ├── api/forms.mjs, forms/      # 한글 서식 작성(kordoc) — Vercel Node 함수·로컬 CLI
-├── extension/                 # Chrome·Edge 확장(ERP 옆 사이드 패널)
+├── extension/                 # Chrome·Edge 확장(ERP 옆 사이드 패널·🔧 ERP 맞춤)
+├── extension_build.py         # 확장 배포본 zip(🧩 ERP 확장 탭·scripts/build_extension.py)
 ├── package.json               # kordoc(Node 20+) 의존성
 ├── reg_chunks.py              # 내규 원문 → 조문 단위 분할
 ├── regulations/               # 내규 원문(HTML) — 규정별 폴더

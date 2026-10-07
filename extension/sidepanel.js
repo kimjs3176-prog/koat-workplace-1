@@ -53,13 +53,20 @@ window.addEventListener("message", async (e) => {
   if (m.src !== "koat-sec") return;
   if (m.type === "ready") {
     ready = true;
+    post({ type: "hello", version: chrome.runtime.getManifest().version });
     const q = queue; queue = [];
     q.forEach(post);
   } else if (m.type === "insert") {
     const id = await currentTab();
-    const r = id == null ? { ok: false, error: "ERP 탭을 찾지 못했습니다." }
-      : await chrome.runtime.sendMessage({ type: "insert", tabId: id, text: String(m.text || "").slice(0, 20000) }).catch(() => ({ ok: false }));
-    post({ type: "inserted", ok: !!(r && r.ok), error: r && r.error });
+    if (id == null) { post({ type: "inserted", ok: false, error: "ERP 탭을 찾지 못했습니다." }); return; }
+    const text = String(m.text || "").slice(0, 20000);
+    // 1) 이 ERP 화면에 칸 매핑(ERP 맞춤)이 있으면 여러 칸을 한 번에
+    const vals = Object.assign({}, m.values || {}, { _body: text, _title: (text.split("\n").map((x) => x.trim()).find(Boolean) || "") });
+    const fm = await chrome.runtime.sendMessage({ type: "fillmap", tabId: id, draft: m.draft || "", values: vals }).catch(() => null);
+    if (fm && fm.ok) { post({ type: "inserted", ok: true, mapped: true, filled: fm.filled, missing: fm.missing, screen: fm.screen }); return; }
+    // 2) 아니면 마지막으로 누른 칸에
+    const r = await chrome.runtime.sendMessage({ type: "insert", tabId: id, text }).catch(() => ({ ok: false }));
+    post({ type: "inserted", ok: !!(r && r.ok), error: r && r.error, mappedButMissed: !!(fm && fm.mapped) });
   }
 });
 
@@ -76,6 +83,7 @@ if (!params.get("tab")) {
 $("ctx").addEventListener("click", () => { if (ctx) ask(ctx.q); });
 $("home").addEventListener("click", () => { if (server) { ready = false; $("app").src = server + "/?embed=ext"; } });
 $("opt").addEventListener("click", () => chrome.runtime.openOptionsPage());
+$("tool").addEventListener("click", async () => { const id = await currentTab(); location.href = "erp.html" + (id != null ? "?tab=" + id + (params.get("tab") ? "&fixed=1" : "") : ""); });
 $("setupBtn").addEventListener("click", () => chrome.runtime.openOptionsPage());
 chrome.storage.onChanged.addListener((c) => { if (c.server) location.reload(); });
 init();
