@@ -239,10 +239,12 @@ async function start(opts){
         const t=S._lastInsert||''; const done=()=>toast((m.error?m.error+' ':'ERP에서 넣을 칸을 찾지 못했습니다. ')+'초안을 복사해 두었으니 ERP 입력란에 붙여넣기(Ctrl+V) 하세요.', 5200);
         (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(done).catch(()=>toast(m.error||'ERP 입력란을 먼저 한 번 누른 뒤 다시 시도하세요.', 4200)); }
     });
-    toExt({type:'ready'}); }
+  }
   bind(w); bindViewer(); loadFormsStatus();
   try{ await load(); }
   catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
+  // 절차 목록을 다 받은 뒤에 '준비됨'을 알린다 — 그 전에 온 '이 업무 안내' 요청이 빈 목록에서 헛돌지 않게
+  if(EMBED) toExt({type:'ready'});
   syncDeadlines();
   if(opts.reg) openReg(opts.reg);
   if(opts.q){ ask(opts.q); return; }
