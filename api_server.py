@@ -1930,7 +1930,7 @@ def _sec_holidays(cfg: dict) -> dict:
 def _sec_public_config(cfg: dict) -> dict:
     return {"org": cfg.get("org", {}), "service": cfg.get("service", {}), "terms": cfg.get("terms", {}),
             "reg_aliases": cfg.get("reg_aliases", {}), "holidays": cfg.get("holidays", {}),
-            "audit": cfg.get("audit") or {}, "insights": cfg.get("insights") or {},
+            "audit": cfg.get("audit") or {}, "insights": cfg.get("insights") or {}, "erp": cfg.get("erp") or {},
             "updated": cfg.get("updated", "")}
 
 
@@ -2200,6 +2200,11 @@ def secretary_config_save():
         "updated": _now_kst(),
         "updated_by": _sec_clean_str((request.get_json(silent=True) or {}).get("editor"), 40),
     }
+    # ERP·그룹웨어 주소(브라우저 확장이 붙을 곳) — 'https://호스트/*' 꼴로 정리
+    import extension_build
+    erp_in = body.get("erp") if isinstance(body.get("erp"), dict) else {}
+    hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (erp_in.get("hosts") or [])[:20]) if h]
+    cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40)}
     # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다
     cur = _sec_config(force=True)
     for k in ("audit", "insights"):
@@ -3338,6 +3343,175 @@ def secretary_insights_reason_delete():
     except Exception:
         return jsonify({"success": False, "error": "저장소에 연결하지 못했습니다."}), 502
     return jsonify({"success": True, "deleted": int(n or 0)})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 브라우저 확장 배포·ERP 프로필
+#   /api/secretary/extension/info · extension.zip : 이 서버 주소와 기관 ERP 주소를 넣은 확장 배포본
+#   /api/secretary/erp/profiles : 관리자가 확장으로 만든 'ERP 화면 규칙·칸 매핑'(모든 직원 확장이 받아 씀)
+#   /api/secretary/erp/meta     : 확장의 ERP 맞춤 도구가 쓰는 초안 항목·절차 목록
+#   확장 페이지(chrome-extension://)가 부르므로 이 경로들만 CORS 를 연다(공개 정보 + 저장은 관리자 토큰).
+# ══════════════════════════════════════════════════════════════════════════
+SEC_ERP_PATH = os.path.join(SEC_DIR, "erp_profiles.json")
+SEC_ERP_REPO_PATH = "secretary/erp_profiles.json"
+_SEC_ERP_CACHE = {"ts": 0.0, "data": None}
+
+
+@app.after_request
+def _sec_ext_cors(resp):
+    if request.path.startswith("/api/secretary/erp/") or request.path.startswith("/api/secretary/extension"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Upload-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "600"
+    return resp
+
+
+def _sec_public_origin() -> str:
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "").split(",")[0].strip()
+    return f"{proto}://{host}" if host else ""
+
+
+def _sec_ext_hosts() -> list:
+    import extension_build
+    hosts = (_sec_config().get("erp") or {}).get("hosts") or []
+    return [h for h in (extension_build.origin_pattern(x) for x in hosts) if h]
+
+
+@app.route("/api/secretary/extension/info")
+def secretary_extension_info():
+    import extension_build
+    man = extension_build.manifest()
+    return jsonify({"success": True, "version": man.get("version", ""), "name": man.get("name", ""),
+                    "server": _sec_public_origin(),
+                    "erp_hosts": _sec_ext_hosts() or man["content_scripts"][0]["matches"]})
+
+
+@app.route("/api/secretary/extension.zip")
+def secretary_extension_zip():
+    """이 서무비서 주소와 기관 ERP 주소를 넣은 확장 배포본. 압축을 풀면 secretary-extension 폴더 하나."""
+    import extension_build
+    server = _sec_public_origin()
+    if not (server.startswith("https://") or re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", server)):
+        server = ""                                   # http 운영 주소는 넣지 않고 사용자가 설정
+    org = (_sec_config().get("org") or {})
+    svc = (_sec_config().get("service") or {})
+    name = f"{org.get('abbr') or org.get('short') or ''} {svc.get('title') or '서무비서'}".strip()
+    try:
+        data, man = extension_build.build_zip(server, _sec_ext_hosts(), name)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    resp = app.response_class(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"secretary-extension-{man['version']}.zip\""
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _sec_erp_clean_field(f: dict):
+    if not isinstance(f, dict):
+        return None
+    key = _sec_clean_str(f.get("key"), 40)
+    if not re.match(r"^[A-Za-z0-9_\-]{1,40}$", key or ""):
+        return None
+    out = {"key": key}
+    for k, n in (("label", 60), ("sel", 300), ("name", 120), ("fid", 120), ("frame", 300), ("kind", 12)):
+        v = _sec_clean_str(f.get(k), n)
+        if v:
+            out[k] = v
+    return out if (out.get("sel") or out.get("name") or out.get("fid") or out.get("label")) else None
+
+
+def _sec_erp_clean(raw) -> list:
+    out = []
+    for p in (raw or [])[:20]:
+        if not isinstance(p, dict):
+            continue
+        import extension_build
+        hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (p.get("hosts") or [])[:10]) if h]
+        screens = []
+        for sc in (p.get("screens") or [])[:80]:
+            if not isinstance(sc, dict):
+                continue
+            m = sc.get("match") if isinstance(sc.get("match"), dict) else {}
+            fields = [x for x in (_sec_erp_clean_field(f) for f in (sc.get("fields") or [])[:60]) if x]
+            item = {"id": _sec_clean_str(sc.get("id"), 40) or f"s{len(screens) + 1}",
+                    "name": _sec_clean_str(sc.get("name"), 60) or "화면",
+                    "match": {"url": _sec_clean_str(m.get("url"), 300), "title": _sec_clean_str(m.get("title"), 120)},
+                    "q": _sec_clean_str(sc.get("q"), 120), "draft": _sec_clean_str(sc.get("draft"), 48),
+                    "proc": _sec_clean_str(sc.get("proc"), 48),
+                    "fields": fields}
+            if item["match"]["url"] or item["match"]["title"]:
+                screens.append(item)
+        if hosts:
+            out.append({"id": _sec_clean_str(p.get("id"), 40) or f"p{len(out) + 1}",
+                        "name": _sec_clean_str(p.get("name"), 60) or hosts[0], "hosts": hosts, "screens": screens})
+    return out
+
+
+def _sec_erp_load(force: bool = False) -> dict:
+    if not force and _SEC_ERP_CACHE["data"] is not None and time.time() - _SEC_ERP_CACHE["ts"] < 30:
+        return _SEC_ERP_CACHE["data"]
+    d = _sec_read_json(SEC_ERP_PATH, {}) or {}
+    data = {"profiles": _sec_erp_clean(d.get("profiles")), "updated": d.get("updated", ""), "updated_by": d.get("updated_by", "")}
+    _SEC_ERP_CACHE.update({"ts": time.time(), "data": data})
+    return data
+
+
+@app.route("/api/secretary/erp/profiles", methods=["GET", "POST", "OPTIONS"])
+def secretary_erp_profiles():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.method == "GET":
+        return jsonify({"success": True, **_sec_erp_load(force=request.args.get("fresh") == "1")})
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get("profiles"), list):
+        return jsonify({"success": False, "error": "profiles 목록이 필요합니다."}), 400
+    data = {"schema_version": 1, "profiles": _sec_erp_clean(body["profiles"]), "updated": _now_kst(),
+            "updated_by": _sec_clean_str(body.get("editor"), 40)}
+    payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
+    if len(payload) > 400_000:
+        return jsonify({"success": False, "error": "ERP 프로필이 너무 큽니다."}), 413
+    try:
+        where = _sec_save_repo_file(SEC_ERP_REPO_PATH, SEC_ERP_PATH, payload, "서무비서 ERP 화면 규칙 갱신")
+    except OSError:
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    _SEC_ERP_CACHE.update({"ts": time.time(), "data": {k: data[k] for k in ("profiles", "updated", "updated_by")}})
+    return jsonify({"success": True, "message": where, "profiles": data["profiles"], "updated": data["updated"]})
+
+
+def _sec_tx(text: str, cfg: dict) -> str:
+    """절차 문장의 [[erp]] 같은 자리표시 → 기관 명칭(화면의 tx() 와 같음)."""
+    terms = {**_SEC_CFG_DEFAULT["terms"], **{k: v for k, v in (cfg.get("terms") or {}).items() if v}}
+    return re.sub(r"\[\[(\w+)\]\]", lambda m: terms.get(m.group(1), m.group(0)), str(text or ""))
+
+
+@app.route("/api/secretary/erp/meta")
+def secretary_erp_meta():
+    """ERP 맞춤 도구용: 초안 서식(항목)과 절차 목록."""
+    common = _sec_read_json(SEC_COMMON_PATH, {"procedures": [], "drafts": {}})
+    org = _sec_org_load()
+    drafts = dict(common.get("drafts") or {}); drafts.update(org.get("drafts") or {})
+    procs = {p["id"]: p for p in common.get("procedures", [])}
+    procs.update({p["id"]: p for p in org.get("procedures", [])})
+    cfg = _sec_config()
+    return jsonify({"success": True,
+                    "drafts": [{"key": k, "title": d.get("title", k), "fields": [{"k": f.get("k"), "l": f.get("l")} for f in d.get("fields") or []]}
+                               for k, d in drafts.items()],
+                    "procedures": [{"id": p["id"], "title": p.get("title", ""), "icon": p.get("icon", ""),
+                                    "q": (p.get("triggers") or [p.get("title", "")])[0],
+                                    # 결재 전 점검(ERP 상신 버튼)용 반려 점검 항목과 근거
+                                    "pitfalls": [{"t": _sec_tx(x.get("t", ""), cfg),
+                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2]}
+                                                 for x in (p.get("pitfalls") or [])][:12],
+                                    "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
+                                   for p in procs.values() if not p.get("hidden")],
+                    "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", "")})
 
 
 # ══════════════════════════════════════════════════════════════════════════

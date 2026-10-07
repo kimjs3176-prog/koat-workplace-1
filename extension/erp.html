@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ERP 맞춤 — 서무비서</title>
+<link rel="stylesheet" href="panel.css">
+<link rel="stylesheet" href="erp.css">
+</head>
+<body>
+<div class="bar">
+  <button class="ic" id="back" type="button" title="서무비서로 돌아가기" aria-label="서무비서로 돌아가기">←</button>
+  <b class="bt">🔧 ERP 맞춤</b>
+  <span class="sp"></span>
+  <button class="ic" id="opt" type="button" title="확장 설정" aria-label="확장 설정">⚙</button>
+</div>
+<main class="wrap" id="main">
+  <section class="card">
+    <div class="h">지금 ERP 화면</div>
+    <div id="cur" class="sub">ERP 탭을 연 상태에서 분석하세요.</div>
+    <div class="row"><button class="btn" id="analyze" type="button">🔍 이 화면 구조 분석</button></div>
+    <p class="hint">화면의 입력란·편집기·제목을 찾아 서무비서 초안 항목과 연결합니다. 한 번 연결해 두면 <b>📥 ERP에 넣기</b>가 여러 칸을 한 번에 채웁니다. 어떤 ERP·그룹웨어든 이렇게 맞출 수 있습니다.</p>
+  </section>
+  <section class="card" id="edit" hidden></section>
+  <section class="card">
+    <div class="h">저장된 화면 규칙 <span class="sub" id="savedSub"></span></div>
+    <div id="saved" class="list"></div>
+    <div class="row">
+      <button class="btn ghost sm" id="export" type="button">⬇ 내 규칙 내보내기</button>
+      <label class="btn ghost sm">⬆ 가져오기<input type="file" id="import" accept=".json,application/json" hidden></label>
+      <button class="btn ghost sm" id="refresh" type="button">↻ 기관 규칙 새로고침</button>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="config.js"></script>
+<script src="erp.js"></script>
+</body>
+</html>

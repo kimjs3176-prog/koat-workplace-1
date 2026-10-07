@@ -40,7 +40,7 @@ function _lsPut(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); return t
 function personal(){ const p=_ls(LS_PERSONAL,{}); p.procedures=Array.isArray(p.procedures)?p.procedures:[]; p.notes=p.notes||{}; return p; }
 function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
-function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); }
+function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); if(typeof syncDeadlines==='function') syncDeadlines(); }
 let _toastT=null;
 function toast(m,ms){ const el=document.getElementById('toast'); if(!el) return; el.textContent=m; el.classList.add('show');
   clearTimeout(_toastT); _toastT=setTimeout(()=>el.classList.remove('show'), ms||2600); }
@@ -230,8 +230,11 @@ async function start(opts){
     // 확장 → 앱: ERP 화면에서 감지한 업무로 바로 안내(패널을 다시 읽지 않아 진행 상태가 유지됨)
     window.addEventListener('message', e=>{ const m=e.data; if(e.source!==window.parent || !m || m.src!=='koat-sec-ext') return;
       if(m.type==='ask' && m.q){ S.view='home'; ask(String(m.q).slice(0,200)); }
+      else if(m.type==='hello'){ S.extVersion=String(m.version||''); checkExtUpdate(); }
       else if(m.type==='inserted'){
-        if(m.ok){ toast('ERP 입력란에 넣었습니다. 내용을 확인하세요.', 4200); return; }
+        if(m.ok && m.mapped){ const d=allDrafts()[(S._draft||{}).key]||{}; const lb=k=>k==='_title'?'제목':k==='_body'?'본문':(((d.fields||[]).find(f=>f.k===k)||{}).l||k);
+          toast(`ERP '${m.screen||'화면'}'의 ${m.filled.length}칸을 채웠습니다(${m.filled.map(lb).join(', ')}).${(m.missing||[]).length?' 못 찾은 칸: '+m.missing.map(lb).join(', '):''} 내용을 확인하세요.`, 6000); return; }
+        if(m.ok){ toast('ERP 입력란에 넣었습니다. 내용을 확인하세요.'+(m.mappedButMissed?' (연결해 둔 칸을 이 화면에서 찾지 못해 마지막으로 누른 칸에 넣었습니다)':''), 4200); return; }
         // 넣을 칸을 못 찾으면 클립보드로 — ERP에서 Ctrl+V
         const t=S._lastInsert||''; const done=()=>toast((m.error?m.error+' ':'ERP에서 넣을 칸을 찾지 못했습니다. ')+'초안을 복사해 두었으니 ERP 입력란에 붙여넣기(Ctrl+V) 하세요.', 5200);
         (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(done).catch(()=>toast(m.error||'ERP 입력란을 먼저 한 번 누른 뒤 다시 시도하세요.', 4200)); }
@@ -240,9 +243,10 @@ async function start(opts){
   bind(w); bindViewer(); loadFormsStatus();
   try{ await load(); }
   catch(e){ w.innerHTML=`<div class="sec-empty">절차 목록을 불러오지 못했습니다. <button class="sec-btn" data-a="retry">다시 시도</button></div>`; return; }
+  syncDeadlines();
   if(opts.reg) openReg(opts.reg);
   if(opts.q){ ask(opts.q); return; }
-  if(opts.view && ['list','history','forms','manage'].includes(opts.view)) S.view=opts.view;
+  if(opts.view && ['list','history','forms','manage','cal','ext'].includes(opts.view)) S.view=opts.view;
   render();
 }
 
@@ -278,7 +282,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -295,6 +299,7 @@ function render(){
   else if(S.view==='cal') body=calView();
   else if(S.view==='manage') body=manageView();
   else if(S.view==='edit') body=editView();
+  else if(S.view==='ext') body=extView();
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
   if(S.view==='proc') loadOpenBasis();
   if(S.view==='forms') loadForms();
@@ -314,7 +319,36 @@ function homeView(){
     cats.map(([cat,ps])=>`<div class="sec-cat"><div class="sec-cat-h">${esc(cat)}</div>`+ps.map(p=>`<button class="sec-proc-l" data-a="proc" data-id="${esc(p.id)}"><span>${esc(p.icon||'📌')}</span><span>${esc(shortTitle(p.title))}</span>${p._layer!=='common'?`<span class="sec-layer ${p._layer}">${LAYER_LABEL[p._layer]}</span>`:''}</button>`).join('')+`</div>`).join('')+
     `</div></div>`;
   const how=`<div class="sec-how"><b>서무비서는 이렇게 돕습니다</b> — ① 상황을 말하면 해당 절차를 찾고 ② 기준일을 넣으면 단계별 기한을 계산해 다음 할 일을 짚어 주며 ③ 단계마다 필요한 서식(원본)과 근거 조문, 문서 초안을 바로 꺼내 줍니다. 진행 상황은 <b>처리 이력</b>에 남아 담당자가 바뀌어도 이어갈 수 있어요.</div>`;
-  return ex+todo+grid+how;
+  return extHero()+ex+todo+grid+how;
+}
+// ── 확장이 메인: 웹 화면은 설치 안내·보조 ─────────────────────────────────
+// 확장이 설치되어 있으면 서무비서 웹 화면에 data-sec-ext(버전)를 달아 준다(확장의 marker.js).
+function extInstalled(){ return document.documentElement.getAttribute('data-sec-ext')||''; }
+function extHero(){
+  if(EMBED) return '';
+  const v=extInstalled();
+  if(v) return `<div class="sec-ext-ok"><span>🧩 <b>서무비서 확장 ${esc(v)}</b>이 설치되어 있습니다 — ERP 화면에서 <b>🗂</b>(또는 <b>Alt+Shift+S</b>)로 여세요. 상신 전 점검·기한 알림도 확장이 맡습니다.</span>`+
+    `<button class="sec-btn sm" data-a="extpanel">이 탭 옆에 패널 열기</button></div>`;
+  if(_ls('koat_sec_herox',0)>Date.now()) return '';
+  const b=browserKind();
+  return `<div class="sec-ext-cta"><div class="sec-ext-cta-m"><div class="sec-ext-cta-t">🧩 서무비서는 <b>ERP 옆에서</b> 쓰는 브라우저 확장이 기본입니다</div>`+
+    `<ul><li>ERP 화면을 열면 그 업무의 <b>절차·기한·반려 점검</b>을 옆 패널에 바로</li><li>만든 초안을 ERP의 <b>여러 칸에 한 번에</b> 입력</li><li><b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 확인</li><li>도구 모음 아이콘에 <b>다가오는 기한</b>, 당일 바탕화면 알림</li></ul></div>`+
+    `<div class="sec-ext-cta-a">${b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치할 수 있습니다</span>`:`<button class="sec-btn primary" data-a="view" data-v="ext">🧩 확장 설치하기</button>`}`+
+    `<button class="sec-linkbtn" data-a="herox">웹에서 계속 쓰기</button></div></div>`;
+}
+// 처리 중인 건의 다가오는 기한 → 확장(아이콘 배지·바탕화면 알림). 패널 안이면 패널로, 일반 탭이면 marker.js 로.
+let _dlTimer=null, _dlLast='';
+function syncDeadlines(){
+  if(!EMBED && !extInstalled()) return;
+  clearTimeout(_dlTimer);
+  _dlTimer=setTimeout(()=>{
+    const lo=addDays(today(),-60), hi=addDays(today(),60);
+    const items=allDeadlines().filter(d=>d.date>=lo && d.date<=hi).slice(0,200)
+      .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}));
+    const key=JSON.stringify(items); if(key===_dlLast) return; _dlLast=key;
+    if(EMBED) toExt({type:'deadlines', items});
+    else window.postMessage({src:'koat-sec', type:'deadlines', items}, location.origin);
+  }, 400);
 }
 function shortTitle(t){ return String(t||'').split(' — ')[0]; }
 function catGroups(){
@@ -575,6 +609,7 @@ function configCard(){
     f('service.tagline','한 줄 소개',v.tagline,'상황을 말하면 절차·기한·서식·근거 안내')+f('service.footer','하단 안내',v.footer,'')+
     `<div class="sec-card-h" style="margin-top:6px;">명칭 <span class="sec-sub">절차 문장의 [[erp]] 등이 이 이름으로 바뀝니다</span></div>`+
     `<div class="sec-eg">${f('terms.erp','업무 시스템',t.erp,'ERP')}${f('terms.portal','내부 포털',t.portal,'그룹웨어')}${f('terms.accounting','회계 담당 부서',t.accounting,'회계부서')}${f('terms.approval','결재 시스템',t.approval,'전자결재')}</div>`+
+    `<label class="sec-f"><span>ERP·그룹웨어 주소(줄마다 하나) <span class="sec-sub">🧩 ERP 확장 배포본에 들어갑니다. 예) https://kerp.koat.or.kr</span></span><textarea data-a="cfgerp" rows="2" placeholder="https://kerp.koat.or.kr">${esc(((c.erp||{}).hosts||[]).map(h=>h.replace(/\/\*$/,'')).join('\n'))}</textarea></label>`+
     `<label class="sec-f"><span>기관 휴일(줄마다 "YYYY-MM-DD 이름") <span class="sec-sub">법정 공휴일은 기본 탑재 — 창립기념일·근로자의 날 등만 적으세요</span></span><textarea data-a="cfghol" rows="3" placeholder="2026-05-01 근로자의 날">${esc(hol)}</textarea></label>`+
     `<div class="sec-row"><button class="sec-btn primary sm" data-a="cfgsave">기관 설정 저장</button><span class="sec-sub">${S.cfg.updated?'최종 저장 '+esc(S.cfg.updated):''}</span></div></details>`;
 }
@@ -764,7 +799,7 @@ function openDraft(key){
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
-    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 화면에서 마지막으로 누른 입력란(본문·제목 등)에 넣습니다">📥 ERP 입력란에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 맞춤으로 연결한 칸들에 한 번에 넣고, 연결이 없으면 ERP에서 마지막으로 누른 칸에 넣습니다">📥 ERP에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
     `<div id="secFormsRow">${formsRow(key)}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
   const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
@@ -772,7 +807,10 @@ function openDraft(key){
   body.addEventListener('change', e=>{ const el=e.target; if(el.dataset.da!=='ffile') return; const f=el.files&&el.files[0]; el.value=''; if(f) formsUpload(key, d, f); });
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
     if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
-    else if(b.dataset.da==='erp'){ S._lastInsert=txt; toExt({type:'insert', text:txt}); }
+    else if(b.dataset.da==='erp'){ S._lastInsert=txt;
+      // ERP 맞춤(칸 연결)이 있는 화면이면 항목별로 여러 칸에 — 항목 값과 초안 전체를 함께 보낸다
+      const vals={}; (d.fields||[]).forEach(f=>{ const v=String(S._draft.vals[f.k]||'').trim(); if(v) vals[f.k]=v; });
+      toExt({type:'insert', text:txt, draft:key, values:vals}); }
     else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
     else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
     else if(b.dataset.da==='fgen'){ formsGenerate(d, S._draft.vals); }
@@ -947,6 +985,9 @@ function bind(panel){
       case 'insrj': promoteReason(D.id, D.t); break;
       case 'insdel': deleteReason(D.id, D.t); break;
       case 'insall': S.insAll=null; loadInsAll(); break;
+      case 'herox': _lsPut('koat_sec_herox', Date.now()+30*86400000); render(); break;
+      case 'extpanel': window.postMessage({src:'koat-sec', type:'openPanel'}, location.origin); toast('확장 패널을 엽니다. 열리지 않으면 도구 모음의 서무비서 아이콘을 누르세요.'); break;
+      case 'copyext': { const t=D.t||''; (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast(t+' 를 복사했습니다. 주소창에 붙여넣으세요.')).catch(()=>toast('주소창에 '+t+' 를 직접 입력하세요.')); break; }
       case 'formsq': S.formsQ=D.q||''; S.view='forms'; render(); break;
       case 'tocal': addDeadlinesToCalendar(); break;
       case 'newcase': S.caseId=null; render(); toast('새 건으로 시작합니다. 체크하거나 기준일을 넣으면 저장돼요.'); break;
@@ -1004,6 +1045,7 @@ function bind(panel){
     if(a==='formsin'){ S.formsQ=el.value; renderFormsList(); return; }
     if(a==='tokg'){ S._tok=el.value.trim(); return; }
     if(a==='cfg'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); const [g,k]=el.dataset.p.split('.'); c[g]=c[g]||{}; c[g][k]=el.value; return; }
+    if(a==='cfgerp'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}, {hosts:el.value.split('\n').map(x=>x.trim()).filter(Boolean)}); return; }
     if(a==='cfghol'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.holidays=c.holidays||{};
       c.holidays.extra=el.value.split('\n').map(l=>l.trim().match(/^(\d{4}-\d{2}-\d{2})\s*(.*)$/)).filter(Boolean).map(m=>({date:m[1], name:m[2]||'기관 휴일'})); return; }
     if(a==='pnote'){ const per=personal(); if(el.value.trim()) per.notes[S.procId]=el.value; else delete per.notes[S.procId]; savePersonal(per); }
@@ -1534,6 +1576,59 @@ function formsUpload(key, d, file){
     const row=document.getElementById('secFormsRow'); if(row) row.innerHTML=formsRow(key);
     formsFill(key, d, S._draft.vals); };
   r.readAsDataURL(file);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑦ 🧩 ERP 확장 — 설치 페이지(이 서버 주소·기관 ERP 주소가 들어간 배포본) · 새 버전 알림
+// ═══════════════════════════════════════════════════════════════════════════
+function loadExtInfo(){
+  if(S.extInfo) return Promise.resolve(S.extInfo);
+  return fetch('/api/secretary/extension/info').then(r=>r.json()).then(d=>{ S.extInfo=d.success?d:{error:true}; return S.extInfo; }).catch(()=>{ S.extInfo={error:true}; return S.extInfo; });
+}
+const verLt=(a,b)=>{ const x=String(a).split('.').map(Number), y=String(b).split('.').map(Number); for(let i=0;i<3;i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
+function checkExtUpdate(){
+  loadExtInfo().then(i=>{ if(i.version && S.extVersion && verLt(S.extVersion, i.version))
+    toast(`서무비서 확장 새 버전 ${i.version}이 있습니다(지금 ${S.extVersion}). 🧩 ERP 확장 탭에서 받아 주세요.`, 6000); });
+}
+function browserKind(){ const u=navigator.userAgent; return /Edg\//.test(u)?'edge':/Whale\//.test(u)?'whale':/Chrome\//.test(u)?'chrome':'other'; }
+function extView(){
+  const i=S.extInfo; if(!i){ loadExtInfo().then(()=>{ if(S.view==='ext') render(); }); return `<div class="assist-loading"><div class="spinner"></div><span>불러오는 중...</span></div>`; }
+  const b=browserKind();
+  const page=b==='edge'?'edge://extensions':b==='whale'?'whale://extensions':'chrome://extensions';
+  const bname={edge:'Microsoft Edge',chrome:'Chrome',whale:'네이버 웨일',other:'Chrome 또는 Edge'}[b];
+  const hosts=(i.erp_hosts||[]).map(h=>h.replace(/\/\*$/,''));
+  const dev=b==='edge'?"왼쪽 메뉴(또는 아래쪽)의 <b>개발자 모드</b>를 켭니다.":"오른쪽 위의 <b>개발자 모드</b>를 켭니다.";
+  const load=b==='edge'?"<b>압축을 푼 파일 로드</b>(압축 해제된 항목 로드)를 누르고":"<b>압축해제된 확장 프로그램을 로드합니다</b>를 누르고";
+  const step=(n,html)=>`<li class="sec-ext-st"><span class="sec-plan-n">${n}</span><div>${html}</div></li>`;
+  const installed=EMBED&&S.extVersion;
+  return `<div class="sec-card sec-ext-hero"><div class="sec-ext-ic">🧩</div><div><div class="sec-card-h">서무비서 ERP 확장 <span class="sec-sub">${esc(bname)}용 · 버전 ${esc(i.version||'')}</span></div>`+
+      `<ul class="sec-tips"><li>ERP·그룹웨어 화면 <b>옆 패널</b>에서 절차·기한·서식·근거·사전 감사를 봅니다.</li>`+
+      `<li>ERP에서 출장·휴가·지출결의 같은 화면을 열면 <b>이 업무 안내</b>를 바로 띄웁니다.</li>`+
+      `<li>만든 초안을 <b>ERP의 여러 칸에 한 번에</b> 넣습니다(제목·기간·출장지·본문…).</li>`+
+      `<li>어떤 ERP든 <b>🔧 ERP 맞춤</b>으로 화면 구조를 분석해 칸을 연결합니다.</li>`+
+      `<li>ERP에서 <b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 보여 줍니다.</li>`+
+      `<li>도구 모음 아이콘에 <b>다가오는 기한</b>을 표시하고, 오늘·내일 기한은 바탕화면으로 알립니다.</li></ul></div></div>`+
+    (installed?`<div class="sec-notice ${verLt(S.extVersion,i.version)?'warn':'info'}">${verLt(S.extVersion,i.version)?`⚠ 설치된 확장 ${esc(S.extVersion)} — 새 버전 ${esc(i.version)}을 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.`:`✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).`}</div>`:'')+
+    (b==='other'?`<div class="sec-notice warn">이 브라우저에서는 확장을 쓸 수 없습니다. <b>Chrome</b>이나 <b>Microsoft Edge</b>로 이 페이지를 여세요.</div>`:'')+
+    `<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
+      step(1,`<a class="sec-btn primary" href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 받기 (v${esc(i.version||'')})</a>`+
+        `<div class="sec-sub">이 서무비서 주소${hosts.length?`와 ERP 주소(${esc(hosts.join(', '))})`:''}가 미리 들어 있어 따로 설정하지 않아도 됩니다.</div>`)+
+      step(2,`받은 <code>secretary-extension-${esc(i.version||'')}.zip</code>을 <b>압축 풀기</b> → <code>secretary-extension</code> 폴더가 생깁니다. 지우지 말고 둘 곳(예: 문서 폴더)에 두세요.`)+
+      step(3,`주소창에 <code>${page}</code>를 입력해 엽니다. <button class="sec-btn sm ghost" data-a="copyext" data-t="${page}">📋 주소 복사</button>`)+
+      step(4,dev)+
+      step(5,`${load} <code>secretary-extension</code> 폴더를 고릅니다.`)+
+      step(6,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
+    `</ol><div class="sec-hint">새 버전이 나오면 1번에서 다시 받아 같은 폴더에 덮어쓰고, ${page} 에서 서무비서의 ↻(새로고침)을 누르면 됩니다. 처리 이력 등은 그대로 남습니다.</div></div>`+
+    `<div class="sec-card"><div class="sec-card-h">🔧 우리 ERP에 맞추기 <span class="sec-sub">어떤 ERP·그룹웨어든</span></div><ol class="sec-ext-steps">`+
+      step(1,`ERP에서 맞출 화면(예: 출장복명서 작성)을 엽니다.`)+
+      step(2,`서무비서 패널 위의 <b>🔧</b>(ERP 맞춤) → <b>이 화면 구조 분석</b>. 화면의 입력란·편집기·제목을 찾고, 이름이 맞는 칸은 초안 항목과 자동으로 연결해 둡니다.`)+
+      step(3,`연결을 고치고(👁로 위치 확인, 🎯로 화면에서 직접 고르기) <b>▶ 시험 채우기</b>로 확인합니다.`)+
+      step(4,`<b>내 브라우저에 저장</b> — 나만 쓰기. 관리자는 <b>기관 전체에 공유</b>하면 모든 직원의 확장이 같은 규칙을 받습니다.`)+
+    `</ol></div>`+
+    `<details class="sec-card"><summary class="sec-card-h">관리자: 기관 PC 일괄 배포</summary><div class="sec-hint">`+
+      `· 확장에 들어갈 ERP 주소는 <button class="sec-linkbtn" data-a="view" data-v="manage">⚙ 규정·절차 관리 › 🏢 기관 설정</button>의 'ERP·그룹웨어 주소'에서 바꿉니다.<br>`+
+      `· 직원마다 설치하지 않으려면 받은 zip을 Chrome 웹 스토어·Edge 추가 기능에 <b>비공개(조직 한정)</b>로 올리고, 그룹 정책 <code>ExtensionInstallForcelist</code>에 확장 ID를 넣어 일괄 설치합니다.<br>`+
+      `· 개발자 모드 설치는 일부 기관 보안 정책에서 막혀 있을 수 있습니다. 그때는 위 일괄 배포를 쓰세요.</div></details>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
