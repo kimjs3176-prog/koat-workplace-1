@@ -10,6 +10,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const uid = () => "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 function toast(m, ms) { const t = $("toast"); t.textContent = m; t.classList.add("show"); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), ms || 2600); }
 const send = (m) => chrome.runtime.sendMessage(m);
+const dlog = (ev, data) => chrome.runtime.sendMessage({ type: "log", src: "erp-tool", ev, data }).catch(() => {});
 const originOf = (u) => { try { const x = new URL(u); return x.origin + "/*"; } catch (e) { return ""; } };
 
 // 서무비서 초안 항목 + 공통 항목(제목·본문 전체)
@@ -67,6 +68,7 @@ async function analyze() {
   $("analyze").disabled = false; $("analyze").textContent = "🔍 이 화면 구조 분석";
   if (!r || !r.ok) { toast((r && r.error) || "분석하지 못했습니다.", 5000); return; }
   ana = r;
+  dlog("analyze", { url: r.url, frames: r.frames.map((f) => ({ path: f.path, fields: (f.fields || []).map((x) => x.label + ":" + x.kind) })) });
   const fields = r.frames.flatMap((f) => f.fields || []);
   // 칸이 가장 많은 프레임(= 실제 서식 화면)의 제목 요소를 앞에, 문서 제목(탭 이름)은 뒤에
   const main = [...r.frames].sort((a, b) => (b.fields || []).length - (a.fields || []).length)[0] || r.frames[0] || {};
@@ -220,6 +222,7 @@ async function save(org) {
     p.screens = [sc, ...p.screens.filter((x) => x.id !== sc.id)];
     await chrome.storage.local.set({ myProfiles: list });
     await send({ type: "profilesChanged" });
+    dlog("rule.save", { where: "mine", name: sc.name, match: sc.match, draft: sc.draft, proc: sc.proc, fields: sc.fields.map((f) => f.key + "←" + (f.label || f.sel)) });
     toast("내 브라우저에 저장했습니다. ERP 화면에 바로 적용됩니다.");
   } else {
     if (!server) { toast("서무비서 주소를 먼저 설정하세요."); return; }

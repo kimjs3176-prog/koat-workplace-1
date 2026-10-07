@@ -12,14 +12,24 @@
   chrome.runtime.onMessage.addListener((m) => { if (m.type === "guard") guard = m.guard; });
   chrome.runtime.sendMessage({ type: "getGuard" }).then((g) => { if (g && g.guard) guard = g.guard; }).catch(() => {});
 
+  const dlog = (ev, data) => { try { chrome.runtime.sendMessage({ type: "log", src: "guard", ev, data }).catch(() => {}); } catch (e) {} };
+  // 상신일 수도 있는 버튼(이름에 이런 말이 들어간 것) — 가로채지 않았을 때도 이름을 남겨 규칙을 보강한다
+  const MAYBE = /상신|결재|제출|기안|신청|승인|요청|보내기|발송|완료/;
   function labelOf(el) { return String(el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").replace(/\s+/g, " ").trim(); }
   document.addEventListener("click", (e) => {
-    if (bypass || !guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
+    if (bypass) return;
     const el = e.target.closest && e.target.closest('button,a,input[type="button"],input[type="submit"],[role="button"],[onclick]');
     if (!el) return;
     const t = labelOf(el);
-    if (!t || t.length > 14 || !SUBMIT.test(t)) return;
+    const isSubmit = !!t && t.length <= 14 && SUBMIT.test(t);
+    if (t && t.length <= 20 && (isSubmit || MAYBE.test(t))) {
+      dlog("button", { label: t, submit: isSubmit, tag: el.tagName.toLowerCase(), id: el.id || "",
+        guard: guard ? { proc: guard.proc, n: (guard.pitfalls || []).length, enabled: guard.enabled } : null, acked: acked() });
+    }
+    if (!guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
+    if (!isSubmit) return;
     e.preventDefault(); e.stopImmediatePropagation();
+    dlog("guard.show", { label: t, proc: guard.proc, n: guard.pitfalls.length });
     show(el, t);
   }, true);
 
@@ -63,9 +73,10 @@
     const close = () => { host.remove(); doc.removeEventListener("keydown", key, true); };
     const key = (e) => { if (e.key === "Escape") close(); };
     doc.addEventListener("keydown", key, true);
-    sh.querySelector('[data-a="no"]').addEventListener("click", close);
+    sh.querySelector('[data-a="no"]').addEventListener("click", () => { dlog("guard.cancel", { label }); close(); });
     sh.querySelector('[data-a="more"]').addEventListener("click", () => { chrome.runtime.sendMessage({ type: "open", q: guard.q || guard.title }).catch(() => {}); });
     go.addEventListener("click", () => {
+      dlog("guard.continue", { label, checked: [...sh.querySelectorAll("input")].filter((x) => x.checked).length, total: ps.length });
       try { sessionStorage.setItem(ackKey(), String(Date.now())); } catch (e) {}
       close();
       bypass = true; try { btn.click(); } finally { setTimeout(() => { bypass = false; }, 0); }

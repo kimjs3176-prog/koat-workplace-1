@@ -84,6 +84,7 @@
 | 묻기 | ERP 글자 드래그 → 오른쪽 클릭 '서무비서에 묻기', 주소창에 `서무` + 띄어쓰기 + 상황 |
 - **설치**: 웹 화면 **🧩 확장 설치** 탭에서 받습니다. 이 서버 주소와 기관 ERP 주소(⚙ 기관 설정 › ERP·그룹웨어 주소)가 미리 들어 있습니다. 명령으로 만들려면 `python scripts/build_extension.py --server https://<서무비서 주소>`.
 - 웹 화면은 확장이 설치되어 있는지 알아보고, 설치되어 있으면 설치 안내 대신 'ERP에서 쓰세요'를 보여 줍니다.
+- **실제 ERP 시험**: 패널의 🩺 진단 센터에서 화면 구조·동작 기록을 보고서로 받아 `scripts/diag_report.py`로 분석합니다([docs/ERP_TEST.md](docs/ERP_TEST.md)).
 - 설치·배포·ERP 맞춤 자세히: [extension/README.md](extension/README.md)
 
 ### 다른 기관에서 쓰기(호환성)
@@ -183,6 +184,8 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 ├── secretary/holidays.json    # 법정 공휴일·대체공휴일
 ├── secretary/schema/          # 절차·절차 팩·기관 설정 JSON 스키마
 ├── docs/ADOPTION.md           # 다른 기관 도입 가이드
+├── docs/ERP_TEST.md           # 실제 ERP 시험 순서(🩺 진단 보고서)
+├── scripts/diag_report.py     # 진단 보고서 요약·수정 후보 뽑기
 ├── upload.html                # 내규 업로드 페이지
 ├── api_server.py              # Flask API 서버
 ├── api/index.py               # Vercel 서버리스 진입점

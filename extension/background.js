@@ -1,6 +1,6 @@
 // 서무비서 확장 — 서비스 워커
 // 역할: 사이드 패널 열기, ERP 화면 감지 결과 전달, 초안을 ERP 입력란(마지막으로 누른 칸)에 넣기, 오른쪽 클릭 메뉴
-importScripts("config.js");
+importScripts("config.js", "diaglog.js");
 
 const state = {};            // tabId → {focusFrame, context:{label,q,title}}
 const PANEL_FALLBACK = !chrome.sidePanel || !chrome.sidePanel.open;
@@ -47,7 +47,8 @@ async function registerExtraHosts() {
 
 async function openPanel(tab) {
   if (!PANEL_FALLBACK) {
-    try { await chrome.sidePanel.open({ tabId: tab.id }); return; } catch (e) { /* 사용자 동작 밖에서 호출된 경우 등 */ }
+    try { await chrome.sidePanel.open({ tabId: tab.id }); diag("bg", "panel.open", { ok: true }); return; }
+    catch (e) { diag("bg", "panel.open", { ok: false, err: e.message }); /* 사용자 동작 밖에서 호출된 경우 등 */ }
   }
   // 사이드 패널이 없는 브라우저: 화면 오른쪽에 작은 창으로
   const url = chrome.runtime.getURL("sidepanel.html") + "?tab=" + tab.id;
@@ -67,8 +68,9 @@ async function serverProfiles(force) {
     const d = await r.json();
     const list = (d && d.profiles) || [];
     await chrome.storage.local.set({ srvProfiles: { ts: Date.now(), list, updated: d.updated || "" } });
+    diag("bg", "profiles.fetch", { ok: true, profiles: list.length, screens: list.reduce((a, p) => a + (p.screens || []).length, 0) });
     return list;
-  } catch (e) { return (srvProfiles && srvProfiles.list) || []; }
+  } catch (e) { diag("bg", "profiles.fetch", { ok: false, err: e.message }); return (srvProfiles && srvProfiles.list) || []; }
 }
 async function allProfiles(force) {
   const srv = await serverProfiles(force);
@@ -90,9 +92,13 @@ async function profilesFor(url) { return (await allProfiles()).filter((p) => (p.
 
 // 모든 프레임에서 내용 스크립트 함수 실행(같은 격리 공간이라 globalThis.__sec* 를 부를 수 있다)
 async function inFrames(tabId, fn, arg) {
-  const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true },
-    func: (name, a) => (typeof globalThis[name] === "function" ? globalThis[name](a) : null), args: [fn, arg ?? null] });
-  return res.map((r) => r.result).filter((x) => x !== null && x !== undefined);
+  try {
+    const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true },
+      func: (name, a) => (typeof globalThis[name] === "function" ? globalThis[name](a) : null), args: [fn, arg ?? null] });
+    // 내용 스크립트가 없는 프레임(다른 출처·권한 밖)은 null — 진단에 프레임 수를 남긴다
+    if (fn !== "__secHighlight" && fn !== "__secPickStop") diag("bg", "frames." + fn, { frames: res.length, withScript: res.filter((r) => r.result !== null && r.result !== undefined).length });
+    return res.map((r) => r.result).filter((x) => x !== null && x !== undefined);
+  } catch (e) { diag("bg", "frames.error", { fn, err: e.message }); throw e; }
 }
 
 // 초안 → 매핑된 칸들. 지금 감지된 화면 → 같은 초안을 쓰는 화면 순으로 고른다.
@@ -109,7 +115,9 @@ async function fillMap(tabId, m) {
   const res = await inFrames(tabId, "__secFillMap", { fields, values: m.values || {}, test: !!m.test });
   const filled = [...new Set(res.flatMap((r) => r.filled || []))];
   const want = [...new Set(fields.map((f) => f.key))].filter((k) => m.test || String((m.values || {})[k] ?? "").trim());
-  return { ok: filled.length > 0, mapped: true, filled, missing: want.filter((k) => !filled.includes(k)), screen: pick[0].name };
+  const out = { ok: filled.length > 0, mapped: true, filled, missing: want.filter((k) => !filled.includes(k)), screen: pick[0].name };
+  diag("bg", "fillmap", { screen: out.screen, test: !!m.test, filled, missing: out.missing, perFrame: res.map((r) => ({ path: r.path, filled: r.filled, missing: r.missing, how: r.how })) });
+  return out;
 }
 
 // ── 서무비서 메타(절차·반려 점검 항목) — 결재 전 점검에 쓴다 ─────────────────
@@ -120,8 +128,8 @@ async function getMeta(force) {
   if (!force && meta && Date.now() - meta.ts < 30 * 60 * 1000) return meta.data;
   try {
     const data = await (await fetch(server + "/api/secretary/erp/meta", { cache: "no-store" })).json();
-    if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); return data; }
-  } catch (e) {}
+    if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); diag("bg", "meta.fetch", { ok: true, procedures: (data.procedures || []).length }); return data; }
+  } catch (e) { diag("bg", "meta.fetch", { ok: false, err: e.message }); }
   return meta ? meta.data : null;
 }
 async function guardFor(ctx) {
@@ -215,6 +223,32 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((m, sender, reply) => {
+  // ── 진단 기록 ──
+  if (m.type === "log") { diag(m.src || "content", m.ev, m.data, sender); return; }
+  if (m.type === "diag.get") {
+    diagLoad().then(async (buf) => {
+      const s = await settings();
+      const st = await chrome.storage.local.get(["myProfiles", "srvProfiles", "deadlines", "meta"]);
+      reply({ log: buf, enabled: diagOn, settings: { ...s }, version: chrome.runtime.getManifest().version,
+        profiles: { mine: st.myProfiles || [], org: (st.srvProfiles && st.srvProfiles.list) || [] },
+        deadlines: Object.fromEntries(Object.entries(st.deadlines || {}).map(([k, v]) => [k, (v.items || []).length])),
+        meta: st.meta ? { ts: st.meta.ts, procedures: ((st.meta.data || {}).procedures || []).length } : null,
+        state: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, { context: v.context || null, guard: v.guard ? { proc: v.guard.proc, n: (v.guard.pitfalls || []).length, enabled: v.guard.enabled } : null, focusFrame: v.focusFrame }])) });
+    });
+    return true;
+  }
+  if (m.type === "diag.enable") { diagSetEnabled(m.on).then(() => reply({ ok: true })); return true; }
+  if (m.type === "diag.clear") { diagClear().then(() => reply({ ok: true })); return true; }
+  if (m.type === "diag.note") { diag("user", "note", { text: String(m.text || "").slice(0, 1000) }); reply({ ok: true }); return; }
+  if (m.type === "diag.snapshot") {                       // 지금 ERP 화면 구조 스냅샷(모든 프레임)
+    inFrames(m.tabId, "__secSnapshot").then(async (frames) => {
+      const tab = await chrome.tabs.get(m.tabId);
+      const snap = { page: diagUrl(tab.url), title: tab.title, frames, context: (state[m.tabId] || {}).context || null };
+      await diag("user", "snapshot", snap, { tab });
+      reply({ ok: true, snap: diagScrub(snap) });
+    }).catch((e) => reply({ ok: false, error: e.message }));
+    return true;
+  }
   const tabId = sender.tab ? sender.tab.id : m.tabId;
   if (m.type === "focus" && sender.tab) {                 // ERP 의 어느 프레임에서 입력란을 눌렀는지
     (state[tabId] = state[tabId] || {}).focusFrame = sender.frameId;
@@ -222,7 +256,8 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     const st = (state[tabId] = state[tabId] || {});
     const cur = st.context;
     const rank = (c) => (c && typeof c.rank === "number" ? c.rank : 99);
-    if (cur && st.ctxFrame !== sender.frameId && rank(m.context) > rank(cur)) { reply && reply({ ignored: true }); return; }
+    if (cur && st.ctxFrame !== sender.frameId && rank(m.context) > rank(cur)) { diag("bg", "context.ignored", { got: m.context, kept: cur }, sender); reply && reply({ ignored: true }); return; }
+    diag("bg", "context", m.context, sender);
     st.context = m.context; st.ctxFrame = sender.frameId;
     guardFor(m.context).then((g) => {                     // 결재 전 점검 항목을 그 탭의 모든 프레임에
       if (!g) return;
@@ -246,8 +281,8 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     const st = state[m.tabId] || {};
     const opts = st.focusFrame !== undefined ? { frameId: st.focusFrame } : { frameId: 0 };
     chrome.tabs.sendMessage(m.tabId, { type: "insert", text: m.text }, opts)
-      .then((r) => reply(r || { ok: false }))
-      .catch(() => reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }));
+      .then((r) => { diag("bg", "insert", { frameId: opts.frameId, ok: !!(r && r.ok), where: r && r.where, len: String(m.text || "").length }); reply(r || { ok: false }); })
+      .catch((e) => { diag("bg", "insert", { frameId: opts.frameId, ok: false, err: e.message }); reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }); });
     return true;
   } else if (m.type === "getProfiles") {                 // 내용 스크립트: 이 사이트의 화면 규칙
     profilesFor(m.url || (sender.tab && sender.tab.url) || "").then((profiles) => reply({ profiles }));

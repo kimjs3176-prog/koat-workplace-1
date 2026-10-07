@@ -3359,7 +3359,7 @@ _SEC_ERP_CACHE = {"ts": 0.0, "data": None}
 
 @app.after_request
 def _sec_ext_cors(resp):
-    if request.path.startswith("/api/secretary/erp/") or request.path.startswith("/api/secretary/extension"):
+    if request.path.startswith(("/api/secretary/erp/", "/api/secretary/extension", "/api/secretary/diag")):
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Upload-Token"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -3483,6 +3483,41 @@ def secretary_erp_profiles():
         return jsonify({"success": False, "error": str(e)}), 502
     _SEC_ERP_CACHE.update({"ts": time.time(), "data": {k: data[k] for k in ("profiles", "updated", "updated_by")}})
     return jsonify({"success": True, "message": where, "profiles": data["profiles"], "updated": data["updated"]})
+
+
+SEC_DIAG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diag")
+
+
+@app.route("/api/secretary/diag", methods=["POST", "OPTIONS"])
+def secretary_diag_upload():
+    """확장 '진단 센터'의 진단 보고서(동작 기록) 받기 — 실제 ERP 시험 뒤 규칙·매핑을 고치는 데 쓴다.
+    입력값(본문)은 확장이 애초에 기록하지 않으며, 관리자 토큰이 있어야 저장된다."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    ok, why = _upload_authorized()
+    if not ok:
+        return jsonify({"success": False, "error": why}), 401
+    raw = request.get_data(cache=False, as_text=True) or ""
+    if len(raw) > 3_000_000:
+        return jsonify({"success": False, "error": "진단 보고서가 너무 큽니다(3MB 초과). '기록 지우기' 후 다시 시험해 주세요."}), 413
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return jsonify({"success": False, "error": "JSON 형식이 아닙니다."}), 400
+    if not isinstance(body, dict) or body.get("kind") != "secretary-diag" or not isinstance(body.get("log"), list):
+        return jsonify({"success": False, "error": "서무비서 진단 보고서가 아닙니다."}), 400
+    stamp = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d-%H%M%S")
+    name = f"{stamp}-{base64.b32encode(os.urandom(5)).decode().lower()}.json"
+    body["received"] = _now_kst()
+    payload = json.dumps(body, ensure_ascii=False, indent=1) + "\n"
+    try:
+        where = _sec_save_repo_file(f"diag/{name}", os.path.join(SEC_DIAG_DIR, name), payload,
+                                    f"서무비서 진단 보고서 {stamp} ({len(body['log'])}건)")
+    except OSError:
+        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    return jsonify({"success": True, "path": f"diag/{name}", "message": where})
 
 
 def _sec_tx(text: str, cfg: dict) -> str:
