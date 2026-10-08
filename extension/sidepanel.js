@@ -92,6 +92,10 @@ chrome.runtime.onMessage.addListener((m) => {
   if (m.type === "ask" && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
     bound = tabId = m.tabId; refreshContext(false); ask(m.q); return;
   }
+  // ERP 팝업 창(기안 작성 창 등)에서 업무를 알아보면 이 창의 패널이 그 팝업 탭에 붙는다
+  if (m.type === "context" && m.context && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
+    bound = tabId = m.tabId;
+  }
   if (tabId != null && m.tabId !== tabId) return;
   if (m.type === "context") {
     showCtx(m.context);

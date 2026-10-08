@@ -7,6 +7,19 @@
 (() => {
   if (window.__secLoaded) return; window.__secLoaded = true;
   const TOP = window === window.top;
+  // 🗂 버튼을 그릴 프레임: 보통은 맨 위. 맨 위가 <frameset>(온나라 등 옛 구조)이면 그 안의 가장 큰 프레임
+  function uiFrame() {
+    if (TOP) return !(document.body && document.body.tagName === "FRAMESET");
+    try {
+      if (window.parent !== window.top || window.top.document.body.tagName !== "FRAMESET") return false;
+      let best = null, area = -1;
+      for (let i = 0; i < window.top.frames.length; i++) {
+        const f = window.top.frames[i]; const a = (f.innerWidth || 0) * (f.innerHeight || 0);
+        if (a > area) { area = a; best = f; }
+      }
+      return best === window;
+    } catch (e) { return false; }
+  }
   let lastEditable = null;
   let profiles = [];                         // 이 사이트에 맞는 ERP 프로필(서비스 워커가 줌)
 
@@ -283,7 +296,7 @@
 
   chrome.runtime.onMessage.addListener((m, _s, reply) => {
     if (m.type === "insert") { reply(insertText(String(m.text || ""))); }
-    else if (m.type === "chip" && TOP) { setChip(m.q || "", m.title || ""); }
+    else if (m.type === "chip" && uiFrame()) { setChip(m.q || "", m.title || ""); }
     else if (m.type === "profiles") { profiles = m.profiles || []; lastSent = ""; schedule(); }
   });
 
@@ -360,12 +373,12 @@
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("hashchange", schedule);
   chrome.runtime.sendMessage({ type: "getProfiles", url: location.href }).then((r) => { profiles = (r && r.profiles) || []; schedule(); }).catch(() => schedule());
-  if (TOP) setTimeout(() => setChip("", ""), 0);   // 감지 전에도 🗂 버튼은 보이게
+  setTimeout(() => { if (uiFrame()) setChip("", ""); }, TOP ? 0 : 800);   // 감지 전에도 🗂 버튼은 보이게(frameset 은 프레임이 다 뜬 뒤 판단)
 
   // ── 🗂 버튼(맨 위 프레임) ───────────────────────────────────
   let host = null, chipQ = "";
   function ui() {
-    if (host || !TOP || !document.body) return host;
+    if (host || !uiFrame() || !document.body) return host;
     host = document.createElement("div");
     host.id = "koat-sec-ext";
     const sh = host.attachShadow({ mode: "closed" });
@@ -389,7 +402,7 @@
     return host;
   }
   function setChip(q, title) {
-    if (!TOP) return;
+    if (!uiFrame()) return;
     chrome.runtime.sendMessage({ type: "settings" }).then((s) => {
       if (!s || s.floating === false) { if (host) host.remove(), host = null; return; }
       const h = ui(); if (!h) return;
