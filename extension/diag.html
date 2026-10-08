@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>진단 센터 — 서무비서</title>
 <link rel="stylesheet" href="panel.css">
-<link rel="stylesheet" href="erp.css">
+<link rel="stylesheet" href="ui.css">
 <style>
 body{display:block;overflow:auto}
 .wrap{max-width:980px;margin:0 auto}
@@ -27,6 +27,11 @@ tr.err td{background:rgba(220,38,38,.08)}
 tr.user td{background:var(--gl)}
 pre{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:280px;overflow:auto;border:1px solid var(--bd);border-radius:8px;padding:8px;margin:0}
 .ok{color:#047857}.bad{color:#b91c1c}
+.fd{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.fd li{border:1px solid var(--bd);border-left-width:4px;border-radius:8px;padding:8px 10px;font-size:13px;line-height:1.5}
+.fd li.high{border-left-color:#dc2626}.fd li.mid{border-left-color:#d97706}.fd li.info{border-left-color:#2563eb}.fd li.good{border-left-color:#059669}
+.fd b{display:block}.fd .fix{color:var(--mu);font-size:12.5px;margin-top:2px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:13px}.kv dt{color:var(--mu)}.kv dd{margin:0}
 </style>
 </head>
 <body>
@@ -37,22 +42,27 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:280px;ov
   <section class="card">
     <div class="h">실제 ERP 시험 순서</div>
     <ol class="sub" style="margin:0;padding-left:18px;line-height:1.8">
-      <li>ERP 화면을 열고 평소처럼 서무비서를 써 봅니다(패널 안내, 🔧 ERP 맞춤, 📥 ERP에 넣기, 상신 버튼).</li>
+      <li>ERP 화면을 열고 평소처럼 서무비서를 써 봅니다(패널 안내, 📥 ERP에 넣기, 상신 버튼).</li>
       <li>이상한 점이 보이면 그 화면에서 아래 <b>📸 화면 구조 기록</b>을 누르고, <b>메모</b>에 무엇을 했는데 어떻게 됐는지 적습니다.</li>
       <li>시험이 끝나면 <b>보고서 받기</b>로 파일을 받아 Claude 대화에 첨부하거나, <b>서버로 보내기</b>를 누릅니다.</li>
     </ol>
     <div class="sub">기록하는 것: 화면 주소(경로)·제목·칸 이름과 종류·버튼 이름·프레임 구조·동작 결과. <b>기록하지 않는 것</b>: ERP와 초안에 입력한 내용, 주소의 값(사번·문서번호 등). 숫자가 길게 이어진 글자(전화·주민번호 모양)는 #으로 가립니다.</div>
   </section>
+  <section class="card">
+    <div class="h">🔎 자동 진단 <span class="sub">기록을 읽어 문제와 조치를 정리합니다</span></div>
+    <ul class="fd" id="findings"></ul>
+  </section>
   <div class="grid2">
     <section class="card">
-      <div class="h">📸 지금 ERP 화면 기록</div>
-      <select id="tabs" aria-label="기록할 탭"></select>
-      <div class="row"><button class="btn sm" id="snap" type="button">📸 화면 구조 기록</button></div>
+      <div class="h">🧭 이 탭 점검 · 📸 화면 기록</div>
+      <select id="tabs" aria-label="점검할 탭"></select>
+      <div class="row"><button class="btn sm" id="check" type="button">🧭 이 탭 점검</button><button class="btn sm ghost" id="snap" type="button">📸 화면 구조 기록</button></div>
+      <dl class="kv" id="checkOut"></dl>
       <pre id="snapOut" class="sub">ERP 탭을 고르고 누르세요. 모든 프레임의 칸·버튼·편집기 구조를 기록합니다.</pre>
     </section>
     <section class="card">
       <div class="h">📝 메모</div>
-      <textarea id="note" placeholder="예) 출장복명서 작성 화면에서 '결재상신'을 눌렀는데 점검 카드가 안 떴음 / 🔧 분석에서 출장지 칸을 못 찾음"></textarea>
+      <textarea id="note" placeholder="예) 출장복명서 작성 화면에서 '결재상신'을 눌렀는데 점검 카드가 안 떴음 / 본문 편집기에 초안이 안 들어감"></textarea>
       <div class="row"><button class="btn sm" id="noteBtn" type="button">메모 남기기</button></div>
       <div class="stat" id="stat"></div>
     </section>
@@ -69,7 +79,7 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:280px;ov
   </section>
   <section class="card">
     <div class="h">기록 <span class="sub" id="cnt"></span></div>
-    <div class="row"><select id="f" aria-label="기록 거르기"><option value="">전체</option><option value="err">오류·실패만</option><option value="user">메모·스냅샷</option><option value="detect">화면 감지</option><option value="fill">칸 넣기</option><option value="guard">결재 전 점검·버튼</option></select>
+    <div class="row"><select id="f" aria-label="기록 거르기"><option value="">전체</option><option value="err">오류·실패만</option><option value="user">메모·스냅샷</option><option value="detect">화면 감지</option><option value="fill">초안 넣기</option><option value="guard">결재 전 점검·버튼</option></select>
       <button class="btn ghost sm" id="reload" type="button">↻ 새로고침</button></div>
     <div class="logw"><table><thead><tr><th>시각</th><th>어디서</th><th>무엇</th><th>내용</th></tr></thead><tbody id="rows"></tbody></table></div>
   </section>

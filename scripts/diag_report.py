@@ -51,9 +51,8 @@ def report(path, r):
     s = r.get("settings") or {}
     print(f"- 서버 {s.get('server') or '(없음)'} / ERP 주소 {s.get('erpHosts') or '(없음)'} / "
           f"결재 전 점검 {s.get('guard')} / 자동 안내 {s.get('autoAsk')}")
-    p = r.get("profiles") or {}
-    n = lambda v: len(v) if isinstance(v, list) else v
-    print(f"- 화면 규칙(프로필): 내 것 {n(p.get('mine', '?'))} / 기관 {n(p.get('org', '?'))}")
+    for f in r.get("findings") or []:                 # 진단 센터의 자동 진단(1.4.0+)
+        print(f"- 자동 진단[{f.get('sev')}] {f.get('title')}")
     if log:
         print(f"- 기간 {log[0].get('t', '')[:19]} ~ {log[-1].get('t', '')[:19]}")
     by = Counter(e.get("ev") for e in log)
@@ -123,7 +122,7 @@ def report(path, r):
     if not btn:
         print("- 버튼 기록 없음(상신·결재 류 버튼을 누르지 않았거나 ERP 에 확장이 붙지 않음)")
 
-    h("5. 칸 채우기")
+    h("5. 초안 넣기")
     fills = [e for e in log if e.get("ev") == "fillmap"]
     for e in fills:
         d = e.get("d") or {}

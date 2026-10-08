@@ -2229,6 +2229,8 @@ def secretary_config_save():
 # 서무비서 AI — 영수증 인식 · 상황 이해 (기관이 키를 설정한 경우에만)
 #   ANTHROPIC_API_KEY 가 있으면 Claude, 없고 GEMINI_API_KEY 가 있으면 Gemini 를 쓴다
 #   (SECRETARY_AI_PROVIDER=claude|gemini 로 고정 가능). 키가 없으면 화면은 수동 입력으로 동작한다.
+#   기관 키가 없어도 사용자가 화면 설정에 '내 AI 키'를 넣으면, 그 요청에 한해 헤더(X-AI-Key·X-AI-Provider)로 받아 쓴다.
+#   사용자 키는 서버에 저장·기록하지 않고, 그 요청의 AI 호출에만 쓴다.
 #   AI 는 절차를 '고르기'와 영수증 '읽기'에만 쓰고, 규정 내용을 만들어 내게 하지 않는다.
 # ══════════════════════════════════════════════════════════════════════════
 SEC_AI_MAX_IMAGE = 5 * 1024 * 1024          # 영수증 이미지 최대 크기(바이트, 디코딩 후)
@@ -2237,7 +2239,27 @@ _SEC_AI_HITS: dict = {}                      # IP → [시각] — 기관 키 �
 _SEC_AI_LIMIT = int(os.environ.get("SECRETARY_AI_RATE", "40") or 40)   # IP 당 10분에 허용할 요청 수
 
 
+def _sec_ai_user() -> tuple:
+    """이 요청에 사용자가 보낸 AI 키 → (provider, key). 없으면 ("", "")."""
+    try:
+        from flask import has_request_context
+        if not has_request_context():
+            return "", ""
+        key = (request.headers.get("X-AI-Key") or "").strip()
+        prov = (request.headers.get("X-AI-Provider") or "").strip().lower()
+    except Exception:
+        return "", ""
+    if not key or len(key) > 300 or not re.match(r"^[\x21-\x7e]+$", key):
+        return "", ""
+    if prov not in ("claude", "gemini"):
+        prov = "claude" if key.startswith("sk-ant-") else "gemini"
+    return prov, key
+
+
 def _sec_ai_provider() -> str:
+    up, _uk = _sec_ai_user()
+    if up:
+        return up
     p = (os.environ.get("SECRETARY_AI_PROVIDER") or "").strip().lower()
     if p in ("claude", "gemini"):
         return p if _sec_ai_key(p) else ""
@@ -2249,6 +2271,9 @@ def _sec_ai_provider() -> str:
 
 
 def _sec_ai_key(provider: str) -> str:
+    up, uk = _sec_ai_user()
+    if up == provider and uk:
+        return uk
     return _env_clean("ANTHROPIC_API_KEY" if provider == "claude" else "GEMINI_API_KEY")
 
 
@@ -2261,7 +2286,8 @@ def _sec_ai_model(provider: str) -> str:
 
 def _sec_ai_status() -> dict:
     p = _sec_ai_provider()
-    return {"available": bool(p), "provider": p, "model": _sec_ai_model(p) if p else ""}
+    return {"available": bool(p), "provider": p, "model": _sec_ai_model(p) if p else "",
+            "user_key": bool(_sec_ai_user()[0])}
 
 
 def _sec_ai_rate_ok() -> bool:
@@ -2444,7 +2470,11 @@ _SEC_UNDERSTAND_SYSTEM = (
     "당신은 한국 공공기관 서무 담당자를 돕는 비서입니다. 사용자가 말한 업무 상황을 읽고, 주어진 '절차 목록'에서 "
     "이 상황에 필요한 절차를 고릅니다. 여러 업무가 섞여 있으면 실제로 처리할 순서대로 모두 고르세요(최대 4개). "
     "목록에 없는 절차를 지어내거나 규정·기한을 추측해 쓰지 마세요. 맞는 절차가 없으면 빈 목록을 돌려주세요. "
-    "summary 에는 상황을 어떻게 이해했는지 한두 문장으로, uncovered 에는 목록으로 처리되지 않는 부분을 적습니다."
+    "summary 에는 상황을 어떻게 이해했는지 한두 문장으로, uncovered 에는 목록으로 처리되지 않는 부분을 적습니다. "
+    "reasons 에는 고른 절차마다 왜 필요한지 상황의 말을 근거로 한 문장. facts 에는 상황에서 읽은 사실(날짜·기간·장소·금액·"
+    "사람 수 등, 사용자가 실제로 말한 것만). questions 에는 절차를 진행하려면 사용자에게 더 확인해야 할 것(최대 4개). "
+    "cautions 에는 고른 절차의 '반려 점검 항목'(pitfalls, 0부터 번호) 가운데 이 상황에서 특히 조심할 것을 번호로 고릅니다(최대 4개). "
+    "점검 항목의 문장을 새로 지어내지 말고 번호로만 고르세요."
 )
 
 
@@ -2467,7 +2497,9 @@ def secretary_ai_understand():
         if _SEC_ID_RE.match(pid):
             procs.append({"id": pid, "title": _sec_clean_str(p.get("title"), 80),
                           "summary": _sec_clean_str(p.get("summary"), 200),
-                          "keywords": [_sec_clean_str(t, 20) for t in (p.get("triggers") or [])[:15]]})
+                          "keywords": [_sec_clean_str(t, 20) for t in (p.get("triggers") or [])[:15]],
+                          "steps": [_sec_clean_str(t, 90) for t in (p.get("steps") or [])[:12] if isinstance(t, str)],
+                          "pitfalls": [_sec_clean_str(t, 120) for t in (p.get("pitfalls") or [])[:10] if isinstance(t, str)]})
     if not procs:
         return jsonify({"success": False, "error": "절차 목록이 비어 있습니다."}), 400
     ids = [p["id"] for p in procs]
@@ -2477,8 +2509,16 @@ def secretary_ai_understand():
             "procedure_ids": {"type": "array", "items": {"type": "string", "enum": ids}},
             "summary": {"type": "string"},
             "uncovered": {"type": "string"},
+            "reasons": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string", "enum": ids}, "why": {"type": "string"}},
+                "required": ["id", "why"], "additionalProperties": False}},
+            "facts": {"type": "array", "items": {"type": "string"}},
+            "questions": {"type": "array", "items": {"type": "string"}},
+            "cautions": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string", "enum": ids}, "idx": {"type": "integer"}},
+                "required": ["id", "idx"], "additionalProperties": False}},
         },
-        "required": ["procedure_ids", "summary", "uncovered"],
+        "required": ["procedure_ids", "summary", "uncovered", "reasons", "facts", "questions", "cautions"],
         "additionalProperties": False,
     }
     text = ("절차 목록(JSON):\n" + json.dumps(procs, ensure_ascii=False)
@@ -2491,9 +2531,22 @@ def secretary_ai_understand():
     for i in data.get("procedure_ids") or []:
         if i in ids and i not in seen:
             seen.add(i); pick.append(i)
-    return jsonify({"success": True, "procedure_ids": pick[:4],
+    pick = pick[:4]
+    npit = {p["id"]: len(p["pitfalls"]) for p in procs}
+    reasons = [{"id": r.get("id"), "why": _sec_clean_str(r.get("why"), 200)} for r in (data.get("reasons") or [])
+               if isinstance(r, dict) and r.get("id") in pick][:4]
+    cautions = []
+    for c in data.get("cautions") or []:      # 점검 항목은 번호로만 받아, 화면이 원래 문장을 보여 준다(지어낸 문장 차단)
+        if isinstance(c, dict) and c.get("id") in pick and isinstance(c.get("idx"), int) and 0 <= c["idx"] < npit.get(c["id"], 0):
+            if {"id": c["id"], "idx": c["idx"]} not in cautions:
+                cautions.append({"id": c["id"], "idx": c["idx"]})
+    return jsonify({"success": True, "procedure_ids": pick,
                     "summary": _sec_clean_str(data.get("summary"), 300),
                     "uncovered": _sec_clean_str(data.get("uncovered"), 200),
+                    "reasons": reasons,
+                    "facts": [_sec_clean_str(x, 80) for x in (data.get("facts") or []) if isinstance(x, str)][:8],
+                    "questions": [_sec_clean_str(x, 120) for x in (data.get("questions") or []) if isinstance(x, str)][:4],
+                    "cautions": cautions[:4],
                     "provider": _sec_ai_provider()})
 
 
@@ -3348,15 +3401,12 @@ def secretary_insights_reason_delete():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 브라우저 확장 배포·ERP 프로필
+# 브라우저 확장 배포
 #   /api/secretary/extension/info · extension.zip : 이 서버 주소와 기관 ERP 주소를 넣은 확장 배포본
-#   /api/secretary/erp/profiles : 관리자가 확장으로 만든 'ERP 화면 규칙·칸 매핑'(모든 직원 확장이 받아 씀)
-#   /api/secretary/erp/meta     : 확장의 ERP 맞춤 도구가 쓰는 초안 항목·절차 목록
+#   /api/secretary/erp/meta     : 확장의 결재 전 점검이 쓰는 절차·반려 점검 항목
+#   (ERP 화면 규칙·칸 매핑 /api/secretary/erp/profiles 는 'ERP 맞춤' 기능과 함께 삭제)
 #   확장 페이지(chrome-extension://)가 부르므로 이 경로들만 CORS 를 연다(공개 정보 + 저장은 관리자 토큰).
 # ══════════════════════════════════════════════════════════════════════════
-SEC_ERP_PATH = os.path.join(SEC_DIR, "erp_profiles.json")
-SEC_ERP_REPO_PATH = "secretary/erp_profiles.json"
-_SEC_ERP_CACHE = {"ts": 0.0, "data": None}
 
 
 @app.after_request
@@ -3408,83 +3458,6 @@ def secretary_extension_zip():
     resp.headers["Content-Disposition"] = f"attachment; filename=\"secretary-extension-{man['version']}.zip\""
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-def _sec_erp_clean_field(f: dict):
-    if not isinstance(f, dict):
-        return None
-    key = _sec_clean_str(f.get("key"), 40)
-    if not re.match(r"^[A-Za-z0-9_\-]{1,40}$", key or ""):
-        return None
-    out = {"key": key}
-    for k, n in (("label", 60), ("sel", 300), ("name", 120), ("fid", 120), ("frame", 300), ("kind", 12)):
-        v = _sec_clean_str(f.get(k), n)
-        if v:
-            out[k] = v
-    return out if (out.get("sel") or out.get("name") or out.get("fid") or out.get("label")) else None
-
-
-def _sec_erp_clean(raw) -> list:
-    out = []
-    for p in (raw or [])[:20]:
-        if not isinstance(p, dict):
-            continue
-        import extension_build
-        hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (p.get("hosts") or [])[:10]) if h]
-        screens = []
-        for sc in (p.get("screens") or [])[:80]:
-            if not isinstance(sc, dict):
-                continue
-            m = sc.get("match") if isinstance(sc.get("match"), dict) else {}
-            fields = [x for x in (_sec_erp_clean_field(f) for f in (sc.get("fields") or [])[:60]) if x]
-            item = {"id": _sec_clean_str(sc.get("id"), 40) or f"s{len(screens) + 1}",
-                    "name": _sec_clean_str(sc.get("name"), 60) or "화면",
-                    "match": {"url": _sec_clean_str(m.get("url"), 300), "title": _sec_clean_str(m.get("title"), 120)},
-                    "q": _sec_clean_str(sc.get("q"), 120), "draft": _sec_clean_str(sc.get("draft"), 48),
-                    "proc": _sec_clean_str(sc.get("proc"), 48),
-                    "fields": fields}
-            if item["match"]["url"] or item["match"]["title"]:
-                screens.append(item)
-        if hosts:
-            out.append({"id": _sec_clean_str(p.get("id"), 40) or f"p{len(out) + 1}",
-                        "name": _sec_clean_str(p.get("name"), 60) or hosts[0], "hosts": hosts, "screens": screens})
-    return out
-
-
-def _sec_erp_load(force: bool = False) -> dict:
-    if not force and _SEC_ERP_CACHE["data"] is not None and time.time() - _SEC_ERP_CACHE["ts"] < 30:
-        return _SEC_ERP_CACHE["data"]
-    d = _sec_read_json(SEC_ERP_PATH, {}) or {}
-    data = {"profiles": _sec_erp_clean(d.get("profiles")), "updated": d.get("updated", ""), "updated_by": d.get("updated_by", "")}
-    _SEC_ERP_CACHE.update({"ts": time.time(), "data": data})
-    return data
-
-
-@app.route("/api/secretary/erp/profiles", methods=["GET", "POST", "OPTIONS"])
-def secretary_erp_profiles():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if request.method == "GET":
-        return jsonify({"success": True, **_sec_erp_load(force=request.args.get("fresh") == "1")})
-    ok, why = _upload_authorized()
-    if not ok:
-        return jsonify({"success": False, "error": why}), 401
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body.get("profiles"), list):
-        return jsonify({"success": False, "error": "profiles 목록이 필요합니다."}), 400
-    data = {"schema_version": 1, "profiles": _sec_erp_clean(body["profiles"]), "updated": _now_kst(),
-            "updated_by": _sec_clean_str(body.get("editor"), 40)}
-    payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
-    if len(payload) > 400_000:
-        return jsonify({"success": False, "error": "ERP 프로필이 너무 큽니다."}), 413
-    try:
-        where = _sec_save_repo_file(SEC_ERP_REPO_PATH, SEC_ERP_PATH, payload, "서무비서 ERP 화면 규칙 갱신")
-    except OSError:
-        return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 502
-    _SEC_ERP_CACHE.update({"ts": time.time(), "data": {k: data[k] for k in ("profiles", "updated", "updated_by")}})
-    return jsonify({"success": True, "message": where, "profiles": data["profiles"], "updated": data["updated"]})
 
 
 SEC_DIAG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diag")
@@ -3542,7 +3515,7 @@ def _sec_tx(text: str, cfg: dict) -> str:
 
 @app.route("/api/secretary/erp/meta")
 def secretary_erp_meta():
-    """ERP 맞춤 도구용: 초안 서식(항목)과 절차 목록."""
+    """확장용: 절차·반려 점검 항목(결재 전 점검)과 초안 서식 목록."""
     common = _sec_read_json(SEC_COMMON_PATH, {"procedures": [], "drafts": {}})
     org = _sec_org_load()
     drafts = dict(common.get("drafts") or {}); drafts.update(org.get("drafts") or {})
