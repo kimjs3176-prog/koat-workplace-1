@@ -3,6 +3,19 @@
 importScripts("config.js", "diaglog.js");
 
 const state = {};            // tabId → {focusFrame, context:{label,q,title}}
+// 서비스 워커는 잠깐 쉬면 메모리가 비워진다 — 탭별 업무 감지 결과를 세션 저장소에 두었다가 깨어날 때 되살린다
+const stateReady = chrome.storage.session.get("tabState").then(({ tabState }) => {
+  for (const [k, v] of Object.entries(tabState || {})) if (!state[k]) state[k] = v;
+}).catch(() => {});
+let saveTimer = null;
+function saveState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const out = {};
+    for (const [k, v] of Object.entries(state)) if (v && v.context) out[k] = { context: v.context, ctxFrame: v.ctxFrame, guard: v.guard };
+    chrome.storage.session.set({ tabState: out }).catch(() => {});
+  }, 300);
+}
 const PANEL_FALLBACK = !chrome.sidePanel || !chrome.sidePanel.open;
 
 async function settings() {
@@ -239,7 +252,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     const st = state[tabId];
     if (st && st.context && st.ctxFrame === sender.frameId) {
       diag("bg", "context.clear", { was: st.context.title }, sender);
-      delete st.context; delete st.guard; delete st.ctxFrame;
+      delete st.context; delete st.guard; delete st.ctxFrame; saveState();
       chrome.tabs.sendMessage(tabId, { type: "guard", guard: null }).catch(() => {});
       chrome.tabs.sendMessage(tabId, { type: "chip", q: "", title: "" }).catch(() => {});
       toPanel({ type: "context", tabId, context: null });
@@ -247,7 +260,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
     openPanel(sender.tab, m.q || "");
   } else if (m.type === "getContext") {                   // 패널이 열릴 때 현재 탭 상태 요청
-    chrome.storage.session.get("pendingAsk").then(({ pendingAsk }) => {
+    stateReady.then(() => chrome.storage.session.get("pendingAsk")).then(({ pendingAsk }) => {
       // 방금 누른 🗂·칩의 물음 — 패널이 다른 탭(예: ERP 팝업 창의 원래 창)에 있어도 10초 안이면 받는다
       const fresh = pendingAsk && (pendingAsk.tabId === m.tabId || (!m.fixed && Date.now() - (pendingAsk.ts || 0) < 10000));
       if (fresh) chrome.storage.session.remove("pendingAsk");
@@ -268,7 +281,8 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   } else if (m.type === "openHere" && sender.tab) {        // 서무비서 웹 화면의 '패널로 열기'
     openPanel(sender.tab);
   } else if (m.type === "getGuard" && sender.tab) {
-    reply({ guard: (state[tabId] || {}).guard || null });
+    stateReady.then(() => reply({ guard: (state[tabId] || {}).guard || null }));
+    return true;
   } else if (m.type === "deadlines") {                    // 서무비서(패널·탭) → 다가오는 기한
     chrome.storage.local.get("deadlines").then(async ({ deadlines }) => {
       const d = deadlines || {};
@@ -285,12 +299,14 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener((id) => { delete state[id]; });
+chrome.tabs.onRemoved.addListener((id) => { delete state[id]; saveState(); });
 // 탭이 다른 주소로 넘어가면 감지 결과를 비운다(같은 탭에서 다른 업무 화면으로)
 chrome.tabs.onUpdated.addListener((id, info, tab) => {
-  if (info.status === "loading" && state[id]) { delete state[id].cs; if (info.url) { delete state[id].context; delete state[id].guard; delete state[id].ctxFrame; } }
+  if (info.status === "loading" && info.url && state[id]) { delete state[id].cs; delete state[id].context; delete state[id].guard; delete state[id].ctxFrame; saveState(); }
   if (info.status === "complete") setTimeout(() => urlContext(id).catch(() => {}), 2500);
 });
+
+chrome.tabs.onActivated.addListener(({ tabId }) => setTimeout(() => urlContext(tabId).catch(() => {}), 600));
 
 // 업무 감지 결과를 탭 상태에 반영하고 결재 전 점검·패널·🗂 칩에 알린다(내용 스크립트·주소 감지 공통)
 function applyContext(tab, frameId, ctx, sender) {
@@ -300,10 +316,10 @@ function applyContext(tab, frameId, ctx, sender) {
   const rank = (c) => (c && typeof c.rank === "number" ? c.rank : 99);
   if (cur && st.ctxFrame !== frameId && rank(ctx) > rank(cur)) { diag("bg", "context.ignored", { got: ctx, kept: cur }, sender); return false; }
   diag("bg", "context", ctx, sender);
-  st.context = ctx; st.ctxFrame = frameId;
+  st.context = ctx; st.ctxFrame = frameId; saveState();
   guardFor(ctx).then((g) => {                           // 결재 전 점검 항목을 그 탭의 모든 프레임에
     if (!g) return;
-    state[tabId].guard = g;
+    state[tabId].guard = g; saveState();
     chrome.tabs.sendMessage(tabId, { type: "guard", guard: g }).catch(() => {});
   });
   // ERP·온나라가 띄운 팝업 창(기안 작성 창 등)의 감지 결과는 원래 창의 옆 패널로도 보낸다
@@ -316,16 +332,28 @@ function applyContext(tab, frameId, ctx, sender) {
 // 내용 스크립트가 붙지 못하는 탭(Edge 'IE 모드'로 열리는 온나라 등): 탭 주소·창 제목만으로 업무를 알아본다.
 // 이런 탭에는 🗂 버튼·결재 전 점검·칸 채우기를 할 수 없고, 옆 패널 안내와 '초안 복사 → Ctrl+V' 만 된다.
 async function urlContext(tabId) {
+  await stateReady;
   const st = state[tabId] || {};
   if (st.cs || st.context) return;
   const tab = await chrome.tabs.get(tabId);
   const { erpHosts } = await settings();
-  if (!tab.url || !(erpHosts || []).some((h) => hostMatch(h, tab.url))) return;
-  let path = ""; try { path = new URL(tab.url).pathname; } catch (e) { return; }
+  let u = null; try { u = new URL(tab.url || ""); } catch (e) {}
+  const listed = !!u && (erpHosts || []).some((h) => hostMatch(h, tab.url));
+  if (!listed) return;                               // 권한 밖 주소는 탭 주소도 읽을 수 없다
+  const path = u.pathname;
+  if (globalThis.SEC_SKIP_URL && SEC_SKIP_URL.test(path)) return;
+  // 정말 화면 안에 들어갈 수 없는지 직접 확인(쉬고 깨어난 서비스 워커는 '붙어 있음' 기억이 없을 수 있다)
+  let blocked = "";
+  try {
+    const r = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!globalThis.__secSnapshot });
+    if (r && r[0] && r[0].result) { (state[tabId] = state[tabId] || {}).cs = true; return; }
+    return;                                              // 들어갈 수는 있는데 아직 붙지 않음(설치 직후 열린 탭 등) — IE 모드 아님
+  } catch (e) { blocked = e.message || "blocked"; }
+  if (!/not ready|Cannot access|cannot be scripted|No frame/i.test(blocked)) return;
   const title = String(tab.title || "").replace(/\s*[-–]\s*(Microsoft Edge|Chrome).*$/i, "").trim();
   let ctx = null;
   for (const [i, [rx, q, proc]] of (SEC_RULES || []).entries()) { if (title && rx.test(title)) { ctx = { q, title: title.slice(0, 40), proc: proc || "", rank: i }; break; } }
   if (!ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) { if (rx.test(path)) { ctx = { q, title: title || q, proc: proc || "", rank: (SEC_RULES || []).length + i }; break; } }
-  diag("bg", ctx ? "detect.tab" : "detect.tab.none", { url: path, title: title.slice(0, 60), note: "확장이 화면 안에 들어가지 못한 탭(IE 모드 등) — 주소·제목으로만 판단" }, { tab });
+  diag("bg", ctx ? "detect.tab" : "detect.tab.none", { url: path, title: title.slice(0, 60), err: blocked.slice(0, 80), note: "확장이 화면 안에 들어가지 못한 탭(IE 모드 등) — 주소·제목으로만 판단" }, { tab });
   if (ctx) { ctx.tabOnly = true; applyContext(tab, 0, ctx, { tab }); }
 }
