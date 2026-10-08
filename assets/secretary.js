@@ -28,7 +28,7 @@ const EXAMPLES=[
 let S={ loaded:false, loading:null, common:{procedures:[],drafts:{}}, org:{procedures:[],drafts:{}}, admin:{},
         view:'home', query:'', formsQ:'', forms:null, kd:null, regs:null,
         cfg:{org:{},service:{},terms:{},reg_aliases:{},holidays:{}}, holidays:{}, status:{}, pstatus:{}, regCount:0, dateNote:'', ai:{available:false}, aiRes:null, calYM:null, rcBusy:0, matches:[], related:null, procId:null, caseId:null, editId:null, editLayer:'personal',
-        basisOpen:{}, basisCache:{}, catFilter:'' };
+        basisOpen:{}, basisCache:{}, moreOpen:{}, catFilter:'' };
 // 브라우저 확장(ERP 옆 사이드 패널) 안에서 열렸는지 — ?embed=ext 이고 다른 창(확장 패널)에 담겨 있을 때
 const EMBED=(()=>{ try{ return new URLSearchParams(location.search).get('embed')==='ext' && window.parent!==window; }catch(e){ return false; } })();
 function toExt(msg){ if(EMBED) try{ window.parent.postMessage(Object.assign({src:'koat-sec'}, msg), '*'); }catch(e){} }
@@ -364,6 +364,74 @@ function catGroups(){
   return [...m.entries()].sort((a,b)=>{ const ia=order.indexOf(a[0]), ib=order.indexOf(b[0]); return (ia<0?99:ia)-(ib<0?99:ib); });
 }
 
+// ── 한눈에 읽기: 금액·날짜·기간 강조 + 긴 서술은 요약문 + '자세히' ──────────────
+const NUM='\\d[\\d,.]*';
+const KEY_RX=new RegExp([
+  `(?<m>(?:${NUM}\\s*(?:억|천만|백만|만|천)?\\s*원|[일이삼사오육칠팔구십]?[백천]?만\\s*원)(?:\\s*(?:이상|이하|미만|초과|이내|한도|까지))?)`,
+  `(?<d>(?:\\d{4}[.-]\\s*\\d{1,2}[.-]\\s*\\d{1,2}|(?:\\d{4}년\\s*)?\\d{1,2}월\\s*\\d{1,2}일|매월\\s*\\d{1,2}일|(?:매월\\s*|다음\\s*달\\s*)?말일)(?:\\s*(?:까지|부터|이후|이전|전|기준))?)`,
+  `(?<f>\\d+\\s*분의\\s*\\d+)`,
+  `(?<p>${NUM}\\s*(?:영업일|근무일|개월|주일|주|시간|년|일|분(?!의))(?:\\s*(?:이내|이상|이하|미만|초과|전|후|까지|안에|안|간|만에|째))?)`,
+  `(?<n>${NUM}\\s*(?:%|퍼센트|km|회|명|건)(?:\\s*(?:이상|이하|미만|초과|이내|까지))?)`,
+].join('|'),'g');
+const KEY_CLS={m:'m',d:'d',p:'p',f:'n',n:'n'};
+function hl(t){
+  t=String(t==null?'':t); let out='', last=0;
+  for(const m of t.matchAll(KEY_RX)){
+    const k=Object.keys(m.groups).find(x=>m.groups[x]); if(!k) continue;
+    // '제11조'·'[별표 1]' 같은 조문 번호의 숫자는 강조하지 않는다
+    if(/제\s*$/.test(t.slice(Math.max(0,m.index-2),m.index))) continue;
+    out+=esc(t.slice(last,m.index))+`<mark class="sec-k ${KEY_CLS[k]}">${esc(m[0])}</mark>`; last=m.index+m[0].length;
+  }
+  return (out+esc(t.slice(last))).replace(/\s→\s/g,' <span class="sec-arr">→</span> ');
+}
+const CITE_RX=/\s*[(（]\s*「([^」]+)」\s*([^)）]*)[)）]/g;
+// 긴 문장을 '요약 + 나머지'로 — 규정 인용은 작은 꼬리표로, '휴가:' 같은 머리말은 굵은 이름표로
+function brief(t, lim){
+  lim=lim||58; let s=String(t||'').trim(); const cites=[];
+  s=s.replace(CITE_RX,(_,r,a)=>{ cites.push((r+' '+a.replace(/^[,·\s]+/,'')).trim()); return ''; }).trim();
+  let label=''; const lm=s.match(/^([^:：()（]{2,14})[:：]\s+/); if(lm){ label=lm[1]; s=s.slice(lm[0].length); }
+  let head=s, rest='';
+  if(s.length>lim){
+    let i=s.indexOf(' — ');
+    if(i>8){ head=s.slice(0,i); rest=s.slice(i+3); }
+    else { const m=s.match(/^(.{8,}?[^\d\s]\.)\s+(?=[^\d\s])(.+)$/); if(m){ head=m[1]; rest=m[2]; } }
+    if(head.length>lim){ const par=[]; const short=head.replace(/\s*[(（]([^)）]{4,})[)）]/g,(_,x)=>{ par.push(x); return ''; });
+      if(par.length){ head=short; rest=[...par.map(x=>'※ '+x), rest].filter(Boolean).join(' '); } }
+  }
+  return {label, head, rest, cites};
+}
+function briefHtml(t, key, o){
+  o=o||{}; const b=brief(t, o.lim);
+  const cite=o.noCite||!b.cites.length?'':b.cites.map(c=>`<span class="sec-cite" title="근거">${esc(c)}</span>`).join('');
+  const more=b.rest?`<details class="sec-more"${S.moreOpen[key]?' open':''} data-k="${esc(key)}"><summary>자세히</summary><div class="sec-more-t">${hl(b.rest)}</div></details>`:'';
+  return `${b.label?`<b class="sec-lbl">${esc(b.label)}</b>`:''}<span class="sec-brief">${hl(b.head)}</span>${cite}${more}`;
+}
+// 절차 전체에서 금액·기간·날짜가 든 짧은 기준 문구를 뽑아 '핵심 기준' 칩으로
+function keyFacts(p){
+  const src=[...(p.tips||[]), ...(p.steps||[]).map(s=>s.t)];   // 반려 점검 문항은 팁과 겹치므로 뺀다
+  const out=[], seen=new Set(), toks=new Set();
+  const keyOf=m=>m.groups.m||m.groups.d||m.groups.p||m.groups.f;
+  for(const t of src){
+    const b=brief(t, 999); const txt=(b.head+(b.rest?' '+b.rest:'')).replace(/※ [^.]*?(?=\s|$)/g,'');
+    for(let sen of txt.split(/(?<=[^\d\s]\.)\s+(?=[^\d\s])|\s—\s/)){
+      sen=sen.replace(/\s*[(（][^)）]*[)）]/g,'').replace(/[.。]$/,'').trim();
+      const segs=sen.length<=50?[sen]:sen.split(/\s*[,;]\s+|\s→\s/);
+      for(const seg of segs){
+        const ms=[...seg.matchAll(KEY_RX)].filter(keyOf); if(!ms.length||seg.length>50||seg.length<4) continue;
+        const tk=ms.map(m=>norm(m[0])); if(tk.every(x=>toks.has(x))) continue;      // 같은 기준 숫자는 한 번만
+        const k=norm(seg); if(seen.has(k)) continue; seen.add(k); tk.forEach(x=>toks.add(x));
+        out.push({seg, lbl:b.label, w:ms.some(m=>m.groups.m)?0:ms.some(m=>m.groups.d)?1:2});
+      }
+    }
+  }
+  return out.sort((a,b)=>a.w-b.w).slice(0,6);
+}
+function keyFactsHtml(p){
+  const f=keyFacts(p); if(!f.length) return '';
+  return `<div class="sec-keys"><span class="sec-keys-l">📌 핵심 기준</span>`+
+    f.map(x=>`<span class="sec-key">${x.lbl?`<b>${esc(x.lbl)}</b> `:''}${hl(x.seg)}</span>`).join('')+`</div>`;
+}
+
 function procView(){
   const p=getProc(S.procId); if(!p) return `<div class="sec-empty">절차를 찾을 수 없습니다.</div>`;
   const c=curCase(); const dates=(c&&c.dates)||{}; const checks=(c&&c.checks)||{};
@@ -375,13 +443,13 @@ function procView(){
   const nx=c?nextStep(c,p):(p.steps&&p.steps.length?{i:0,s:p.steps[0],due:''}:null);
   const head=`<div class="sec-proc-h"><span class="sec-proc-ic">${esc(p.icon||'📌')}</span><div class="sec-proc-tt">`+
     `<div class="sec-proc-t">${esc(p.title)} <span class="sec-layer ${p._layer}">${LAYER_LABEL[p._layer]}${p._base?' 보충':''}</span></div>`+
-    `<div class="sec-proc-s">${esc(p.summary||'')}</div></div></div>`;
+    `<div class="sec-proc-s">${p.summary?briefHtml(p.summary,'sum',{lim:80}):''}</div></div></div>`;
   const dateIn=(p.dates&&p.dates.length)?`<div class="sec-dates"><span class="sec-dates-l">📅 기준일을 넣으면 기한을 계산해요</span>`+
     p.dates.map(d=>`<label class="sec-date"><span>${esc(d.l)}</span><input type="date" value="${esc(dates[d.k]||'')}" data-a="date" data-k="${esc(d.k)}"></label>`).join('')+`</div>`:'';
   let nextBox='';
   if(nx){ const dd=nx.due?dday(nx.due):null;
-    nextBox=`<div class="sec-nextbox"><span class="sec-nextbox-l">다음 할 일</span><span class="sec-nextbox-t">${nx.i+1}. ${esc(nx.s.t)}</span>`+
-      (nx.due?`<span class="sec-dd ${dd.cls}">${esc(fmtDate(nx.due))} · ${dd.label}</span>${offHtml(nx.due)}`:(nx.s.when?`<span class="sec-when">${esc(deadlineText(nx.s))}</span>`:''))+`</div>`;
+    nextBox=`<div class="sec-nextbox"><span class="sec-nextbox-l">다음 할 일</span><span class="sec-nextbox-t">${nx.i+1}. ${hl(brief(nx.s.t).head)}</span>`+
+      (nx.due?`<span class="sec-dd ${dd.cls}">${esc(fmtDate(nx.due))} · ${dd.label}</span>${offHtml(nx.due)}`:(nx.s.when?`<span class="sec-when">${hl(deadlineText(nx.s))}</span>`:''))+`</div>`;
   } else if(c){ nextBox=`<div class="sec-nextbox done"><span class="sec-nextbox-l">완료</span><span class="sec-nextbox-t">필수 단계를 모두 마쳤습니다.</span>${c.status!=='done'?`<button class="sec-btn primary sm" data-a="casedone">완료 처리</button>`:''}</div>`; }
   const steps=(p.steps||[]).map((s,i)=>stepHtml(p,s,i,checks,dates)).join('');
   const notes=procNotices(p, c);
@@ -389,8 +457,8 @@ function procView(){
   const forms=allForms(p);
   const formsHtml=forms.length?`<div class="sec-card"><div class="sec-card-h">📎 필요한 서식 <span class="sec-sub">원본 서식을 그대로 엽니다</span></div><div class="sec-forms">`+
     forms.map(f=>`<button class="sec-form" data-a="form" data-reg="${esc(f.reg)}" data-label="${esc(f.label)}"><span class="sec-form-t">${esc(f.title||f.label)}</span><span class="sec-form-s">${esc(f.reg)} ${esc(f.label)}</span></button>`).join('')+`</div></div>`:'';
-  const tips=(p.tips&&p.tips.length)?`<div class="sec-card"><div class="sec-card-h">💡 알아 두면 좋은 점</div><ul class="sec-tips">`+p.tips.map(t=>`<li>${esc(t)}</li>`).join('')+`</ul></div>`:'';
-  const approval=p.approval?`<div class="sec-approval"><span class="sec-approval-l">결재선</span><span>${esc(p.approval)}</span></div>`:'';
+  const tips=(p.tips&&p.tips.length)?`<div class="sec-card"><div class="sec-card-h">💡 알아 두면 좋은 점</div><ul class="sec-tips">`+p.tips.map((t,i)=>`<li>${briefHtml(t,'tip'+i)}</li>`).join('')+`</ul></div>`:'';
+  const approval=p.approval?`<div class="sec-approval"><span class="sec-approval-l">결재선</span><span>${hl(p.approval)}</span></div>`:'';
   const noteHtml=`<div class="sec-card"><div class="sec-card-h">📝 개인 보충 <span class="sec-sub">우리 부서 실제 결재선·담당자·팁 — 내 브라우저에 저장되고 이 절차를 열 때마다 함께 보여요</span></div>`+
     `<textarea class="sec-note" data-a="pnote" rows="3" placeholder="예) 결재선: 팀장 전결 / 정산 담당: 운영지원실 김○○(내선 1234)">${esc(pnote)}</textarea></div>`;
   const caseBar=`<div class="sec-casebar">`+
@@ -402,7 +470,7 @@ function procView(){
       (c&&c.status!=='done'?`<button class="sec-btn sm ghost" data-a="casedone">완료</button>`:'')+
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
-  return aiBox()+altHtml+`<div class="sec-proc">`+head+notes+approval+dateIn+nextBox+caseBar+
+  return aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
     `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
@@ -438,7 +506,7 @@ function pitfallsHtml(p, c){
   return `<div class="sec-card sec-pit"><div class="sec-card-h">🚫 제출 전 반려 점검 <span class="sec-sub">${left?`남은 항목 ${left}개 — 결재 올리기 전에 확인하세요`:'모두 확인했어요'}</span></div>`+
     `<div class="sec-pit-list">`+all.map(x=>`<div class="sec-pit-i${pc[x.k]?' done':''}${x.rj?' rj':''}">`+
       `<button class="sec-pchk" data-a="pcheck" data-k="${esc(x.k)}" aria-pressed="${!!pc[x.k]}" aria-label="점검 ${pc[x.k]?'취소':'완료'}">${pc[x.k]?'✓':''}</button>`+
-      `<span class="sec-pit-t">${esc(x.t)}${x.rj?` <span class="sec-layer personal" title="${esc(x.rj.date||'')}">우리 부서 반려 기록</span>`:''}${x.sh?` <span class="sec-layer org" title="다른 담당자들이 공유한 반려 사유">👥 기관에서 ${x.sh.c}회 반려</span>`:''}</span>`+
+      `<span class="sec-pit-t">${briefHtml(x.t,'pit'+x.k)}${x.rj?` <span class="sec-layer personal" title="${esc(x.rj.date||'')}">우리 부서 반려 기록</span>`:''}${x.sh?` <span class="sec-layer org" title="다른 담당자들이 공유한 반려 사유">👥 기관에서 ${x.sh.c}회 반려</span>`:''}</span>`+
       (x.basis||[]).map(b=>`<button class="sec-mini" data-a="openreg" data-reg="${esc(b.reg)}" data-art="${esc(b.art||'')}" data-q="${esc(b.q||'')}">📖 ${esc(basisLabel(b))}</button>`).join('')+
       (x.rj?`<button class="sec-x" data-a="rjdel" data-id="${esc(x.rj.id)}" aria-label="반려 기록 삭제">✕</button>`:'')+`</div>`).join('')+`</div>`+
     `<div class="sec-row"><button class="sec-btn sm" data-a="rjadd">＋ 반려 사례 기록</button><span class="sec-sub">반려 사유를 적어 두면 다음 처리 때 점검 항목에 함께 나옵니다(내 브라우저 저장). 관리자는 절차 수정에서 기관 점검 항목으로 올릴 수 있어요.</span></div></div>`;
@@ -453,7 +521,7 @@ function allForms(p){
 function stepHtml(p, s, i, checks, dates){
   const done=!!checks[i]; const due=stepDue(s,dates); const dd=due?dday(due):null;
   const when=due?`<span class="sec-dd ${done?'ok':dd.cls}" title="${esc(deadlineText(s))}">${esc(fmtDate(due))}${done?'':' · '+dd.label}</span>`
-    :(s.when||s.deadline?`<span class="sec-when">${esc(deadlineText(s))}</span>`:'');
+    :(s.when||s.deadline?`<span class="sec-when">${hl(deadlineText(s))}</span>`:'');
   const off=due?offHtml(due, done):'';
   const docs=(s.docs&&s.docs.length)?`<div class="sec-docs">`+s.docs.map(d=>`<span class="sec-doc">${esc(d)}</span>`).join('')+`</div>`:'';
   const acts=[];
@@ -464,7 +532,7 @@ function stepHtml(p, s, i, checks, dates){
   const basisBoxes=(s.basis||[]).map((b,bi)=>S.basisOpen[i+':'+bi]?`<div class="sec-basis" id="secb_${i}_${bi}"><div class="assist-loading sm"><div class="spinner"></div><span>근거 불러오는 중...</span></div></div>`:'').join('');
   return `<div class="sec-step${done?' done':''}${s.optional?' opt':''}">`+
     `<button class="sec-chk" data-a="check" data-i="${i}" aria-pressed="${done}" aria-label="${i+1}단계 ${done?'완료 취소':'완료'}">${done?'✓':i+1}</button>`+
-    `<div class="sec-step-m"><div class="sec-step-t">${esc(s.t)}${s.optional?'<span class="sec-opt">선택</span>':''}</div>`+
+    `<div class="sec-step-m"><div class="sec-step-t">${s.optional?'<span class="sec-opt">선택</span>':''}${briefHtml(s.t,'s'+p.id+i)}</div>`+
     `<div class="sec-step-meta">${when}${off}</div>${docs}${acts.length?`<div class="sec-step-acts">${acts.join('')}</div>`:''}${basisBoxes}</div></div>`;
 }
 function basisLabel(b){ return b.art?`${b.reg} 제${b.art}조`:`${b.reg}${b.q?' · '+b.q:''}`; }
@@ -964,7 +1032,8 @@ function readJsonFile(input, cb){ const f=input.files&&input.files[0]; if(!f) re
 // ── 이벤트(패널 위임) ────────────────────────────────────────────────────
 function bind(panel){
   if(panel._secBound) return; panel._secBound=true;
-  panel.addEventListener('toggle', e=>{ if(e.target.classList&&e.target.classList.contains('sec-cfg')) S._cfgOpen=e.target.open; }, true);
+  panel.addEventListener('toggle', e=>{ const t=e.target; if(!t.classList) return; if(t.classList.contains('sec-cfg')) S._cfgOpen=t.open;
+    if(t.classList.contains('sec-more')&&t.dataset.k) S.moreOpen[t.dataset.k]=t.open; }, true);
   panel.addEventListener('submit', e=>{ const f=e.target.closest('[data-a="askform"]'); if(!f) return; e.preventDefault(); const q=document.getElementById('secQ'); ask(q?q.value:''); });
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
