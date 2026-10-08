@@ -172,6 +172,22 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 2. 변환된 원문은 `regulations/<규정명>/`에 저장되고, 목록은 `regulations_manifest.json`에 반영됩니다.
 3. 의미 검색 색인을 다시 만들 때는 `scripts/build_embeddings.py`를 실행합니다(`GEMINI_API_KEY` 필요).
 
+### 📡 ALIO 공시 내규로 최신 유지 (alio-mcp)
+[ALIO](https://www.alio.go.kr)에 공시된 우리 기관 내규와 서무비서 등록 내규를 비교해, **개정·신규 규정만 받아 등록**합니다. ALIO 조회·본문 추출은 [alio-mcp](https://github.com/chromehearts79/alio-mcp)를 씁니다.
+
+```bash
+git clone https://github.com/chromehearts79/alio-mcp.git ../alio-mcp
+(cd ../alio-mcp && npm install --omit=optional)
+
+node scripts/alio_sync.mjs              # 비교만(개정·신규·ALIO 미공시 목록) → secretary/alio_status.json
+node scripts/alio_sync.mjs --download   # 개정·신규 현행본을 alio_inbox/ 에 받기(.hwp 는 kordoc 으로 본문 추출)
+node scripts/alio_sync.mjs --apply      # 받아서 scripts/import_regs.py 로 등록 — 이후 git diff 확인 → commit·push
+```
+- 비교 기준: ALIO 시행일 vs 등록본 개정 정보(`2025년도 1월 일부개정`). 다른 경로(`../alio-mcp` 아님)면 `--alio <경로>` 또는 `ALIO_MCP_DIR`.
+- 결과는 화면 **규정·절차 관리 › 호환성 점검**에 '📡 ALIO 공시 내규보다 오래된 규정 N건'으로 보입니다. 등록 후에는 근거 규정이 바뀐 절차가 '개정됨'으로 표시되어 **🔬 영향 분석**으로 이어집니다.
+- **자동**: `.github/workflows/alio-sync.yml`이 매주 월요일 아침 비교·등록해 PR을 엽니다(수동 실행 가능). GitHub 러너(해외)에서는 ALIO 접속이 가끔 실패하니, 그때는 기관 PC에서 `--apply`를 실행하세요.
+- **Claude Code에서 ALIO 직접 검색**: 저장소의 `.mcp.json`에 alio 서버가 등록되어 있습니다(`ALIO_MCP_DIR`, 기본 `../alio-mcp`). "우리 기관 여비규정 최신 조문 보여줘", "다른 기관 유연근무 규정과 비교해줘"처럼 물으면 됩니다.
+
 ---
 
 ## 프로젝트 구조
@@ -186,6 +202,8 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 ├── docs/ADOPTION.md           # 다른 기관 도입 가이드
 ├── docs/ERP_TEST.md           # 실제 ERP 시험 순서(🩺 진단 보고서)
 ├── scripts/diag_report.py     # 진단 보고서 요약·수정 후보 뽑기
+├── scripts/alio_sync.mjs      # ALIO 공시 내규와 비교·개정본 등록(alio-mcp)
+├── .mcp.json                  # Claude Code용 alio MCP 서버 등록
 ├── upload.html                # 내규 업로드 페이지
 ├── api_server.py              # Flask API 서버
 ├── api/index.py               # Vercel 서버리스 진입점

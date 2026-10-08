@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "alio": {
+      "command": "node",
+      "args": ["${ALIO_MCP_DIR:-../alio-mcp}/src/main.js"]
+    }
+  }
+}

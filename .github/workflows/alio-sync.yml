@@ -1,0 +1,57 @@
+name: ALIO 내규 최신성 확인
+
+# 매주 월요일 아침(한국 시각 7시) ALIO 공시 내규와 서무비서 등록 내규를 비교하고,
+# 개정·신규 규정이 있으면 받아서 등록한 PR 을 연다(수동 실행도 가능).
+# GitHub 러너(해외)에서는 ALIO 접속이 간헐적으로 실패할 수 있다 — 실패하면 기관 PC 에서
+# node scripts/alio_sync.mjs --apply 를 실행한다.
+on:
+  schedule:
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+    inputs:
+      all:
+        description: "개정 여부와 상관없이 ALIO 현행본 전부 다시 등록"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 서버 의존성
+        run: pip install -r requirements.txt
+      - name: alio-mcp 받기
+        run: |
+          git clone --depth 1 https://github.com/chromehearts79/alio-mcp.git "$RUNNER_TEMP/alio-mcp"
+          cd "$RUNNER_TEMP/alio-mcp" && npm ci --omit=optional --ignore-scripts
+      - name: ALIO 와 비교·등록
+        env:
+          ALIO_MCP_DIR: ${{ runner.temp }}/alio-mcp
+        run: node scripts/alio_sync.mjs --apply ${{ inputs.all && '--all' || '' }}
+      - name: 바뀐 것이 있으면 PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$(git status --porcelain -- regulations regulations_manifest.json secretary/alio_status.json)" ]; then echo "변경 없음"; exit 0; fi
+          b="alio-sync/$(date +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$b"
+          git add regulations regulations_manifest.json secretary/alio_status.json
+          git commit -m "ALIO 공시 내규 반영($(date +%Y-%m-%d))"
+          git push -f origin "$b"
+          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$b" \
+            --title "ALIO 공시 내규 반영($(date +%Y-%m-%d))" \
+            --body "scripts/alio_sync.mjs 결과입니다. 바뀐 규정을 확인한 뒤, 관리 › 호환성 점검에서 근거 규정이 개정된 절차를 영향 분석으로 확인하세요." || echo "PR 이 이미 있습니다."
