@@ -24,6 +24,14 @@ chrome.runtime.onInstalled.addListener(async (d) => {
     chrome.contextMenus.create({ id: "sec-ask", title: "서무비서에 묻기: “%s”", contexts: ["selection"] });
     chrome.contextMenus.create({ id: "sec-open", title: "서무비서 열기", contexts: ["page", "editable"] });
   });
+  // 업데이트로 기본 주소가 늘었으면(예: 온나라) 사용자가 저장해 둔 주소 목록에도 더한다
+  if (d && d.reason === "update") {
+    const { erpHosts } = await chrome.storage.sync.get("erpHosts");
+    if (Array.isArray(erpHosts)) {
+      const add = SEC_DEFAULTS.erpHosts.filter((h) => !erpHosts.includes(h));
+      if (add.length) await chrome.storage.sync.set({ erpHosts: [...erpHosts, ...add] });
+    }
+  }
   await registerExtraHosts();
   if (d.reason === "install" && !(await settings()).server) chrome.runtime.openOptionsPage();
 });
@@ -266,6 +274,15 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     });
     toPanel({ type: "context", tabId, context: m.context });
     chrome.tabs.sendMessage(tabId, { type: "chip", q: m.context.q, title: m.context.title }, { frameId: 0 }).catch(() => {});
+  } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
+    const st = state[tabId];
+    if (st && st.context && st.ctxFrame === sender.frameId) {
+      diag("bg", "context.clear", { was: st.context.title }, sender);
+      delete st.context; delete st.guard; delete st.ctxFrame;
+      chrome.tabs.sendMessage(tabId, { type: "guard", guard: null }).catch(() => {});
+      chrome.tabs.sendMessage(tabId, { type: "chip", q: "", title: "" }, { frameId: 0 }).catch(() => {});
+      toPanel({ type: "context", tabId, context: null });
+    }
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
     openPanel(sender.tab).then(async () => {
       if (m.q) { await chrome.storage.session.set({ pendingAsk: { tabId, q: m.q } }); toPanel({ type: "ask", tabId, q: m.q }); }
