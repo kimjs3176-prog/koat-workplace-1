@@ -106,12 +106,16 @@ async function main() {
   if (notOnAlio.length) console.log(`\n## ALIO 에서 찾지 못한 등록 규정 ${notOnAlio.length}건(이름이 다르거나 비공시) — ${notOnAlio.slice(0, 15).map((x) => x.title).join(", ")}${notOnAlio.length > 15 ? " 등(전체는 상태 파일)" : ""}`);
 
   // 서무비서 화면(관리 › 호환성 점검)이 읽는 상태 파일 — 규정 원문은 담지 않는다
-  await fs.writeFile(STATUS, JSON.stringify({
-    checked: new Date().toISOString(), org: org.name, alio: rules.length, registered: manifest.length,
+  const status = { org: org.name, alio: rules.length, registered: manifest.length,
     items: rows.filter((x) => x.status !== "current").map(({ rule, ...x }) => x),
-    current: by("current").length, notOnAlio,
-  }, null, 1) + "\n");
-  console.log(`\n상태 저장: ${path.relative(ROOT, STATUS)}`);
+    current: by("current").length, notOnAlio };
+  // 확인 시각만 바뀐 경우엔 파일을 그대로 둔다 — 주간 자동 실행이 '변경 없음'을 알아볼 수 있게
+  const prev = await readJson(STATUS, null);
+  const same = prev && JSON.stringify({ ...prev, checked: undefined }) === JSON.stringify({ ...status, checked: undefined });
+  if (!same) {
+    await fs.writeFile(STATUS, JSON.stringify({ checked: new Date().toISOString(), ...status }, null, 1) + "\n");
+    console.log(`\n상태 저장: ${path.relative(ROOT, STATUS)}`);
+  } else console.log("\n상태 변화 없음(확인 시각만 다름) — 상태 파일은 그대로 둡니다.");
 
   if (!DOWNLOAD) { console.log("받으려면 --download, 받아서 등록까지 하려면 --apply"); return; }
   const targets = rows.filter((x) => ALL || x.status === "revised" || x.status === "new");

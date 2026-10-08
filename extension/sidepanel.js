@@ -40,12 +40,13 @@ async function refreshContext(askNow) {
   if (r && r.ask && r.tabId != null && r.tabId !== tabId && !params.get("tab")) { bound = tabId = r.tabId; }
   showCtx(r && r.context);
   if (r && r.ask) ask(r.ask);
-  else if (askNow && r && r.context) { lastAuto = r.context.screenId || r.context.q; ask(r.context.q); }
+  else if (askNow && r && r.context) { lastAuto = r.context.q; ask(r.context.q); }
 }
 
 async function init() {
   if (!params.get("tab")) myWin = await chrome.windows.getCurrent().then((w) => w.id).catch(() => null);
-  const s = await chrome.runtime.sendMessage({ type: "settings" });
+  const s = await chrome.runtime.sendMessage({ type: "settings" }).catch(() => null);
+  if (!s) { $("setup").hidden = false; return; }               // 백그라운드가 답하지 않으면 설정 안내라도 보인다
   dlog("panel.open", { server: !!(s && s.server), autoAsk: !!(s && s.autoAsk) });
   server = (s && s.server) || "";
   autoAsk = !s || s.autoAsk !== false;
@@ -85,7 +86,7 @@ window.addEventListener("message", async (e) => {
 chrome.runtime.onMessage.addListener((m) => {
   if (m.to !== "panel") return;
   // 🗂·칩을 누른 물음: 이 패널이 열린 창으로 온 것이면 그 탭(팝업 창 포함)에 붙는다
-  if (m.type === "ask" && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
+  if (m.type === "ask" && !params.get("tab") && m.tabId != null && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
     bound = tabId = m.tabId; refreshContext(false); ask(m.q); return;
   }
   // ERP 팝업 창(기안 작성 창 등)에서 업무를 알아보면 이 창의 패널이 그 팝업 탭에 붙는다
@@ -97,7 +98,7 @@ chrome.runtime.onMessage.addListener((m) => {
     showCtx(m.context);
     if (!m.context) lastAuto = "";                      // 업무 화면을 벗어나면, 다시 들어올 때 다시 안내
     // ERP 화면이 바뀌면(다른 업무) 패널이 바로 그 업무 안내로 — 같은 업무에선 다시 묻지 않는다
-    const key = m.context && (m.context.screenId || m.context.q);
+    const key = m.context && m.context.q;
     if (autoAsk && key && key !== lastAuto) { lastAuto = key; ask(m.context.q); }
   }
   else if (m.type === "ask") ask(m.q);
