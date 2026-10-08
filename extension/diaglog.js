@@ -17,7 +17,9 @@ function diagLoad() {
 }
 // 문자열 속 전화·주민·계좌처럼 보이는 숫자열을 가린다(제목·칸 이름에 섞여 들어오는 경우 대비)
 function diagScrub(v, depth = 0) {
-  if (typeof v === "string") return v.replace(/\d{6}[- ]?\d{7}|\d{2,4}[-. ]\d{3,4}[-. ]\d{4}|\d{9,}/g, "#").slice(0, 300);
+  if (typeof v === "string") return v
+    .replace(/([가-힣]{2,4}\s*)?[\w.+-]+@[\w-]+(\.[\w-]+)+/g, "(메일주소)")       // 이름+메일(그룹웨어 머리말 등)
+    .replace(/\d{6}[- ]?\d{7}|\d{2,4}[-. ]\d{3,4}[-. ]\d{4}|\d{9,}/g, "#").slice(0, 300);
   if (Array.isArray(v)) return depth > 4 ? [] : v.slice(0, 80).map((x) => diagScrub(x, depth + 1));
   if (v && typeof v === "object") {
     if (depth > 4) return {};

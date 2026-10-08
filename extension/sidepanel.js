@@ -82,6 +82,7 @@ chrome.runtime.onMessage.addListener((m) => {
   if (m.to !== "panel" || (tabId != null && m.tabId !== tabId)) return;
   if (m.type === "context") {
     showCtx(m.context);
+    if (!m.context) lastAuto = "";                      // 업무 화면을 벗어나면, 다시 들어올 때 다시 안내
     // ERP 화면이 바뀌면(다른 업무) 패널이 바로 그 업무 안내로 — 같은 업무에선 다시 묻지 않는다
     const key = m.context && (m.context.screenId || m.context.q);
     if (autoAsk && key && key !== lastAuto) { lastAuto = key; ask(m.context.q); }

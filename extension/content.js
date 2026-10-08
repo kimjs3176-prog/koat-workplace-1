@@ -32,6 +32,8 @@
   // 진단 기록: 서비스 워커로 보낸다(값은 보내지 않고 구조·결과만). 기록이 꺼져 있으면 서비스 워커가 버린다.
   const dlog = (ev, data) => { try { chrome.runtime.sendMessage({ type: "log", src: TOP ? "content" : "content(frame)", ev, data: Object.assign({ frame: MYPATH }, data || {}) }).catch(() => {}); } catch (e) {} };
   dlog("load", { url: location.pathname, title: document.title.slice(0, 60), designMode: document.designMode === "on", top: TOP });
+  // 이 프레임이 새 화면을 열었다 — 이 프레임이 알려 둔 업무가 있으면 서비스 워커가 지운다(메뉴만 바뀌는 그룹웨어 대비)
+  try { chrome.runtime.sendMessage({ type: "frameNav" }).catch(() => {}); } catch (e) {}
 
   // ── 입력란 ────────────────────────────────────────────────
   const isTextInput = (el) => el.tagName === "INPUT" && /^(text|search|email|tel|number|date|)$/i.test(el.type || "");
@@ -322,7 +324,10 @@
     return null;
   }
   let lastSent = "", noneLogged = "";
+  // 이 프레임이 알려 둔 업무가 더는 화면에 없으면 지우게 한다
+  function forget() { if (lastSent) { lastSent = ""; chrome.runtime.sendMessage({ type: "frameNav" }).catch(() => {}); } }
   function detect() {
+    if (globalThis.SEC_SKIP_URL && globalThis.SEC_SKIP_URL.test(location.pathname)) { forget(); return; }
     const texts = candidates();
     const m = screenMatch(texts);
     let ctx = null;
@@ -332,14 +337,21 @@
       const hit = texts.find((t) => rx.test(t));
       if (hit) { ctx = { q, title: hit.slice(0, 40), proc: proc || "", rank: i }; break; }
     }
+    if (!ctx) {                                         // 제목 문구가 없으면 주소 경로로(가장 덜 구체적)
+      const base = (globalThis.SEC_RULES || []).length;
+      for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) {
+        if (rx.test(location.pathname)) { ctx = { q, title: q, proc: proc || "", rank: base + i, byUrl: true }; break; }
+      }
+    }
     if (!ctx) {
       // 업무를 알아보지 못한 화면 — 어떤 제목 문구가 있었는지 남겨 규칙을 보강한다(주소마다 한 번)
       if (texts.length && noneLogged !== location.pathname) { noneLogged = location.pathname; dlog("detect.none", { url: location.pathname, texts: texts.slice(0, 25) }); }
+      forget();
       return;
     }
     const key = JSON.stringify(ctx);
     // 어느 프레임에서 찾았든 서비스 워커가 맨 위 프레임의 🗂 버튼에 다시 알려 준다
-    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: m ? "화면 규칙" : "기본 규칙", hit: m ? m.hit : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
+    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: m ? "화면 규칙" : ctx.byUrl ? "주소 규칙" : "기본 규칙", hit: m ? m.hit : ctx.byUrl ? location.pathname : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
   }
   let timer = null;
   const schedule = () => { clearTimeout(timer); timer = setTimeout(detect, 600); };

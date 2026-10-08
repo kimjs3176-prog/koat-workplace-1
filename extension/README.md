@@ -1,6 +1,6 @@
 # 서무비서 브라우저 확장 (Chrome · Edge) — 서무비서의 메인
 
-ERP·그룹웨어(기본: `https://kerp.koat.or.kr`) 화면 **옆 사이드 패널**에서 서무비서를 쓰는 확장입니다. Manifest V3 형식이며, 같은 파일로 Chrome과 Edge에서 모두 동작합니다.
+ERP·그룹웨어(기본: `https://kerp.koat.or.kr`, 온나라 `https://onnara.koat.or.kr`) 화면 **옆 사이드 패널**에서 서무비서를 쓰는 확장입니다. Manifest V3 형식이며, 같은 파일로 Chrome과 Edge에서 모두 동작합니다.
 
 | 기능 | 내용 |
 |---|---|

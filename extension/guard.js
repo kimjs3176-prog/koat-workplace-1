@@ -1,11 +1,11 @@
 // 서무비서 확장 — 결재 전 점검
-// ERP 에서 '상신·결재요청·기안·제출' 버튼을 누르면, 지금 화면 업무의 반려 점검 항목을 먼저 보여 준다.
+// ERP 에서 '상신·결재요청·제출' 버튼을 누르면, 지금 화면 업무의 반려 점검 항목을 먼저 보여 준다.
 // 점검했다고 누르면 원래 버튼을 그대로 다시 눌러 준다(ERP 동작은 바꾸지 않는다). 설정에서 끌 수 있다.
 (() => {
   if (window.__secGuard) return; window.__secGuard = true;
   let guard = null;                  // {proc, title, pitfalls:[{t,basis}], enabled}
   let bypass = false;
-  const SUBMIT = /^(결재\s*)?상신(하기)?$|결재\s*(요청|올리기|상신)|^기안(하기|완료)?$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$/;
+  const SUBMIT = /^(결재\s*)?상신(하기)?$|결재\s*(요청|올리기|올림|상신)|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$/;
   const ackKey = () => "secGuardAck:" + (guard && guard.proc);
   const acked = () => { try { return Date.now() - Number(sessionStorage.getItem(ackKey()) || 0) < 10 * 60 * 1000; } catch (e) { return false; } };
 
