@@ -5,14 +5,15 @@ importScripts("config.js", "diaglog.js");
 const state = {};            // tabId → {focusFrame, context:{label,q,title}}
 // 서비스 워커는 잠깐 쉬면 메모리가 비워진다 — 탭별 업무 감지 결과를 세션 저장소에 두었다가 깨어날 때 되살린다
 const stateReady = chrome.storage.session.get("tabState").then(({ tabState }) => {
-  for (const [k, v] of Object.entries(tabState || {})) if (!state[k]) state[k] = v;
+  for (const [k, v] of Object.entries(tabState || {})) state[k] = Object.assign({}, v, state[k] || {});   // 깨어난 뒤 먼저 온 값이 우선
 }).catch(() => {});
 let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     const out = {};
-    for (const [k, v] of Object.entries(state)) if (v && v.context) out[k] = { context: v.context, ctxFrame: v.ctxFrame, guard: v.guard };
+    for (const [k, v] of Object.entries(state)) if (v && (v.context || v.focusFrame !== undefined || v.cs))
+      out[k] = { context: v.context, ctxFrame: v.ctxFrame, guard: v.guard, focusFrame: v.focusFrame, cs: v.cs };
     chrome.storage.session.set({ tabState: out }).catch(() => {});
   }, 300);
 }
@@ -245,7 +246,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   }
   const tabId = sender.tab ? sender.tab.id : m.tabId;
   if (m.type === "focus" && sender.tab) {                 // ERP 의 어느 프레임에서 입력란을 눌렀는지
-    (state[tabId] = state[tabId] || {}).focusFrame = sender.frameId;
+    (state[tabId] = state[tabId] || {}).focusFrame = sender.frameId; saveState();   // 초안을 쓰는 사이 워커가 쉬어도 기억
   } else if (m.type === "context" && sender.tab) {        // 화면 감지 결과 — 프레임 중 가장 구체적인 것
     if (!applyContext(sender.tab, sender.frameId, m.context, sender)) { reply && reply({ ignored: true }); return; }
   } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
@@ -269,15 +270,17 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     });
     return true;
   } else if (m.type === "insert") {                       // 패널의 초안 → ERP 입력란
+    stateReady.then(() => {
     const st = state[m.tabId] || {};
     const opts = st.focusFrame !== undefined ? { frameId: st.focusFrame } : { frameId: 0 };
-    chrome.tabs.sendMessage(m.tabId, { type: "insert", text: m.text }, opts)
+    return chrome.tabs.sendMessage(m.tabId, { type: "insert", text: m.text }, opts)
       .then((r) => { diag("bg", "insert", { frameId: opts.frameId, ok: !!(r && r.ok), where: r && r.where, len: String(m.text || "").length }); reply(r || { ok: false }); })
       .catch((e) => { diag("bg", "insert", { frameId: opts.frameId, ok: false, err: e.message }); reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }); });
+    });
     return true;
-  } else if (m.type === "hello" || m.type === "getProfiles") {   // 내용 스크립트가 이 탭에 붙었다(맨 위 프레임)
-    if (sender.tab && sender.frameId === 0) (state[tabId] = state[tabId] || {}).cs = true;
-    reply && reply({ profiles: [] });
+  } else if (m.type === "hello") {                       // 내용 스크립트가 이 탭에 붙었다(맨 위 프레임)
+    if (sender.tab && sender.frameId === 0) { (state[tabId] = state[tabId] || {}).cs = true; saveState(); }
+    reply && reply({ ok: true });
   } else if (m.type === "openHere" && sender.tab) {        // 서무비서 웹 화면의 '패널로 열기'
     openPanel(sender.tab);
   } else if (m.type === "getGuard" && sender.tab) {
@@ -302,7 +305,12 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
 chrome.tabs.onRemoved.addListener((id) => { delete state[id]; saveState(); });
 // 탭이 다른 주소로 넘어가면 감지 결과를 비운다(같은 탭에서 다른 업무 화면으로)
 chrome.tabs.onUpdated.addListener((id, info, tab) => {
-  if (info.status === "loading" && info.url && state[id]) { delete state[id].cs; delete state[id].context; delete state[id].guard; delete state[id].ctxFrame; saveState(); }
+  if (info.status === "loading" && info.url && state[id]) {
+    const had = !!state[id].context;
+    for (const k of ["cs", "context", "guard", "ctxFrame", "focusFrame"]) delete state[id][k];
+    saveState();
+    if (had) toPanel({ type: "context", tabId: id, context: null });   // 패널의 이전 업무 배지도 지운다
+  }
   if (info.status === "complete") setTimeout(() => urlContext(id).catch(() => {}), 2500);
 });
 
@@ -318,9 +326,11 @@ function applyContext(tab, frameId, ctx, sender) {
   diag("bg", "context", ctx, sender);
   st.context = ctx; st.ctxFrame = frameId; saveState();
   guardFor(ctx).then((g) => {                           // 결재 전 점검 항목을 그 탭의 모든 프레임에
-    if (!g) return;
-    state[tabId].guard = g; saveState();
-    chrome.tabs.sendMessage(tabId, { type: "guard", guard: g }).catch(() => {});
+    const now = state[tabId];
+    if (!now || now.context !== ctx) return;            // 그사이 다른 화면이 감지됐으면 늦게 온 결과는 버린다
+    if (g) now.guard = g; else delete now.guard;        // 점검 항목이 없는 화면이면 이전 화면의 점검을 지운다
+    saveState();
+    chrome.tabs.sendMessage(tabId, { type: "guard", guard: g || null }).catch(() => {});
   });
   // ERP·온나라가 띄운 팝업 창(기안 작성 창 등)의 감지 결과는 원래 창의 옆 패널로도 보낸다
   const popup = winType[tab.windowId] && winType[tab.windowId] !== "normal";

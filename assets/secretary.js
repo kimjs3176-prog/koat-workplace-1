@@ -40,7 +40,7 @@ function _lsPut(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); return t
 function personal(){ const p=_ls(LS_PERSONAL,{}); p.procedures=Array.isArray(p.procedures)?p.procedures:[]; p.notes=p.notes||{}; return p; }
 function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
-function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); if(typeof syncDeadlines==='function') syncDeadlines(); }
+function saveCases(c){ const ok=_lsPut(LS_CASES, c.slice(0,300)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
 let _toastT=null;
 // ── 내 AI 키(이 브라우저에만 저장) — 기관 키가 없어도 AI 분석을 켠다. 요청할 때만 헤더로 보내고 서버는 저장하지 않는다.
 const LS_AIKEY='koat-sec-aikey';
@@ -54,16 +54,23 @@ const norm=s=>String(s||'').replace(/\s+/g,'').toLowerCase();
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 
 // ── 절차 목록(층 병합) ───────────────────────────────────────────────────
-function allProcs(){
+// S.common·S.org·개인 층은 [[erp]] 같은 자리표시를 그대로 둔 원본이다(저장·내보내기는 원본으로).
+// 화면에 보일 때만 기관 명칭으로 바꾼다 — 바꾼 결과는 원본·설정이 바뀔 때까지 재사용.
+const _txMemo=new WeakMap();
+function txCached(obj){ if(!obj||typeof obj!=='object') return obj; const m=_txMemo.get(obj);
+  if(m&&m.cfg===S.cfg) return m.v; const v=deepTx(obj); _txMemo.set(obj,{cfg:S.cfg,v}); return v; }
+function allProcs(raw){
   const map=new Map();
   const put=(arr,layer)=>(arr||[]).forEach(p=>{ if(!p||!p.id) return;
-    const q=layer==='personal'?deepTx(p):p;
+    const q=raw?p:txCached(p);
     map.set(p.id, Object.assign({}, q, {_layer:layer, _base: map.has(p.id)?map.get(p.id)._layer:null,
       _status: layer==='personal'?(S.pstatus[p.id]||null):(S.status[layer+':'+p.id]||null)})); });
   put(S.common.procedures,'common'); put(S.org.procedures,'org'); put(personal().procedures,'personal');
   return [...map.values()].filter(p=>!p.hidden);
 }
-function allDrafts(){ return Object.assign({}, S.common.drafts||{}, S.org.drafts||{}); }
+function allDrafts(raw){ const o={}; for(const src of [S.common.drafts||{}, S.org.drafts||{}]) for(const k in src) o[k]=raw?src[k]:txCached(src[k]); return o; }
+// 편집·저장용 원본 절차(자리표시 유지)
+function rawProc(id){ return allProcs(true).find(p=>p.id===id)||null; }
 function getProc(id){ return allProcs().find(p=>p.id===id)||null; }
 function hiddenProcs(){
   const vis=new Set(allProcs().map(p=>p.id)); const out=[];
@@ -77,7 +84,7 @@ async function load(force){
   S.loading=(async()=>{
     try{ const r=await fetch('/api/secretary/procedures'+(force?'?fresh=1':'')); const d=await r.json();
       S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.revised=d.revised||[]; S.alio=d.alio||null; S.ai=d.ai||{available:false}; S.insights=d.insights||{available:false}; S.ins={};
-      S.common=deepTx(d.common||S.common); S.org=deepTx(d.org||S.org); S.admin=d.admin||{}; S.loaded=true;
+      S.common=d.common||S.common; S.org=d.org||S.org; S.admin=d.admin||{}; S.loaded=true;
       applyBranding(); checkPersonal();
     }catch(e){ S.loaded=false; throw e; }
     finally{ S.loading=null; }
@@ -206,11 +213,13 @@ function ensureCase(){
   let c=curCase(); if(c) return c;
   const p=getProc(S.procId); if(!p) return null;
   c={id:uid(), procId:p.id, title:p.title, created:today(), updated:Date.now(), query:S.query||'', dates:{}, checks:{}, note:'', drafts:{}, status:'open'};
-  const all=cases(); all.unshift(c); saveCases(all); S.caseId=c.id; return c;
+  const all=cases(); all.unshift(c); if(!saveCases(all)) return null; S.caseId=c.id; return c;
 }
-function updateCase(fn){
-  const all=cases(); const i=all.findIndex(c=>c.id===S.caseId); if(i<0) return null;
-  fn(all[i]); all[i].updated=Date.now(); saveCases(all); return all[i];
+function updateCase(fn){ return updateCaseById(S.caseId, fn); }
+// 비동기 작업(감사·영수증 인식)은 시작할 때의 건 id 로 저장한다 — 그사이 다른 건을 열어도 섞이지 않게
+function updateCaseById(id, fn){
+  const all=cases(); const i=all.findIndex(c=>c.id===id); if(i<0) return null;
+  fn(all[i]); all[i].updated=Date.now(); return saveCases(all)?all[i]:null;
 }
 function caseProgress(c, p){
   const steps=(p&&p.steps)||[]; const req=steps.map((s,i)=>i).filter(i=>!steps[i].optional);
@@ -237,9 +246,7 @@ async function start(opts){
       if(m.type==='ask' && m.q){ S.view='home'; ask(String(m.q).slice(0,200)); }
       else if(m.type==='hello'){ S.extVersion=String(m.version||''); checkExtUpdate(); }
       else if(m.type==='inserted'){
-        if(m.ok && m.mapped){ const d=allDrafts()[(S._draft||{}).key]||{}; const lb=k=>k==='_title'?'제목':k==='_body'?'본문':(((d.fields||[]).find(f=>f.k===k)||{}).l||k);
-          toast(`ERP '${m.screen||'화면'}'의 ${m.filled.length}칸을 채웠습니다(${m.filled.map(lb).join(', ')}).${(m.missing||[]).length?' 못 찾은 칸: '+m.missing.map(lb).join(', '):''} 내용을 확인하세요.`, 6000); return; }
-        if(m.ok){ toast('ERP 입력란에 넣었습니다. 내용을 확인하세요.'+(m.mappedButMissed?' (연결해 둔 칸을 이 화면에서 찾지 못해 마지막으로 누른 칸에 넣었습니다)':''), 4200); return; }
+        if(m.ok){ toast('ERP 입력란(마지막으로 누른 칸)에 넣었습니다. 내용을 확인하세요.', 4200); return; }
         // 넣을 칸을 못 찾으면 클립보드로 — ERP에서 Ctrl+V
         const t=S._lastInsert||''; const done=()=>toast((m.error?m.error+' ':'ERP에서 넣을 칸을 찾지 못했습니다. ')+'초안을 복사해 두었으니 ERP 입력란에 붙여넣기(Ctrl+V) 하세요.', 5200);
         (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(done).catch(()=>toast(m.error||'ERP 입력란을 먼저 한 번 누른 뒤 다시 시도하세요.', 4200)); }
@@ -339,7 +346,7 @@ function extHero(){
   if(_ls('koat_sec_herox',0)>Date.now()) return '';
   const b=browserKind();
   return `<div class="sec-ext-cta"><div class="sec-ext-cta-m"><div class="sec-ext-cta-t">🧩 서무비서는 <b>ERP 옆에서</b> 쓰는 브라우저 확장이 기본입니다</div>`+
-    `<ul><li>ERP 화면을 열면 그 업무의 <b>절차·기한·반려 점검</b>을 옆 패널에 바로</li><li>만든 초안을 ERP의 <b>여러 칸에 한 번에</b> 입력</li><li><b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 확인</li><li>도구 모음 아이콘에 <b>다가오는 기한</b>, 당일 바탕화면 알림</li></ul></div>`+
+    `<ul><li>ERP 화면을 열면 그 업무의 <b>절차·기한·반려 점검</b>을 옆 패널에 바로</li><li>만든 초안을 ERP에서 <b>마지막으로 누른 입력란</b>에 바로 넣기(안 되면 복사 → Ctrl+V)</li><li><b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 확인</li><li>도구 모음 아이콘에 <b>다가오는 기한</b>, 당일 바탕화면 알림</li></ul></div>`+
     `<div class="sec-ext-cta-a">${b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치할 수 있습니다</span>`:`<button class="sec-btn primary" data-a="view" data-v="ext">🧩 확장 설치하기</button>`}`+
     `<button class="sec-linkbtn" data-a="herox">웹에서 계속 쓰기</button></div></div>`;
 }
@@ -717,10 +724,10 @@ async function saveConfig(cfg, okMsg){
 }
 function packOut(){
   const scope=(document.getElementById('secPackScope')||{}).value||'all';
-  const src=scope==='org'?(S.org.procedures||[]).map(p=>Object.assign({},p,{_layer:'org'})):scope==='personal'?personal().procedures.map(p=>Object.assign({},p,{_layer:'personal'})):allProcs();
+  const src=scope==='org'?(S.org.procedures||[]).map(p=>Object.assign({},p,{_layer:'org'})):scope==='personal'?personal().procedures.map(p=>Object.assign({},p,{_layer:'personal'})):allProcs(true);
   const procs=src.filter(p=>!p.hidden).map(p=>{ const o=JSON.parse(JSON.stringify(p)); Object.keys(o).forEach(k=>{ if(k.startsWith('_')) delete o[k]; }); return o; });
   if(!procs.length){ toast('내보낼 절차가 없습니다.'); return; }
-  const drafts={}; const ad=allDrafts(); procs.forEach(p=>(p.steps||[]).forEach(s=>{ if(s.draft&&ad[s.draft]) drafts[s.draft]=ad[s.draft]; }));
+  const drafts={}; const ad=allDrafts(true); procs.forEach(p=>(p.steps||[]).forEach(s=>{ if(s.draft&&ad[s.draft]) drafts[s.draft]=ad[s.draft]; }));
   const regs={}; procs.forEach(p=>{ (p.steps||[]).forEach(s=>{ (s.basis||[]).concat(s.form?[s.form]:[]).forEach(b=>regs[b.reg]=regs[b.reg]||(p.verified||{})[b.reg]||''); });
     (p.forms||[]).forEach(f=>regs[f.reg]=regs[f.reg]||(p.verified||{})[f.reg]||''); });
   const o=S.cfg.org||{};
@@ -752,7 +759,7 @@ async function packIn(layer){
 
 function blankProc(){ return {id:'p-'+uid().slice(-6), icon:'📌', category:'기타', title:S.query||'', summary:'', approval:'', triggers:S.query?[S.query]:[], dates:[], steps:[{t:''}], forms:[], tips:[]}; }
 function editView(){
-  const src=S.editId?getProc(S.editId):null; const p=S._draftProc||(src?JSON.parse(JSON.stringify(src)):blankProc());
+  const src=S.editId?rawProc(S.editId):null; const p=S._draftProc||(src?JSON.parse(JSON.stringify(src)):blankProc());
   S._draftProc=p;
   const lay=S.editLayer;
   const f=(k,l,v,ph,extra)=>`<label class="sec-f"><span>${l}</span><input data-a="ef" data-k="${k}" value="${esc(v||'')}" placeholder="${esc(ph||'')}" ${extra||''}></label>`;
@@ -769,7 +776,7 @@ function editView(){
       `<label class="sec-f"><span>서식</span><input data-a="es" data-i="${i}" data-k="form" value="${esc(s.form?s.form.reg+' '+s.form.label:'')}" placeholder="문서규칙 별지 제9호 서식"></label>`+
       `<label class="sec-f"><span>초안</span><select data-a="es" data-i="${i}" data-k="draft"><option value="">없음</option>${Object.entries(allDrafts()).map(([k,d])=>`<option value="${esc(k)}" ${s.draft===k?'selected':''}>${esc(d.title)}</option>`).join('')}</select></label>`+
     `</div></div>`).join('');
-  return `<div class="sec-card"><div class="sec-card-h">${src?'✏ 절차 수정':'＋ 새 절차'} <span class="sec-sub">${src?`원본: ${LAYER_LABEL[src._layer]} 층`:''}</span></div>`+
+  return `<div class="sec-card"><div class="sec-card-h">${src?'✏ 절차 수정':'＋ 새 절차'} <span class="sec-sub">${src?`원본: ${LAYER_LABEL[src._layer]} 층 · `:''}[[erp]]·[[org]] 같은 자리표시는 화면에서 기관 명칭으로 바뀌어 보입니다</span></div>`+
     `<div class="sec-eg">`+f('title','제목 *',p.title,'예: 국내출장 — 신청부터 정산까지')+f('id','ID *',p.id,'영문 소문자·숫자·하이픈 (예: my-trip)', src?'readonly':'')+
       f('icon','아이콘',p.icon,'📌','maxlength="4"')+f('category','분류',p.category,'출장·복무·물품·행사·회계·문서')+`</div>`+
     `<label class="sec-f"><span>요약</span><input data-a="ef" data-k="summary" value="${esc(p.summary||'')}" placeholder="한 줄 요약"></label>`+
@@ -852,7 +859,7 @@ async function saveOrg(list, tokArg){
       body:JSON.stringify({procedures:list, drafts:S.org.drafts||{}, editor})});
     const d=await r.json();
     if(!d.success){ toast(d.error||'저장하지 못했습니다.', 4200); return false; }
-    S._tok=tok; S.org=deepTx(d.org); toast(d.message||'기관 절차를 저장했습니다.', 4200);
+    S._tok=tok; S.org=d.org||S.org; toast(d.message||'기관 절차를 저장했습니다.', 4200);
     try{ await load(true); }catch(e){} return true;
   }catch(e){ toast('서버에 저장하지 못했습니다.'); return false; }
 }
@@ -1219,11 +1226,12 @@ function imgToJpeg(file, max, q){
 }
 async function addReceipts(files){
   const p=getProc(S.procId); if(!p||!files||!files.length) return;
-  ensureCase(); const n0=receipts(curCase()).length;
+  const c0=ensureCase(); if(!c0){ toast('처리 이력을 저장하지 못했습니다(브라우저 저장 공간 확인).'); return; }
+  const cid=c0.id; const n0=receipts(c0).length;
   if(n0+files.length>20){ toast('한 건에 증빙은 20장까지 넣을 수 있습니다.'); return; }
   S.rcBusy=(S.rcBusy||0)+files.length; render();
-  const year=((curCase().dates||{}).start||today()).slice(0,4);
-  for(const f of files){
+  const year=((c0.dates||{}).start||today()).slice(0,4);
+  for(const f of files){ try{
     const r={id:uid(), name:String(f.name||'증빙').slice(0,60), date:'', end_date:'', amount:0, vendor:'', kind:'기타', payment:'알수없음', nights:0, route:'', items:'', note:'', confidence:'', ai:false};
     try{
       r.thumb=await imgToJpeg(f, 220, .7);
@@ -1234,16 +1242,15 @@ async function addReceipts(files){
         if(d.success){ Object.assign(r, d.receipt, {ai:true}); } else { r.note=d.error||'인식하지 못했습니다 — 직접 입력하세요.'; }
       }
     }catch(e){ r.note='이미지를 읽지 못했습니다 — 직접 입력하세요.'; }
-    updateCase(c=>{ (c.receipts=c.receipts||[]).push(r); });
-    S.rcBusy--; render();
-  }
+    if(!updateCaseById(cid, c=>{ (c.receipts=c.receipts||[]).push(r); })) toast('증빙을 저장하지 못했습니다(브라우저 저장 공간 확인).');
+  } finally { S.rcBusy=Math.max(0,S.rcBusy-1); render(); } }
   // 영수증 날짜로 비어 있는 기준일 채우기(출장: 첫날~마지막 날, 그 밖: 첫 날짜)
-  const c=curCase(); const ds=receipts(c).flatMap(x=>[x.date, x.end_date]).filter(Boolean).sort();
+  const c=cases().find(x=>x.id===cid); if(!c) return; const ds=receipts(c).flatMap(x=>[x.date, x.end_date]).filter(Boolean).sort();
   const keys=(p.dates||[]).map(d=>d.k);
   if(ds.length && keys.length && !Object.keys(c.dates||{}).length){
     const fill={}; fill[keys[0]]=ds[0]; if(keys[1]) fill[keys[1]]=ds[ds.length-1];
-    updateCase(x=>{ x.dates=fill; });
-    S.dateNote='영수증 날짜로 '+(p.dates||[]).filter(d=>fill[d.k]).map(d=>`${d.l} ${fmtDate(fill[d.k])}`).join(' · ');
+    updateCaseById(cid, x=>{ x.dates=fill; });
+    if(S.caseId===cid) S.dateNote='영수증 날짜로 '+(p.dates||[]).filter(d=>fill[d.k]).map(d=>`${d.l} ${fmtDate(fill[d.k])}`).join(' · ');
     render();
   }
 }
@@ -1409,14 +1416,14 @@ function auditInput(p, c){
 function auditSig(inp){ const x=JSON.stringify(inp); let h=0; for(let i=0;i<x.length;i++) h=(h*31+x.charCodeAt(i))|0; return String(h); }
 function auditOpen(c){ const a=c&&c.audit; if(!a) return []; return (a.findings||[]).filter(f=>!(a.ack||{})[f.id]); }
 async function runAudit(){
-  const p=getProc(S.procId); if(!p) return; ensureCase(); const c=curCase();
+  const p=getProc(S.procId); if(!p) return; const c=ensureCase(); if(!c){ toast('처리 이력을 저장하지 못했습니다(브라우저 저장 공간 확인).'); return; }
   const inp=auditInput(p, c); const sig=auditSig(inp); const id=c.id;
   const proc={}; Object.keys(p).filter(k=>k[0]!=='_').forEach(k=>proc[k]=p[k]);
   S.auditBusy=id; render();
   try{ const r=await fetch('/api/secretary/audit',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({procedure:proc, case:inp, today:today(), ai:!!aiOn()})});
     const d=await r.json(); if(!d.success) throw new Error(d.error||'감사하지 못했습니다.');
     const prev=(c.audit&&c.audit.ack)||{};
-    updateCase(x=>{ x.audit={at:today(), sig, findings:d.findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
+    updateCaseById(id, x=>{ x.audit={at:today(), sig, findings:d.findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
       ack:Object.fromEntries(Object.entries(prev).filter(([k])=>d.findings.some(f=>f.id===k)))}; });
     toast(d.findings.length?`지적 ${d.findings.length}건 — 높음 ${d.counts.high} · 보통 ${d.counts.medium} · 참고 ${d.counts.low}`:'걸리는 항목이 없습니다.');
   }catch(e){ toast(e.message||'감사 서버에 연결하지 못했습니다.'); }

@@ -8,7 +8,7 @@
   1) 사용자 메모(시험하면서 남긴 '여기서 안 됨' 같은 말)와 오류
   2) 화면 인식: 어떤 화면을 무슨 업무로 알아봤는지 / 못 알아본 화면의 제목·문구 → SEC_RULES 추가 후보
   3) 결재 전 점검: 눌린 버튼 이름 중 가로채지 못한 '상신·결재' 류 → guard.js SUBMIT 추가 후보
-  4) 칸 채우기: 프레임별 채운 칸·못 찾은 칸과 찾은 방법(sel/id/name/label/editor)
+  4) 초안 넣기: 마지막으로 누른 칸에 넣기 성공 여부·눌린 입력란(프레임·이름·종류)
   5) 스냅샷: 프레임 구조(같은 출처 여부·편집기), 칸 목록, 버튼, 편집기·화면 라이브러리 단서
 """
 import json
@@ -88,7 +88,7 @@ def report(path, r):
         print(f"- 덜 구체적이라 무시한 인식 {len(ign)}회(정상 동작일 수 있음)")
     nones = [e for e in log if e.get("ev") == "detect.none" and (e.get("d") or {}).get("texts")]
     if nones:
-        print("\n못 알아본 화면(문구를 보고 SEC_RULES 나 화면 규칙을 추가):")
+        print("\n못 알아본 화면(문구를 보고 SEC_RULES·SEC_URL_RULES 에 규칙 추가):")
     words = Counter()
     for e in nones:
         d = e.get("d") or {}
@@ -123,14 +123,6 @@ def report(path, r):
         print("- 버튼 기록 없음(상신·결재 류 버튼을 누르지 않았거나 ERP 에 확장이 붙지 않음)")
 
     h("5. 초안 넣기")
-    fills = [e for e in log if e.get("ev") == "fillmap"]
-    for e in fills:
-        d = e.get("d") or {}
-        print(f"- {hm(e)} 화면 '{d.get('screen')}' {'(시험)' if d.get('test') else ''} 채움 {d.get('filled')} / 못 찾음 {d.get('missing')}")
-        for f in d.get("perFrame") or []:
-            how = f.get("how") or {}
-            if how:
-                print(f"    [{f.get('path') or '(최상위)'}] " + "; ".join(f"{k}={v}" for k, v in how.items()))
     ins = [e for e in log if e.get("ev") in ("insert", "erp.insert")]
     okn = sum(1 for e in ins if (e.get("d") or {}).get("ok"))
     if ins:
@@ -144,7 +136,7 @@ def report(path, r):
         print("- 사용자가 누른 입력란(프레임 / 이름 / 종류):")
         for (fr, lab, kind), n in focus.most_common(25):
             print(f"    · {fr or '(최상위)'} / {lab or '(이름 없음)'} / {kind} ×{n}")
-    if not fills and not ins:
+    if not ins:
         print("- (없음)")
 
     h("6. 화면 구조 스냅샷")

@@ -25,9 +25,9 @@ ERP·그룹웨어(기본: `https://kerp.koat.or.kr`, 온나라 `https://onnara.k
 
 **기관 배포본**
 ```bash
-python scripts/build_extension.py --server https://<서무비서 주소> --erp https://kerp.koat.or.kr --version 1.0.0
+python scripts/build_extension.py --server https://<서무비서 주소> --erp https://kerp.koat.or.kr        # --version 을 빼면 manifest 의 현재 버전
 ```
-- `dist/secretary-extension-1.0.0.zip`이 만들어집니다. 서무비서 주소와 ERP 주소가 미리 들어 있어 사용자가 따로 설정하지 않아도 됩니다.
+- `dist/secretary-extension-<버전>.zip`이 만들어집니다. 서무비서 주소와 ERP 주소가 미리 들어 있어 사용자가 따로 설정하지 않아도 됩니다.
 - 이 zip을 Chrome 웹 스토어 또는 Edge 추가 기능(Partner Center)에 **비공개·조직 한정**으로 올립니다.
 - 그룹 정책 `ExtensionInstallForcelist`로 기관 PC에 일괄 설치할 수 있습니다.
 

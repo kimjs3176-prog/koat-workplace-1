@@ -40,6 +40,28 @@ else:
     ]
 CORS(app, origins=_cors_origins)
 
+# 요청 본문 상한 — 큰 본문을 다 읽기 전에 거른다(규정 업로드 포함 넉넉히). Vercel 은 자체 상한(4.5MB)이 먼저 걸린다.
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({"success": False, "error": "보낸 내용이 너무 큽니다. 파일 크기를 줄여 다시 시도하세요."}), 413
+
+
+def _bad_request_body(e):
+    """형식이 틀린 요청(예: 목록 자리에 객체)으로 생긴 형 오류는 500 대신 400 으로 알려 준다.
+    코드 결함일 수도 있으니 서버 로그에는 위치를 남긴다(요청 내용은 남기지 않는다)."""
+    if not request.path.startswith("/api/"):
+        app.logger.exception("처리 중 오류: %s", request.path)
+        return "서버 오류", 500
+    app.logger.warning("형식 오류 %s %s: %s", request.method, request.path, type(e).__name__, exc_info=True)
+    return jsonify({"success": False, "error": "요청 형식이 올바르지 않습니다."}), 400
+
+
+for _exc in (TypeError, AttributeError, ValueError, KeyError, IndexError):
+    app.register_error_handler(_exc, _bad_request_body)
+
 HEADERS = {"User-Agent": "KOAT-Secretary/1.0", "Accept": "application/json, */*;q=0.9"}
 
 # ── 재시도 정책이 적용된 requests 세션 ────────────────────────────────────────
@@ -1497,20 +1519,21 @@ def _embed_query(text: str, api_key: str, model: str, dim: int = 0):
     문서 벡터를 MRL 로 축소해 저장했으면 질의도 같은 차원으로 뽑아야 한다.
     """
     try:
+        # 키는 주소가 아니라 헤더로 — 주소는 오류 메시지·재시도 경고·접근 로그에 그대로 남는다
         url = (f"https://generativelanguage.googleapis.com/v1beta/models"
-               f"/{model}:embedContent?key={api_key}")
+               f"/{model}:embedContent")
         body = {"model": f"models/{model}",
                 "content": {"parts": [{"text": text}]},
                 "taskType": "RETRIEVAL_QUERY"}
         if dim:
             body["outputDimensionality"] = dim
-        r = _SESSION.post(url, timeout=15, json=body)
+        r = _SESSION.post(url, timeout=15, json=body, headers={"x-goog-api-key": api_key})
         if r.status_code != 200:
             print(f"[vec] 질의 임베딩 실패({r.status_code})")
             return None
         return r.json()["embedding"]["values"]
     except Exception as e:
-        print(f"[vec] 질의 임베딩 오류: {e}")
+        print(f"[vec] 질의 임베딩 오류: {type(e).__name__}")   # 예외 문구는 남기지 않는다(요청 정보가 섞일 수 있음)
         return None
 
 
@@ -1538,12 +1561,14 @@ def semantic_search(query: str, api_key: str, top_k: int = 20):
 
 
 def _user_gemini_key():
-    """사용자 Gemini 키 — 헤더(X-Gemini-Key) 우선, 없으면 서버 키.
+    """사용자 Gemini 키 — 헤더(X-Gemini-Key) → '내 AI 키'(X-AI-Key, Gemini) → 서버 키.
 
     F02: URL 쿼리로 키를 받지 않는다. 쿼리 파라미터는 접근 로그·관측 시스템에
     남을 수 있어, 사용자별 키는 요청 헤더로만 전달받는다.
     """
+    up, uk = _sec_ai_user()
     return (request.headers.get("X-Gemini-Key")
+            or (uk if up == "gemini" else "")
             or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
@@ -2314,6 +2339,7 @@ def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str =
     if not provider:
         raise _SecAIError("AI 키가 설정되어 있지 않습니다.")
     model = _sec_ai_model(provider)
+    who = "내 AI 키" if _sec_ai_user()[0] else ("서버 AI 키(ANTHROPIC_API_KEY)" if provider == "claude" else "서버 AI 키(GEMINI_API_KEY)")
     if provider == "claude":
         try:
             import anthropic
@@ -2323,7 +2349,7 @@ def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str =
         if image:
             content.append({"type": "image", "source": {"type": "base64", "media_type": image[0], "data": image[1]}})
         content.append({"type": "text", "text": text})
-        client = anthropic.Anthropic(api_key=_sec_ai_key("claude"), timeout=60.0, max_retries=2)
+        client = anthropic.Anthropic(api_key=_sec_ai_key("claude"), timeout=60.0, max_retries=1)
         try:
             resp = client.beta.messages.create(
                 model=model,
@@ -2337,7 +2363,7 @@ def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str =
                 fallbacks="default",
             )
         except anthropic.AuthenticationError:
-            raise _SecAIError("AI 키(ANTHROPIC_API_KEY)가 올바르지 않습니다.")
+            raise _SecAIError(f"{who}가 올바르지 않습니다. 키를 다시 확인하세요.")
         except anthropic.RateLimitError:
             raise _SecAIError("AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도하세요.")
         except anthropic.BadRequestError as e:
@@ -2359,12 +2385,17 @@ def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str =
                       + json.dumps(schema, ensure_ascii=False)})
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent"
         try:
-            r = _SESSION.post(url, params={"key": _sec_ai_key("gemini")}, timeout=60, json={
+            # 키는 헤더로(주소에 넣으면 로그에 남는다). 재시도 세션 대신 한 번만 — 사용자 키 사용량을 불리지 않는다
+            r = req_lib.post(url, headers={"x-goog-api-key": _sec_ai_key("gemini")}, timeout=60, json={
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": parts}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 0}})
         except req_lib.RequestException:
             raise _SecAIError("AI 서버에 연결하지 못했습니다.")
+        if r.status_code in (400, 401, 403) and "API_KEY" in (r.text or "")[:2000]:
+            raise _SecAIError(f"{who}가 올바르지 않습니다. 키를 다시 확인하세요.")
+        if r.status_code == 429:
+            raise _SecAIError("AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도하세요.")
         if r.status_code >= 400:
             raise _SecAIError(f"AI 서버 오류({r.status_code}).")
         try:
@@ -2377,7 +2408,10 @@ def _sec_ai_json(system: str, text: str, schema: dict, image=None, effort: str =
         m = re.search(r"\{.*\}", out or "", re.S)
         if not m:
             raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
-        data = json.loads(m.group(0))
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
     if not isinstance(data, dict):
         raise _SecAIError("AI 응답 형식이 올바르지 않습니다.")
     return data
@@ -3465,7 +3499,7 @@ SEC_DIAG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diag")
 
 @app.route("/api/secretary/diag", methods=["POST", "OPTIONS"])
 def secretary_diag_upload():
-    """확장 '진단 센터'의 진단 보고서(동작 기록) 받기 — 실제 ERP 시험 뒤 규칙·매핑을 고치는 데 쓴다.
+    """확장 '진단 센터'의 진단 보고서(동작 기록) 받기 — 실제 ERP 시험 뒤 화면 감지 규칙·상신 버튼·편집기 넣기를 고치는 데 쓴다.
     입력값(본문)은 확장이 애초에 기록하지 않으며, 관리자 토큰이 있어야 저장된다."""
     if request.method == "OPTIONS":
         return ("", 204)

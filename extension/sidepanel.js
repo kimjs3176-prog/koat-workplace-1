@@ -40,7 +40,7 @@ async function refreshContext(askNow) {
   if (r && r.ask && r.tabId != null && r.tabId !== tabId && !params.get("tab")) { bound = tabId = r.tabId; }
   showCtx(r && r.context);
   if (r && r.ask) ask(r.ask);
-  else if (askNow && r && r.context) { lastAuto = r.context.screenId || r.context.q; ask(r.context.q); }
+  else if (askNow && r && r.context) { lastAuto = r.context.q; ask(r.context.q); }
 }
 
 async function init() {
@@ -97,7 +97,7 @@ chrome.runtime.onMessage.addListener((m) => {
     showCtx(m.context);
     if (!m.context) lastAuto = "";                      // 업무 화면을 벗어나면, 다시 들어올 때 다시 안내
     // ERP 화면이 바뀌면(다른 업무) 패널이 바로 그 업무 안내로 — 같은 업무에선 다시 묻지 않는다
-    const key = m.context && (m.context.screenId || m.context.q);
+    const key = m.context && m.context.q;
     if (autoAsk && key && key !== lastAuto) { lastAuto = key; ask(m.context.q); }
   }
   else if (m.type === "ask") ask(m.q);
