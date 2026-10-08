@@ -35,6 +35,10 @@ $("save").addEventListener("click", async () => {
   // 새로 추가한 ERP 주소는 사이트 접근 허용을 받는다(저장 버튼 클릭이 사용자 동작이라 이때만 물을 수 있음)
   const need = [];
   for (const h of hosts) if (!(await chrome.permissions.contains({ origins: [h] }))) need.push(h);
+  // 서무비서 주소 — 웹 화면에서 '확장 설치됨' 표시·기한을 확장으로 전달하는 데 쓴다(없어도 옆 패널은 동작)
+  const srvPat = server ? new URL(server).origin + "/*" : "";
+  const askSrv = srvPat && !(await chrome.permissions.contains({ origins: [srvPat] }));
+  if (askSrv) need.push(srvPat);
   if (need.length && !(await chrome.permissions.request({ origins: need }).catch(() => false))) {
     msg.textContent = "ERP 주소 접근이 허용되지 않아 저장하지 않았습니다."; return;
   }

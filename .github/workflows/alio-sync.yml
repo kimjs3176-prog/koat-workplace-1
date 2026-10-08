@@ -18,12 +18,24 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: alio-sync
+  cancel-in-progress: false
+
+env:
+  # 외부 코드(alio-mcp)는 확인한 커밋으로 고정한다 — 올릴 때는 이 값을 바꾸고 변경 내용을 검토할 것
+  ALIO_MCP_REF: 4400ab742fdb34a1e426c26b347225c8e6d6b51b
+  BRANCH: alio-sync
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # 저장소 쓰기 토큰을 .git 설정에 남기지 않는다(외부 코드가 도는 동안 꺼낼 수 없게) — 올리기 단계에서만 쓴다
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -32,26 +44,40 @@ jobs:
           python-version: "3.12"
       - name: 서버 의존성
         run: pip install -r requirements.txt
-      - name: alio-mcp 받기
+      - name: alio-mcp 받기(고정 커밋)
         run: |
-          git clone --depth 1 https://github.com/chromehearts79/alio-mcp.git "$RUNNER_TEMP/alio-mcp"
-          cd "$RUNNER_TEMP/alio-mcp" && npm ci --omit=optional --ignore-scripts
+          git init -q "$RUNNER_TEMP/alio-mcp"
+          cd "$RUNNER_TEMP/alio-mcp"
+          git fetch -q --depth 1 https://github.com/chromehearts79/alio-mcp.git "$ALIO_MCP_REF"
+          git checkout -q FETCH_HEAD
+          npm ci --omit=optional --ignore-scripts
       - name: ALIO 와 비교·등록
         env:
           ALIO_MCP_DIR: ${{ runner.temp }}/alio-mcp
         run: node scripts/alio_sync.mjs --apply ${{ inputs.all && '--all' || '' }}
+      - name: 의미 검색 색인 다시 만들기(GEMINI_API_KEY 가 있을 때)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then echo "GEMINI_API_KEY 없음 — 색인은 기관 PC 에서 python scripts/build_embeddings.py 로 갱신"; exit 0; fi
+          if [ -z "$(git status --porcelain -- regulations regulations_manifest.json)" ]; then echo "규정 변경 없음"; exit 0; fi
+          python scripts/build_embeddings.py
       - name: 바뀐 것이 있으면 PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$(git status --porcelain -- regulations regulations_manifest.json secretary/alio_status.json)" ]; then echo "변경 없음"; exit 0; fi
-          b="alio-sync/$(date +%Y%m%d)"
+          if [ -z "$(git status --porcelain -- regulations regulations_manifest.json secretary/alio_status.json regulations_vectors.json regulations_vectors.bin)" ]; then echo "변경 없음"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$b"
+          git checkout -B "$BRANCH"
           git add regulations regulations_manifest.json secretary/alio_status.json
-          git commit -m "ALIO 공시 내규 반영($(date +%Y-%m-%d))"
-          git push -f origin "$b"
-          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$b" \
+          git add regulations_vectors.json regulations_vectors.bin 2>/dev/null || true
+          # '내규 개정:' 머리말 — 개정 영향 분석이 직전 규정본을 찾을 때 이 커밋을 알아본다
+          git commit -m "내규 개정: ALIO 공시 반영($(date +%Y-%m-%d))"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "열린 PR 이 이미 있어 같은 가지를 갱신했습니다."; exit 0
+          fi
+          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
             --title "ALIO 공시 내규 반영($(date +%Y-%m-%d))" \
-            --body "scripts/alio_sync.mjs 결과입니다. 바뀐 규정을 확인한 뒤, 관리 › 호환성 점검에서 근거 규정이 개정된 절차를 영향 분석으로 확인하세요." || echo "PR 이 이미 있습니다."
+            --body "scripts/alio_sync.mjs 결과입니다. 바뀐 규정을 확인한 뒤, 관리 › 호환성 점검에서 근거 규정이 개정된 절차를 영향 분석으로 확인하세요."

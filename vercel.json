@@ -6,7 +6,7 @@
       "use": "@vercel/python",
       "config": {
         "maxLambdaSize": "50mb",
-        "excludeFiles": "{node_modules/**,forms/**,dist/**}"
+        "excludeFiles": "{node_modules/**,forms/**,dist/**,diag/**}"
       }
     },
     {
@@ -77,5 +77,10 @@
         "Referrer-Policy": "strict-origin-when-cross-origin"
       }
     }
-  ]
+  ],
+  "git": {
+    "deploymentEnabled": {
+      "secretary-diag": false
+    }
+  }
 }

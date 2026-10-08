@@ -95,16 +95,18 @@ function renderStat() {
 function renderRows() {
   const f = $("f").value;
   const pick = (e) => !f || (f === "err" ? isErr(e) : f === "user" ? e.src === "user" : f === "detect" ? /detect|context/.test(e.ev)
-    : f === "fill" ? /fill|insert|focus/.test(e.ev) : /guard|button/.test(e.ev + e.src));
+    : f === "fill" ? /insert|focus/.test(e.ev) : /guard|button/.test(e.ev + e.src));
   const rows = data.log.filter(pick).slice(-400).reverse();
   $("cnt").textContent = `${rows.length}건 표시(최근 순)`;
   $("rows").innerHTML = rows.map((e) => `<tr class="${isErr(e) ? "err" : e.src === "user" ? "user" : ""}"><td class="t">${esc(e.t.slice(11, 19))}</td><td>${esc(e.src)}${e.fid ? `<span class="sub"> f${e.fid}</span>` : ""}</td><td>${esc(e.ev)}</td><td class="d">${esc(JSON.stringify(e.d || {})).slice(0, 600)}</td></tr>`).join("") ||
     `<tr><td colspan="4" class="sub">기록이 없습니다. ERP 화면에서 서무비서를 써 보세요.</td></tr>`;
 }
 async function tabs() {
-  const ts = (await chrome.tabs.query({})).filter((t) => /^https?:/.test(t.url || ""));
+  // 접근 권한이 없는 탭은 주소가 비어 온다 — 빼지 않고 '권한 없음'으로 보여 이 탭 점검에서 판정받게 한다
+  const ts = (await chrome.tabs.query({})).filter((t) => (!t.url && t.title) || /^https?:/.test(t.url || ""));
   const want = Number(params.get("tab"));
-  $("tabs").innerHTML = ts.map((t) => `<option value="${t.id}"${t.id === want ? " selected" : ""}>${esc((t.title || "").slice(0, 40))} — ${esc(new URL(t.url).host)}</option>`).join("") || `<option value="">열린 ERP 탭이 없습니다</option>`;
+  const where = (t) => { try { return new URL(t.url).host; } catch (e) { return "(권한 없음 — ERP 주소 미등록)"; } };
+  $("tabs").innerHTML = ts.map((t) => `<option value="${t.id}"${t.id === want ? " selected" : ""}>${esc((t.title || "").slice(0, 40))} — ${esc(where(t))}</option>`).join("") || `<option value="">열린 탭이 없습니다</option>`;
 }
 function report() {
   return { kind: "secretary-diag", created: new Date().toISOString(), version: data.version, ua: navigator.userAgent,

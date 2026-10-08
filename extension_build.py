@@ -30,7 +30,8 @@ def build_zip(server: str = "", erps=None, name: str = "", version: str = "") ->
         raise ValueError("서무비서 주소는 https 여야 합니다.")
     man = manifest()
     pats = [p for p in (origin_pattern(x) for x in (erps or [])) if p]
-    pats = list(dict.fromkeys(pats)) or man["content_scripts"][0]["matches"]
+    # 기관 ERP 주소를 기본 주소(kerp·온나라)에 더한다 — 바꿔 치우면 온나라 같은 기본 화면이 빠진다
+    pats = list(dict.fromkeys(man["content_scripts"][0]["matches"] + pats))
     man["host_permissions"] = pats
     man["content_scripts"][0]["matches"] = pats
     if server:

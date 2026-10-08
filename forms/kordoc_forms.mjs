@@ -24,6 +24,10 @@ function items(text) {
 
 /** 초안 항목 → kordoc 공문 마크다운 */
 export function draftMarkdown({ title, rows = [], closing = [] }) {
+  // 형식이 틀린 요청(목록 자리에 다른 값)도 빈 목록으로 받아 500 대신 빈 칸으로 만든다
+  if (!Array.isArray(rows)) rows = []
+  if (!Array.isArray(closing)) closing = []
+  rows = rows.filter((r) => r && typeof r === "object")
   const t = cell(title) || "보고서"
   const one = rows.filter((r) => !r.multi && str(r.value).trim())
   const multi = rows.filter((r) => r.multi && str(r.value).trim())

@@ -33,6 +33,16 @@
     show(el, t);
   }, true);
 
+  // 입력란에서 Enter 로 양식을 보내는 경우(버튼 클릭 없이) — 보내는 버튼 이름이 상신이면 같은 점검
+  document.addEventListener("submit", (e) => {
+    if (bypass || !guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
+    const el = e.submitter; const t = el ? labelOf(el) : "";
+    if (!t || t.length > 14 || !SUBMIT.test(t)) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    dlog("guard.show", { label: t, proc: guard.proc, n: guard.pitfalls.length, via: "submit" });
+    show(el, t);
+  }, true);
+
   function show(btn, label) {
     // 같은 출처면 맨 위 창에 띄운다(안쪽 프레임이 작아도 카드가 잘리지 않게)
     let doc = document;

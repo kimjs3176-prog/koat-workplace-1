@@ -10,3 +10,6 @@ secretary/insights.json
 dist/
 node_modules/
 alio_inbox/
+
+# 진단 보고서(로컬 저장분) — 개인·화면 구조 정보라 커밋하지 않는다
+diag/

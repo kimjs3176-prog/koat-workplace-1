@@ -17,6 +17,7 @@ import urllib3
 from urllib.parse import quote
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+import hmac
 import requests as req_lib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -42,6 +43,14 @@ CORS(app, origins=_cors_origins)
 
 # 요청 본문 상한 — 큰 본문을 다 읽기 전에 거른다(규정 업로드 포함 넉넉히). Vercel 은 자체 상한(4.5MB)이 먼저 걸린다.
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+
+@app.after_request
+def _frame_policy(resp):
+    """웹 화면(HTML)은 이 서비스와 브라우저 확장 패널 안에서만 담길 수 있게(vercel.json 과 같은 정책 — 내부망 설치 대비)."""
+    if resp.mimetype == "text/html" and "Content-Security-Policy" not in resp.headers:
+        resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' chrome-extension: extension: moz-extension:"
+    return resp
 
 
 @app.errorhandler(413)
@@ -281,6 +290,7 @@ REG_MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "regulations_manifest.json")
 # 업로드 토큰(설정 시 업로드에 필수) — 공개 배포본에서 무단 업로드 방지
 REG_UPLOAD_TOKEN = os.environ.get("REG_UPLOAD_TOKEN", "").strip()
+SEC_DIAG_BRANCH = os.environ.get("SECRETARY_DIAG_BRANCH", "secretary-diag").strip() or "secretary-diag"
 REG_UPLOAD_MAX_MB = int(os.environ.get("REG_UPLOAD_MAX_MB", "40"))
 REG_CATEGORIES = ["정관", "규정", "규칙", "세칙", "예규", "매뉴얼", "기타"]
 _ALLOWED_EXT = {".hwpx", ".hwp", ".docx", ".pdf", ".html", ".htm", ".txt", ".md"}
@@ -841,6 +851,21 @@ def _upsert_manifest(entry: dict, backup_name: str = "") -> dict:
     return entry
 
 
+def _local_request() -> bool:
+    """이 컴퓨터에서 직접 연 요청인지(프록시를 거치지 않은 127.0.0.1·::1)."""
+    return (request.remote_addr in ("127.0.0.1", "::1")
+            and not request.headers.get("X-Forwarded-For") and not os.environ.get("VERCEL"))
+
+
+def _client_ip() -> str:
+    """요청한 쪽 IP — X-Forwarded-For 는 믿을 수 있는 프록시 뒤일 때만(Vercel 은 직접 덮어쓴다, 그 밖은 TRUST_PROXY=1)."""
+    if os.environ.get("VERCEL") or os.environ.get("TRUST_PROXY", "").strip() in ("1", "true"):
+        xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            return xff
+    return request.remote_addr or "?"
+
+
 def _upload_authorized() -> tuple[bool, str]:
     """업로드 허용 여부와 거부 사유를 반환한다.
 
@@ -853,9 +878,13 @@ def _upload_authorized() -> tuple[bool, str]:
         if _gh_enabled():
             return (False, "이 서버는 업로드가 리포지토리에 자동 커밋되므로 "
                            "REG_UPLOAD_TOKEN 설정이 필요합니다. 관리자에게 문의하세요.")
-        return (True, "")
+        # 토큰이 없으면 이 컴퓨터에서 연 화면(로컬 개발)만 저장을 허용한다 — 내부망 서버를 누구나 고치지 못하게.
+        # 꼭 열어 두려면 SECRETARY_OPEN_ADMIN=1 (권장하지 않음)
+        if _local_request() or os.environ.get("SECRETARY_OPEN_ADMIN", "").strip().lower() in ("1", "true", "yes"):
+            return (True, "")
+        return (False, "관리자 토큰(REG_UPLOAD_TOKEN)이 설정되지 않은 서버입니다. 서버에 토큰을 설정한 뒤 저장하세요.")
     tok = (request.form.get("token") or request.headers.get("X-Upload-Token") or "").strip()
-    if tok == REG_UPLOAD_TOKEN:
+    if hmac.compare_digest(tok.encode(), REG_UPLOAD_TOKEN.encode()):
         return (True, "")
     return (False, "업로드 토큰이 올바르지 않습니다.")
 
@@ -950,13 +979,22 @@ def _gh_check(force: bool = False) -> dict:
     return {"ok": _GH_CHECK["ok"], "error": _GH_CHECK["error"]}
 
 
-def _gh_commit_files(files: dict, message: str, deletes=None):
+def _gh_commit_files(files: dict, message: str, deletes=None, branch: str = ""):
     """여러 파일을 한 커밋으로 반영. files={경로: bytes|str}, deletes=[경로].
 
     Git Data API(blob→tree→commit→ref)로 원자적으로 커밋한다.
     Contents API를 파일마다 호출하면 커밋이 쪼개지고 중간 실패 시 상태가 깨진다.
     """
-    ref = _gh("GET", f"/git/ref/heads/{GITHUB_BRANCH}")
+    branch = branch or GITHUB_BRANCH
+    try:
+        ref = _gh("GET", f"/git/ref/heads/{branch}")
+    except Exception:
+        if branch == GITHUB_BRANCH:
+            raise
+        # 따로 쓰는 가지(진단 보고서 등)가 아직 없으면 배포 가지에서 만든다
+        base = _gh("GET", f"/git/ref/heads/{GITHUB_BRANCH}")
+        _gh("POST", "/git/refs", json={"ref": f"refs/heads/{branch}", "sha": base["object"]["sha"]})
+        ref = _gh("GET", f"/git/ref/heads/{branch}")
     head_sha = ref["object"]["sha"]
     base_tree = _gh("GET", f"/git/commits/{head_sha}")["tree"]["sha"]
 
@@ -979,7 +1017,7 @@ def _gh_commit_files(files: dict, message: str, deletes=None):
     commit = _gh("POST", "/git/commits",
                  json={"message": message, "tree": new_tree["sha"],
                        "parents": [head_sha]})
-    _gh("PATCH", f"/git/refs/heads/{GITHUB_BRANCH}",
+    _gh("PATCH", f"/git/refs/heads/{branch}",
         json={"sha": commit["sha"], "force": False})
     return commit["sha"]
 
@@ -1132,7 +1170,7 @@ def reg_upload_status():
         "github_branch": GITHUB_BRANCH if _gh_enabled() else "",
         "github_ok": chk["ok"],
         "github_error": chk["error"],
-        "token_required": bool(REG_UPLOAD_TOKEN),
+        "token_required": bool(REG_UPLOAD_TOKEN) or not _local_request(),
         "max_mb": REG_UPLOAD_MAX_MB,
         "categories": REG_CATEGORIES,
         "allowed_ext": sorted(_ALLOWED_EXT),
@@ -2008,8 +2046,8 @@ def secretary_check():
     """절차 목록(개인 절차·가져올 절차 팩)의 호환성 점검 — 저장하지 않는다."""
     body = request.get_json(silent=True) or {}
     procs = body.get("procedures")
-    if not isinstance(procs, list) or len(procs) > 300:
-        return jsonify({"success": False, "error": "procedures 목록(최대 300건)이 필요합니다."}), 400
+    if not isinstance(procs, list) or len(procs) > 150:
+        return jsonify({"success": False, "error": "procedures 목록(최대 150건)이 필요합니다."}), 400
     forms = _sec_forms_set()
     out = {}
     for p in procs:
@@ -2316,7 +2354,7 @@ def _sec_ai_status() -> dict:
 
 
 def _sec_ai_rate_ok() -> bool:
-    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    ip = _client_ip()
     now = time.time()
     hits = [t for t in _SEC_AI_HITS.get(ip, []) if now - t < 600]
     if len(hits) >= _SEC_AI_LIMIT:
@@ -3290,7 +3328,7 @@ def _sec_kv(cmds: list) -> list:
 
 
 def _sec_ins_rate_ok() -> bool:
-    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    ip = _client_ip()
     now = time.time()
     hits = [t for t in _SEC_INS_HITS.get(ip, []) if now - t < 3600]
     if len(hits) >= 60:
@@ -3520,8 +3558,13 @@ def secretary_diag_upload():
     body["received"] = _now_kst()
     payload = json.dumps(body, ensure_ascii=False, indent=1) + "\n"
     try:
-        where = _sec_save_repo_file(f"diag/{name}", os.path.join(SEC_DIAG_DIR, name), payload,
-                                    f"서무비서 진단 보고서 {stamp} ({len(body['log'])}건)")
+        if _gh_enabled():
+            # 배포 가지가 아니라 진단 전용 가지에 — 보고서마다 재배포되거나 배포본에 섞이지 않게
+            sha = _gh_commit_files({f"diag/{name}": payload}, f"서무비서 진단 보고서 {stamp} ({len(body['log'])}건)",
+                                   branch=SEC_DIAG_BRANCH)
+            where = f"저장소의 '{SEC_DIAG_BRANCH}' 가지에 올렸습니다({sha[:7]})."
+        else:
+            where = _sec_save_repo_file(f"diag/{name}", os.path.join(SEC_DIAG_DIR, name), payload, "")
     except OSError:
         return jsonify({"success": False, "error": _SEC_READONLY_MSG}), 500
     except Exception as e:

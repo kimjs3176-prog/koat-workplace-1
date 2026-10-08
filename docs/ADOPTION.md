@@ -179,7 +179,7 @@ python scripts/build_extension.py --server https://<우리 서무비서 주소> 
 
 ## 9. 도입 점검표
 
-- [ ] `REG_UPLOAD_TOKEN` 설정, 관리자에게만 공유
+- [ ] `REG_UPLOAD_TOKEN` 설정, 관리자에게만 공유 — 내부망(Docker 등) 설치도 토큰이 없으면 관리 저장이 막힙니다(서버 컴퓨터에서 직접 연 화면만 예외)
 - [ ] 기관 설정: 기관명·서비스 이름·색·명칭·기관 휴일
 - [ ] `import_regs.py --reset`으로 우리 내규 등록 → 배포
 - [ ] 규정명 매핑: '연결 안 됨'·'근사' 0건

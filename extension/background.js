@@ -61,7 +61,16 @@ async function registerExtraHosts() {
     if (builtin.includes(h)) continue;
     if (await chrome.permissions.contains({ origins: [h] })) extra.push(h);
   }
-  try { await chrome.scripting.unregisterContentScripts({ ids: ["sec-erp-extra"] }); } catch (e) {}
+  try { await chrome.scripting.unregisterContentScripts({ ids: ["sec-erp-extra", "sec-marker"] }); } catch (e) {}
+  // 서무비서 웹 화면 표시·기한 전달(marker.js) — 기관 배포본은 manifest 에 들어 있고, 개발자 설치·주소 변경 때는 여기서 붙인다
+  const { server } = await settings();
+  if (server) {
+    const pat = server.replace(/^(https?:\/\/[^/]+).*$/, "$1") + "/*";
+    const inManifest = chrome.runtime.getManifest().content_scripts.some((c) => (c.js || []).includes("marker.js") && c.matches.includes(pat));
+    if (!inManifest && await chrome.permissions.contains({ origins: [pat] }).catch(() => false)) {
+      await chrome.scripting.registerContentScripts([{ id: "sec-marker", matches: [pat], js: ["marker.js"], runAt: "document_start", persistAcrossSessions: true }]).catch((e) => console.warn(e));
+    }
+  }
   if (extra.length) {
     await chrome.scripting.registerContentScripts([{ id: "sec-erp-extra", matches: extra, js: ["config.js", "content.js", "guard.js"],
       allFrames: true, matchOriginAsFallback: true, runAt: "document_idle", persistAcrossSessions: true }]).catch((e) => console.warn(e));
@@ -73,7 +82,7 @@ const winType = {};
 let lastNormalWin = null;
 chrome.windows.getAll().then((ws) => ws.forEach((w) => { winType[w.id] = w.type; if (w.type === "normal" && (w.focused || lastNormalWin == null)) lastNormalWin = w.id; })).catch(() => {});
 chrome.windows.onCreated.addListener((w) => { winType[w.id] = w.type; });
-chrome.windows.onRemoved.addListener((id) => { delete winType[id]; if (lastNormalWin === id) lastNormalWin = null; });
+chrome.windows.onRemoved.addListener((id) => { delete winType[id]; if (lastNormalWin === id) lastNormalWin = null; if (fallbackWin === id) fallbackWin = null; });
 chrome.windows.onFocusChanged.addListener((id) => { if (winType[id] === "normal") lastNormalWin = id; });
 
 // 패널 열기(+ 물을 말). ERP 가 띄운 작은 창(팝업)에는 옆 패널이 없으므로 원래 창의 옆 패널에서 연다.
@@ -89,14 +98,30 @@ function openPanel(tab, q) {
   return opened.then(() => { if (q) toPanel({ type: "ask", tabId: tab.id, panelWin, q }); });
 }
 // 사이드 패널을 쓸 수 없을 때: 화면 오른쪽에 작은 창으로(그 탭에 고정)
+let fallbackWin = null;      // 이미 띄운 작은 창이 있으면 새로 만들지 않고 앞으로 가져온다
 async function panelWindow(tab) {
   const url = chrome.runtime.getURL("sidepanel.html") + "?tab=" + tab.id;
+  if (fallbackWin != null) {
+    try {
+      const [t] = await chrome.tabs.query({ windowId: fallbackWin });
+      if (t) { await chrome.tabs.update(t.id, { url }); await chrome.windows.update(fallbackWin, { focused: true }); return; }
+    } catch (e) { fallbackWin = null; }
+  }
   const win = await chrome.windows.getCurrent();
-  chrome.windows.create({ url, type: "popup", width: 440, height: Math.min(900, win.height || 900),
+  const w = await chrome.windows.create({ url, type: "popup", width: 440, height: Math.min(900, win.height || 900),
     left: Math.max(0, (win.left || 0) + (win.width || 1200) - 440), top: win.top || 0 });
+  fallbackWin = w && w.id;
 }
 
-const hostMatch = (pat, url) => { try { const u = new URL(url); return pat.replace(/\/\*$/, "") === u.origin; } catch (e) { return false; } };
+// 'https://erp.example.com/*' 또는 'https://*.example.com/*' 형식의 주소 규칙과 탭 주소 비교
+const hostMatch = (pat, url) => {
+  try {
+    const u = new URL(url); const m = String(pat).match(/^(\*|https?):\/\/([^/]+)/); if (!m) return false;
+    if (m[1] !== "*" && m[1] + ":" !== u.protocol) return false;
+    const h = m[2].toLowerCase(), host = u.host.toLowerCase();
+    return h.startsWith("*.") ? host === h.slice(2) || host.endsWith(h.slice(1)) : h === host;
+  } catch (e) { return false; }
+};
 
 // 모든 프레임에서 내용 스크립트 함수 실행(같은 격리 공간이라 globalThis.__sec* 를 부를 수 있다)
 async function inFrames(tabId, fn, arg) {
@@ -136,7 +161,10 @@ const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); retur
 async function deadlineItems() {
   const { deadlines } = await chrome.storage.local.get("deadlines");
   const seen = new Set(), out = [];
-  for (const src of Object.values(deadlines || {})) for (const it of src.items || []) {
+  // 패널·웹 탭은 저장소가 따로라 각자 보낸다. 다른 쪽이 더 최근에 보냈고 이쪽이 2주 넘게 소식이 없으면
+  // (예: 다시 열지 않는 웹 탭) 이미 끝낸 건이 배지에 남지 않게 뺀다.
+  const srcs = Object.values(deadlines || {}); const newest = Math.max(0, ...srcs.map((s) => s.ts || 0));
+  for (const src of srcs) if ((src.ts || 0) >= newest - 14 * 864e5) for (const it of src.items || []) {
     const k = it.caseId + "|" + it.i;
     if (!seen.has(k)) { seen.add(k); out.push(it); }
   }
@@ -182,14 +210,33 @@ chrome.runtime.onStartup.addListener(() => { ensureAlarm(); updateBadge(); });
 
 // ── 주소창: '서무' + 띄어쓰기 + 상황 ────────────────────────────────────
 chrome.omnibox.setDefaultSuggestion({ description: "서무비서에 묻기: %s" });
-chrome.omnibox.onInputEntered.addListener(async (text) => {
+chrome.omnibox.onInputEntered.addListener((text) => {
   const q = String(text || "").trim().slice(0, 200);
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!q) return;
-  if (tab && !PANEL_FALLBACK) { openPanel(tab, q); return; }
-  const { server } = await settings();
-  if (server) chrome.tabs.create({ url: server + "/?q=" + encodeURIComponent(q) });
-  else chrome.runtime.openOptionsPage();
+  const web = async () => {
+    const { server } = await settings();
+    if (server) chrome.tabs.create({ url: server + "/?q=" + encodeURIComponent(q) });
+    else chrome.runtime.openOptionsPage();
+  };
+  // 옆 패널은 기다림 없이 바로 연다(await 뒤에 열면 사용자 동작으로 인정되지 않는다) — 물음은 패널이 열리면서 받는다
+  if (PANEL_FALLBACK || lastNormalWin == null) { web(); return; }
+  chrome.storage.session.set({ pendingAsk: { tabId: -1, q, ts: Date.now() } }).catch(() => {});
+  chrome.sidePanel.open({ windowId: lastNormalWin })
+    .then(() => { diag("bg", "panel.open", { ok: true, via: "omnibox" }); toPanel({ type: "ask", panelWin: lastNormalWin, q }); })
+    .catch((e) => { diag("bg", "panel.open", { ok: false, via: "omnibox", err: e.message }); chrome.storage.session.remove("pendingAsk"); web(); });
+});
+
+// 설정을 바꾸면 바로 반영 — 기한 알림 배지, 열려 있는 화면의 결재 전 점검 켜기/끄기
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area !== "sync") return;
+  if (ch.notify) updateBadge().catch(() => {});
+  if (ch.guard) {
+    const on = ch.guard.newValue !== false;
+    for (const [id, st] of Object.entries(state)) if (st && st.guard) {
+      st.guard.enabled = on; chrome.tabs.sendMessage(Number(id), { type: "guard", guard: st.guard }).catch(() => {});
+    }
+    saveState();
+  }
 });
 
 function toPanel(msg) { chrome.runtime.sendMessage(Object.assign({ to: "panel" }, msg)).catch(() => {}); }
@@ -265,7 +312,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       // 방금 누른 🗂·칩의 물음 — 패널이 다른 탭(예: ERP 팝업 창의 원래 창)에 있어도 10초 안이면 받는다
       const fresh = pendingAsk && (pendingAsk.tabId === m.tabId || (!m.fixed && Date.now() - (pendingAsk.ts || 0) < 10000));
       if (fresh) chrome.storage.session.remove("pendingAsk");
-      const t = fresh ? pendingAsk.tabId : m.tabId;
+      const t = fresh && pendingAsk.tabId >= 0 ? pendingAsk.tabId : m.tabId;   // 주소창 물음(-1)은 탭과 무관
       reply({ context: (state[t] || {}).context || null, ask: fresh ? pendingAsk.q : "", tabId: t });
     });
     return true;

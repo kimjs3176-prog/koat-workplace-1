@@ -148,6 +148,9 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 | 이름 | 용도 | 필수 |
 |---|---|---|
 | `REG_UPLOAD_TOKEN` | 내규 업로드·기관 절차·기관 설정 저장용 관리자 토큰 | 관리 기능 사용 시 |
+| `SECRETARY_OPEN_ADMIN` | `1`이면 토큰 없이도 누구나 관리 저장 허용(권장하지 않음). 기본은 토큰이 없으면 **서버 컴퓨터에서 직접 연 화면만** 저장 가능 | 선택 |
+| `TRUST_PROXY` | `1`이면 `X-Forwarded-For`를 요청자 IP로 믿음(역방향 프록시 뒤 내부망 설치). Vercel은 자동 | 선택 |
+| `SECRETARY_DIAG_BRANCH` | 확장 진단 보고서를 올릴 가지(기본 `secretary-diag`, 배포 가지와 분리) | 선택 |
 | `SECRETARY_CONFIG` | 기관 설정 파일 위치(기본 `secretary/config.json`) | 선택 |
 | `GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH` | 읽기 전용 배포에서 업로드·기관 절차를 저장소에 커밋 | 관리 기능 사용 시 |
 | `REG_UPLOAD_MAX_MB` | 내규 업로드 최대 크기 | 선택 |
