@@ -4,13 +4,18 @@ const dlog = (ev, data) => chrome.runtime.sendMessage({ type: "log", src: "panel
 const params = new URLSearchParams(location.search);
 let tabId = params.get("tab") ? Number(params.get("tab")) : null;   // 작은 창(대체 모드)일 때 고정
 let server = "", origin = "", ready = false, queue = [], ctx = null, autoAsk = true, lastAuto = "";
+let bound = null, myWin = null, lastAsk = { q: "", t: 0 };   // bound: 🗂·칩을 누른 탭(ERP 팝업 창일 수 있음)
 
 function post(msg) {
   const w = $("app").contentWindow;
   if (!ready || !w) { queue.push(msg); return; }
   w.postMessage(Object.assign({ src: "koat-sec-ext" }, msg), origin);
 }
-function ask(q) { if (q) { dlog("ask", { q, ready }); post({ type: "ask", q }); } }
+function ask(q) {
+  if (!q || (q === lastAsk.q && Date.now() - lastAsk.t < 3000)) return;   // 같은 물음이 두 길(대기분·메시지)로 오면 한 번만
+  lastAsk = { q, t: Date.now() };
+  dlog("ask", { q, ready }); post({ type: "ask", q });
+}
 
 function showCtx(c) {
   ctx = c;
@@ -23,20 +28,23 @@ function showCtx(c) {
 
 async function currentTab() {
   if (params.get("tab")) return tabId;
-  const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (bound != null) { const t = await chrome.tabs.get(bound).catch(() => null); if (t) return bound; bound = null; }
+  const [t] = await chrome.tabs.query(myWin != null ? { active: true, windowId: myWin } : { active: true, lastFocusedWindow: true });
   return t ? t.id : null;
 }
 
 async function refreshContext(askNow) {
   tabId = await currentTab();
   if (tabId == null) return;
-  const r = await chrome.runtime.sendMessage({ type: "getContext", tabId }).catch(() => null);
+  const r = await chrome.runtime.sendMessage({ type: "getContext", tabId, fixed: !!params.get("tab") }).catch(() => null);
+  if (r && r.ask && r.tabId != null && r.tabId !== tabId && !params.get("tab")) { bound = tabId = r.tabId; }
   showCtx(r && r.context);
   if (r && r.ask) ask(r.ask);
   else if (askNow && r && r.context) { lastAuto = r.context.screenId || r.context.q; ask(r.context.q); }
 }
 
 async function init() {
+  if (!params.get("tab")) myWin = await chrome.windows.getCurrent().then((w) => w.id).catch(() => null);
   const s = await chrome.runtime.sendMessage({ type: "settings" });
   dlog("panel.open", { server: !!(s && s.server), autoAsk: !!(s && s.autoAsk) });
   server = (s && s.server) || "";
@@ -79,7 +87,12 @@ window.addEventListener("message", async (e) => {
 
 // 서비스 워커 → 패널
 chrome.runtime.onMessage.addListener((m) => {
-  if (m.to !== "panel" || (tabId != null && m.tabId !== tabId)) return;
+  if (m.to !== "panel") return;
+  // 🗂·칩을 누른 물음: 이 패널이 열린 창으로 온 것이면 그 탭(팝업 창 포함)에 붙는다
+  if (m.type === "ask" && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
+    bound = tabId = m.tabId; refreshContext(false); ask(m.q); return;
+  }
+  if (tabId != null && m.tabId !== tabId) return;
   if (m.type === "context") {
     showCtx(m.context);
     if (!m.context) lastAuto = "";                      // 업무 화면을 벗어나면, 다시 들어올 때 다시 안내
@@ -90,7 +103,7 @@ chrome.runtime.onMessage.addListener((m) => {
   else if (m.type === "ask") ask(m.q);
 });
 if (!params.get("tab")) {
-  chrome.tabs.onActivated.addListener(() => refreshContext(false));
+  chrome.tabs.onActivated.addListener((info) => { if (info.windowId === myWin) { bound = null; refreshContext(false); } });
 }
 
 $("ctx").addEventListener("click", () => { if (ctx) ask(ctx.q); });

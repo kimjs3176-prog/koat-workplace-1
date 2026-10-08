@@ -53,12 +53,28 @@ async function registerExtraHosts() {
   }
 }
 
-async function openPanel(tab) {
-  if (!PANEL_FALLBACK) {
-    try { await chrome.sidePanel.open({ tabId: tab.id }); diag("bg", "panel.open", { ok: true }); return; }
-    catch (e) { diag("bg", "panel.open", { ok: false, err: e.message }); /* 사용자 동작 밖에서 호출된 경우 등 */ }
-  }
-  // 사이드 패널이 없는 브라우저: 화면 오른쪽에 작은 창으로
+// 창 종류(일반·팝업)를 미리 알아 둔다 — sidePanel.open 은 사용자 클릭 직후 '기다림 없이' 불러야 해서 그때 물어볼 수 없다
+const winType = {};
+let lastNormalWin = null;
+chrome.windows.getAll().then((ws) => ws.forEach((w) => { winType[w.id] = w.type; if (w.type === "normal" && (w.focused || lastNormalWin == null)) lastNormalWin = w.id; })).catch(() => {});
+chrome.windows.onCreated.addListener((w) => { winType[w.id] = w.type; });
+chrome.windows.onRemoved.addListener((id) => { delete winType[id]; if (lastNormalWin === id) lastNormalWin = null; });
+chrome.windows.onFocusChanged.addListener((id) => { if (winType[id] === "normal") lastNormalWin = id; });
+
+// 패널 열기(+ 물을 말). ERP 가 띄운 작은 창(팝업)에는 옆 패널이 없으므로 원래 창의 옆 패널에서 연다.
+// 주의: sidePanel.open 앞에 await 를 두면 클릭(사용자 동작)으로 인정되지 않아 열리지 않는다.
+function openPanel(tab, q) {
+  if (q) chrome.storage.session.set({ pendingAsk: { tabId: tab.id, q, ts: Date.now() } }).catch(() => {});
+  const popup = winType[tab.windowId] && winType[tab.windowId] !== "normal";
+  const panelWin = popup && lastNormalWin != null ? lastNormalWin : tab.windowId;
+  const opened = PANEL_FALLBACK ? panelWindow(tab)
+    : chrome.sidePanel.open(popup && lastNormalWin != null ? { windowId: lastNormalWin } : { tabId: tab.id })
+      .then(() => diag("bg", "panel.open", { ok: true, popup: !!popup }))
+      .catch((e) => { diag("bg", "panel.open", { ok: false, popup: !!popup, err: e.message }); return panelWindow(tab); });
+  return opened.then(() => { if (q) toPanel({ type: "ask", tabId: tab.id, panelWin, q }); });
+}
+// 사이드 패널을 쓸 수 없을 때: 화면 오른쪽에 작은 창으로(그 탭에 고정)
+async function panelWindow(tab) {
   const url = chrome.runtime.getURL("sidepanel.html") + "?tab=" + tab.id;
   const win = await chrome.windows.getCurrent();
   chrome.windows.create({ url, type: "popup", width: 440, height: Math.min(900, win.height || 900),
@@ -205,14 +221,7 @@ chrome.omnibox.onInputEntered.addListener(async (text) => {
   const q = String(text || "").trim().slice(0, 200);
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!q) return;
-  if (tab && !PANEL_FALLBACK) {
-    try {
-      await chrome.storage.session.set({ pendingAsk: { tabId: tab.id, q } });
-      await chrome.sidePanel.open({ tabId: tab.id });
-      toPanel({ type: "ask", tabId: tab.id, q });
-      return;
-    } catch (e) { /* 패널을 열 수 없으면 새 탭으로 */ }
-  }
+  if (tab && !PANEL_FALLBACK) { openPanel(tab, q); return; }
   const { server } = await settings();
   if (server) chrome.tabs.create({ url: server + "/?q=" + encodeURIComponent(q) });
   else chrome.runtime.openOptionsPage();
@@ -220,14 +229,10 @@ chrome.omnibox.onInputEntered.addListener(async (text) => {
 
 function toPanel(msg) { chrome.runtime.sendMessage(Object.assign({ to: "panel" }, msg)).catch(() => {}); }
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab) return;
-  await openPanel(tab);
-  if (info.menuItemId === "sec-ask" && info.selectionText) {
-    const q = info.selectionText.trim().slice(0, 200);
-    await chrome.storage.session.set({ pendingAsk: { tabId: tab.id, q } });
-    toPanel({ type: "ask", tabId: tab.id, q });
-  }
+  const q = info.menuItemId === "sec-ask" && info.selectionText ? info.selectionText.trim().slice(0, 200) : "";
+  openPanel(tab, q);
 });
 
 chrome.runtime.onMessage.addListener((m, sender, reply) => {
@@ -284,14 +289,14 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       toPanel({ type: "context", tabId, context: null });
     }
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
-    openPanel(sender.tab).then(async () => {
-      if (m.q) { await chrome.storage.session.set({ pendingAsk: { tabId, q: m.q } }); toPanel({ type: "ask", tabId, q: m.q }); }
-    });
+    openPanel(sender.tab, m.q || "");
   } else if (m.type === "getContext") {                   // 패널이 열릴 때 현재 탭 상태 요청
     chrome.storage.session.get("pendingAsk").then(({ pendingAsk }) => {
-      const pa = pendingAsk && pendingAsk.tabId === m.tabId ? pendingAsk.q : "";
-      if (pa) chrome.storage.session.remove("pendingAsk");
-      reply({ context: (state[m.tabId] || {}).context || null, ask: pa });
+      // 방금 누른 🗂·칩의 물음 — 패널이 다른 탭(예: ERP 팝업 창의 원래 창)에 있어도 10초 안이면 받는다
+      const fresh = pendingAsk && (pendingAsk.tabId === m.tabId || (!m.fixed && Date.now() - (pendingAsk.ts || 0) < 10000));
+      if (fresh) chrome.storage.session.remove("pendingAsk");
+      const t = fresh ? pendingAsk.tabId : m.tabId;
+      reply({ context: (state[t] || {}).context || null, ask: fresh ? pendingAsk.q : "", tabId: t });
     });
     return true;
   } else if (m.type === "insert") {                       // 패널의 초안 → ERP 입력란

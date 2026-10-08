@@ -289,6 +289,8 @@
 
   // ── 화면 감지 ──────────────────────────────────────────────
   const SEL = 'h1,h2,h3,legend,caption,.title,.tit,[class*="title"],[class*="Title"],[class*="tit_"],.on,.active,[aria-selected="true"],[aria-current]';
+  // 첨부파일 이름(예: 출장증빙서식_2026-09-22.xlsx)은 화면 제목이 아니다
+  const FILE_RX = /\.(xlsx?|hwpx?|hwp|pdf|docx?|pptx?|zip|jpe?g|png|gif|txt|csv)\)?$/i;
   function candidates() {
     const out = [document.title || ""];
     const els = document.querySelectorAll(SEL);
@@ -296,7 +298,7 @@
       const el = els[i];
       if (!el.offsetParent) continue;
       const t = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
-      if (t && t.length <= 40 && !out.includes(t)) out.push(t);
+      if (t && t.length <= 40 && !FILE_RX.test(t) && !out.includes(t)) out.push(t);
     }
     return out.filter(Boolean);
   }
