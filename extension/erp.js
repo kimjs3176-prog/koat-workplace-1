@@ -71,10 +71,13 @@ async function analyze() {
   dlog("analyze", { url: r.url, frames: r.frames.map((f) => ({ path: f.path, fields: (f.fields || []).map((x) => x.label + ":" + x.kind) })) });
   const fields = r.frames.flatMap((f) => f.fields || []);
   // 칸이 가장 많은 프레임(= 실제 서식 화면)의 제목 요소를 앞에, 문서 제목(탭 이름)은 뒤에
-  const main = [...r.frames].sort((a, b) => (b.fields || []).length - (a.fields || []).length)[0] || r.frames[0] || {};
+  // 그룹웨어 바깥 껍데기(맨 위 프레임, 검색칸 하나)보다 안쪽 업무 프레임을 고른다
+  const nf = (f) => (f.fields || []).length - (!f.path && r.frames.length > 1 ? 1.5 : 0);
+  const main = [...r.frames].sort((a, b) => nf(b) - nf(a))[0] || r.frames[0] || {};
   const others = r.frames.filter((f) => f !== main);
   const heads = [...new Set([...(main.headings || []).slice(1), ...others.flatMap((f) => (f.headings || []).slice(1)), (main.headings || [])[0], ...others.map((f) => (f.headings || [])[0])])]
-    .filter((h) => h && h.length <= 30).slice(0, 24);
+    .map((h) => (h && /\d/.test(h) && h.length > 10 ? (h.split(/[\d:：]/)[0] || "").trim() : h))   // '잔여연차 : 9.29' → '잔여연차'
+    .filter((h, i, a) => h && h.length >= 2 && h.length <= 30 && a.indexOf(h) === i).slice(0, 24);
   let urlRule = ""; try { const u = new URL(main.url || r.url); urlRule = u.pathname.length > 1 ? u.pathname : ""; } catch (e) {}
   const ctx = r.context || {};
   const existing = ctx.screenId ? await findScreen(ctx.screenId) : null;

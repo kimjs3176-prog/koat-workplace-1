@@ -266,21 +266,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   if (m.type === "focus" && sender.tab) {                 // ERP 의 어느 프레임에서 입력란을 눌렀는지
     (state[tabId] = state[tabId] || {}).focusFrame = sender.frameId;
   } else if (m.type === "context" && sender.tab) {        // 화면 감지 결과 — 프레임 중 가장 구체적인 것
-    const st = (state[tabId] = state[tabId] || {});
-    const cur = st.context;
-    const rank = (c) => (c && typeof c.rank === "number" ? c.rank : 99);
-    if (cur && st.ctxFrame !== sender.frameId && rank(m.context) > rank(cur)) { diag("bg", "context.ignored", { got: m.context, kept: cur }, sender); reply && reply({ ignored: true }); return; }
-    diag("bg", "context", m.context, sender);
-    st.context = m.context; st.ctxFrame = sender.frameId;
-    guardFor(m.context).then((g) => {                     // 결재 전 점검 항목을 그 탭의 모든 프레임에
-      if (!g) return;
-      state[tabId].guard = g;
-      chrome.tabs.sendMessage(tabId, { type: "guard", guard: g }).catch(() => {});
-    });
-    // ERP·온나라가 띄운 팝업 창(기안 작성 창 등)의 감지 결과는 원래 창의 옆 패널로도 보낸다
-    const popup = winType[sender.tab.windowId] && winType[sender.tab.windowId] !== "normal";
-    toPanel({ type: "context", tabId, context: m.context, panelWin: popup ? lastNormalWin : null });
-    chrome.tabs.sendMessage(tabId, { type: "chip", q: m.context.q, title: m.context.title }).catch(() => {});   // 버튼을 그린 프레임이 받는다(frameset 대비)
+    if (!applyContext(sender.tab, sender.frameId, m.context, sender)) { reply && reply({ ignored: true }); return; }
   } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
     const st = state[tabId];
     if (st && st.context && st.ctxFrame === sender.frameId) {
@@ -308,7 +294,8 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       .then((r) => { diag("bg", "insert", { frameId: opts.frameId, ok: !!(r && r.ok), where: r && r.where, len: String(m.text || "").length }); reply(r || { ok: false }); })
       .catch((e) => { diag("bg", "insert", { frameId: opts.frameId, ok: false, err: e.message }); reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }); });
     return true;
-  } else if (m.type === "getProfiles") {                 // 내용 스크립트: 이 사이트의 화면 규칙
+  } else if (m.type === "getProfiles") {                 // 내용 스크립트: 이 사이트의 화면 규칙(= 이 탭에 확장이 붙었다)
+    if (sender.tab && sender.frameId === 0) (state[tabId] = state[tabId] || {}).cs = true;
     profilesFor(m.url || (sender.tab && sender.tab.url) || "").then((profiles) => reply({ profiles }));
     return true;
   } else if (m.type === "allProfiles") {                  // ERP 맞춤 도구·설정
@@ -367,4 +354,45 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
 
 chrome.tabs.onRemoved.addListener((id) => { delete state[id]; });
 // 탭이 다른 주소로 넘어가면 감지 결과를 비운다(같은 탭에서 다른 업무 화면으로)
-chrome.tabs.onUpdated.addListener((id, info) => { if (info.status === "loading" && info.url && state[id]) { delete state[id].context; delete state[id].guard; delete state[id].ctxFrame; } });
+chrome.tabs.onUpdated.addListener((id, info, tab) => {
+  if (info.status === "loading" && state[id]) { delete state[id].cs; if (info.url) { delete state[id].context; delete state[id].guard; delete state[id].ctxFrame; } }
+  if (info.status === "complete") setTimeout(() => urlContext(id).catch(() => {}), 2500);
+});
+
+// 업무 감지 결과를 탭 상태에 반영하고 결재 전 점검·패널·🗂 칩에 알린다(내용 스크립트·주소 감지 공통)
+function applyContext(tab, frameId, ctx, sender) {
+  const tabId = tab.id;
+  const st = (state[tabId] = state[tabId] || {});
+  const cur = st.context;
+  const rank = (c) => (c && typeof c.rank === "number" ? c.rank : 99);
+  if (cur && st.ctxFrame !== frameId && rank(ctx) > rank(cur)) { diag("bg", "context.ignored", { got: ctx, kept: cur }, sender); return false; }
+  diag("bg", "context", ctx, sender);
+  st.context = ctx; st.ctxFrame = frameId;
+  guardFor(ctx).then((g) => {                           // 결재 전 점검 항목을 그 탭의 모든 프레임에
+    if (!g) return;
+    state[tabId].guard = g;
+    chrome.tabs.sendMessage(tabId, { type: "guard", guard: g }).catch(() => {});
+  });
+  // ERP·온나라가 띄운 팝업 창(기안 작성 창 등)의 감지 결과는 원래 창의 옆 패널로도 보낸다
+  const popup = winType[tab.windowId] && winType[tab.windowId] !== "normal";
+  toPanel({ type: "context", tabId, context: ctx, panelWin: popup ? lastNormalWin : null });
+  chrome.tabs.sendMessage(tabId, { type: "chip", q: ctx.q, title: ctx.title }).catch(() => {});   // 버튼을 그린 프레임이 받는다(frameset 대비)
+  return true;
+}
+
+// 내용 스크립트가 붙지 못하는 탭(Edge 'IE 모드'로 열리는 온나라 등): 탭 주소·창 제목만으로 업무를 알아본다.
+// 이런 탭에는 🗂 버튼·결재 전 점검·칸 채우기를 할 수 없고, 옆 패널 안내와 '초안 복사 → Ctrl+V' 만 된다.
+async function urlContext(tabId) {
+  const st = state[tabId] || {};
+  if (st.cs || st.context) return;
+  const tab = await chrome.tabs.get(tabId);
+  const { erpHosts } = await settings();
+  if (!tab.url || !(erpHosts || []).some((h) => hostMatch(h, tab.url))) return;
+  let path = ""; try { path = new URL(tab.url).pathname; } catch (e) { return; }
+  const title = String(tab.title || "").replace(/\s*[-–]\s*(Microsoft Edge|Chrome).*$/i, "").trim();
+  let ctx = null;
+  for (const [i, [rx, q, proc]] of (SEC_RULES || []).entries()) { if (title && rx.test(title)) { ctx = { q, title: title.slice(0, 40), proc: proc || "", rank: i }; break; } }
+  if (!ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) { if (rx.test(path)) { ctx = { q, title: title || q, proc: proc || "", rank: (SEC_RULES || []).length + i }; break; } }
+  diag("bg", ctx ? "detect.tab" : "detect.tab.none", { url: path, title: title.slice(0, 60), note: "확장이 화면 안에 들어가지 못한 탭(IE 모드 등) — 주소·제목으로만 판단" }, { tab });
+  if (ctx) { ctx.tabOnly = true; applyContext(tab, 0, ctx, { tab }); }
+}
