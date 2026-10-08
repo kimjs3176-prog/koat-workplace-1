@@ -26,7 +26,7 @@ globalThis.SEC_RULES = [
   [/물품|구매\s*(요청|의뢰)|구입/, "물품 구매", "goods-purchase"],
   [/인계|인수/, "업무 인계", "handover"],
   [/지출\s*결의/, "지출결의", "doc-approval"],
-  [/기안|품의|전자\s*결재|결재\s*상신|공문|시행문|문서\s*작성/, "기안 결재", "doc-approval"]
+  [/기안|품의|전자\s*결재|결재\s*상신|공문|시행문|문서\s*작성|문서\s*관리\s*카드/, "기안 결재", "doc-approval"]
 ];
 // 제목 문구가 없는 화면(제목을 그림·스크립트로 그리는 ERP)은 주소 경로로 — 위 규칙이 하나도 안 맞을 때만 쓴다.
 // 아래는 KOAT ERP(kerp.koat.or.kr) 실제 시험 기록에서 뽑은 경로.
@@ -39,7 +39,7 @@ globalThis.SEC_URL_RULES = [
   [/cashDisbursementVoucher/i, "지출결의", "doc-approval"],
   [/\/eapproval\/docCommonDrafWrite/i, "기안 결재", "doc-approval"],
   // 온나라(onnara.koat.or.kr) 문서관리 — 기안·공문 작성 화면
-  [/\/bms\/.*(draft|Draft|write|Write|regist|Regist)/, "기안 결재", "doc-approval"]
+  [/\/bms\/dct\/|\/bms\/.*(draft|Draft|write|Write|regist|Regist)/, "기안 결재", "doc-approval"]   // 문서관리카드(기안 작성 창)
 ];
 // 업무를 알아보지 않을 화면(주소 경로) — 메일·일정·자원예약·게시판은 제목에 '세미나실' 같은 말이 있어도 업무 화면이 아니다
 globalThis.SEC_SKIP_URL = /\/mail2?\/|bizboxMail|\/schedule\/|\/board\//i;

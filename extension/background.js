@@ -277,15 +277,17 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       state[tabId].guard = g;
       chrome.tabs.sendMessage(tabId, { type: "guard", guard: g }).catch(() => {});
     });
-    toPanel({ type: "context", tabId, context: m.context });
-    chrome.tabs.sendMessage(tabId, { type: "chip", q: m.context.q, title: m.context.title }, { frameId: 0 }).catch(() => {});
+    // ERP·온나라가 띄운 팝업 창(기안 작성 창 등)의 감지 결과는 원래 창의 옆 패널로도 보낸다
+    const popup = winType[sender.tab.windowId] && winType[sender.tab.windowId] !== "normal";
+    toPanel({ type: "context", tabId, context: m.context, panelWin: popup ? lastNormalWin : null });
+    chrome.tabs.sendMessage(tabId, { type: "chip", q: m.context.q, title: m.context.title }).catch(() => {});   // 버튼을 그린 프레임이 받는다(frameset 대비)
   } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
     const st = state[tabId];
     if (st && st.context && st.ctxFrame === sender.frameId) {
       diag("bg", "context.clear", { was: st.context.title }, sender);
       delete st.context; delete st.guard; delete st.ctxFrame;
       chrome.tabs.sendMessage(tabId, { type: "guard", guard: null }).catch(() => {});
-      chrome.tabs.sendMessage(tabId, { type: "chip", q: "", title: "" }, { frameId: 0 }).catch(() => {});
+      chrome.tabs.sendMessage(tabId, { type: "chip", q: "", title: "" }).catch(() => {});
       toPanel({ type: "context", tabId, context: null });
     }
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
