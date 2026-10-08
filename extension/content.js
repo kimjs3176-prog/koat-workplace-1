@@ -21,7 +21,6 @@
     } catch (e) { return false; }
   }
   let lastEditable = null;
-  let profiles = [];                         // 이 사이트에 맞는 ERP 프로필(서비스 워커가 줌)
 
   // ── 프레임 위치(경로) — 프레임 구조가 같은 ERP 화면이면 늘 같은 값 ─────────────
   function framePath() {
@@ -126,26 +125,6 @@
     f.empty = !((el.value !== undefined ? el.value : el.innerText) || "").trim();
     return f;
   }
-  // 저장된 칸 정보 → 지금 화면의 요소 (선택자 → id → name → 칸 이름)
-  let lastHow = "";                              // 진단용: 칸을 무엇으로 찾았는지(sel·id·name·label·editor·none)
-  function locate(f) {
-    lastHow = "none";
-    if (f.frame !== undefined && f.frame !== MYPATH) return null;
-    const tries = [];
-    if (f.sel) tries.push(["sel", () => document.querySelector(f.sel)]);
-    if (f.fid) tries.push(["id", () => document.getElementById(f.fid)]);
-    if (f.name) tries.push(["name", () => document.querySelector(`[name="${CSS.escape(f.name)}"]`)]);
-    for (const [how, t] of tries) { try { const el = t(); if (el) { lastHow = how; return el; } } catch (e) {} }
-    if (f.label) {
-      const want = clean(f.label).replace(/\s/g, "");
-      for (const el of document.querySelectorAll("input,textarea,select,[contenteditable='true'],[contenteditable='']")) {
-        if (clean(labelOf(el)).replace(/\s/g, "") === want) { lastHow = "label"; return el; }
-      }
-    }
-    if (f.kind === "editor" && document.designMode === "on") { lastHow = "editor"; return document.body; }
-    return null;
-  }
-
   // ── 값 넣기 ────────────────────────────────────────────────
   function setValue(el, text, mode) {
     text = String(text ?? "");
@@ -241,63 +220,9 @@
     try { const u = new URL(location.href); a.url = u.origin + u.pathname + (u.search ? "?" + [...u.searchParams.keys()].join("&") : ""); } catch (e) {}
     return Object.assign(a, { buttons: btns, iframes: frames, scriptHints: hints, scripts: scripts.length, contentEditable: document.querySelectorAll("[contenteditable]").length, forms: document.forms.length });
   };
-  // ── 강조(눈으로 확인) ──────────────────────────────────────
-  globalThis.__secHighlight = (f) => {
-    const el = locate(f); if (!el) return false;
-    const t = el === document.body ? document.documentElement : el;
-    t.scrollIntoView && t.scrollIntoView({ block: "center", behavior: "smooth" });
-    const prev = t.style.outline, prevOff = t.style.outlineOffset;
-    t.style.outline = "3px solid #f59e0b"; t.style.outlineOffset = "2px";
-    setTimeout(() => { t.style.outline = prev; t.style.outlineOffset = prevOff; }, 1800);
-    return true;
-  };
-  // ── 요소 직접 고르기 ───────────────────────────────────────
-  let pick = null;
-  globalThis.__secPick = () => {
-    if (pick) return true;
-    const box = document.createElement("div");
-    box.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #f59e0b;background:rgba(245,158,11,.12);border-radius:3px;display:none";
-    document.documentElement.appendChild(box);
-    const target = (e) => { const el = e.target === document.documentElement ? document.body : e.target; return editable(el) || (el.tagName === "SELECT" ? el : el); };
-    const move = (e) => { const el = target(e); const r = (el === document.body ? document.documentElement : el).getBoundingClientRect();
-      Object.assign(box.style, { display: "block", left: r.left + "px", top: r.top + "px", width: r.width + "px", height: r.height + "px" }); };
-    const click = (e) => { e.preventDefault(); e.stopPropagation(); const el = target(e);
-      chrome.runtime.sendMessage({ type: "picked", field: describe(el) }).catch(() => {}); globalThis.__secPickStop(); };
-    const key = (e) => { if (e.key === "Escape") { chrome.runtime.sendMessage({ type: "picked", field: null }).catch(() => {}); globalThis.__secPickStop(); } };
-    document.addEventListener("mousemove", move, true);
-    document.addEventListener("click", click, true);
-    document.addEventListener("keydown", key, true);
-    pick = { box, move, click, key };
-    return true;
-  };
-  globalThis.__secPickStop = () => {
-    if (!pick) return;
-    document.removeEventListener("mousemove", pick.move, true);
-    document.removeEventListener("click", pick.click, true);
-    document.removeEventListener("keydown", pick.key, true);
-    pick.box.remove(); pick = null;
-  };
-  // ── 매핑으로 여러 칸 채우기 ─────────────────────────────────
-  //  payload: {fields:[{key,sel,name,fid,label,frame,kind}], values:{key:값}, test?:true}
-  globalThis.__secFillMap = (payload) => {
-    const filled = [], missing = [], how = {};
-    for (const f of (payload && payload.fields) || []) {
-      if (f.frame !== undefined && f.frame !== MYPATH) continue;
-      const v = payload.test ? `[시험] ${f.label || f.key}` : (payload.values || {})[f.key];
-      if (v === undefined || v === null || String(v).trim() === "") continue;
-      const el = locate(f);
-      let ok = false;
-      try { ok = !!(el && setValue(el, v, "replace")); } catch (e) { how[f.key + ":err"] = e.message; }
-      how[f.key] = el ? lastHow + (ok ? "" : "(넣기 실패)") + ":" + kindOf(el) : "못 찾음(" + [f.sel, f.fid, f.name, f.label].filter(Boolean).join(" | ").slice(0, 120) + ")";
-      if (ok) filled.push(f.key); else missing.push(f.key);
-    }
-    return { path: MYPATH, filled, missing, how };
-  };
-
   chrome.runtime.onMessage.addListener((m, _s, reply) => {
     if (m.type === "insert") { reply(insertText(String(m.text || ""))); }
     else if (m.type === "chip" && uiFrame()) { setChip(m.q || "", m.title || ""); }
-    else if (m.type === "profiles") { profiles = m.profiles || []; lastSent = ""; schedule(); }
   });
 
   // ── 화면 감지 ──────────────────────────────────────────────
@@ -315,46 +240,21 @@
     }
     return out.filter(Boolean);
   }
-  const textMatch = (pat, s) => {
-    if (!pat) return false;
-    const m = /^\/(.+)\/([a-z]*)$/.exec(pat);
-    if (m) { try { return new RegExp(m[1], m[2]).test(s); } catch (e) { return false; } }
-    return s.replace(/\s/g, "").includes(pat.replace(/\s/g, ""));
-  };
-  function topTexts() {
-    if (TOP) return [];
-    try { const d = window.top.document; return [d.title, ...[...d.querySelectorAll(SEL)].slice(0, 60).filter((e) => e.offsetParent).map((e) => (e.innerText || "").trim().replace(/\s+/g, " ")).filter((t) => t && t.length <= 40)]; }
-    catch (e) { return []; }
-  }
-  function topHref() { try { return window.top.location.href; } catch (e) { return ""; } }
-  function screenMatch(own) {
-    const texts = [...own, ...topTexts()], hrefs = [location.href, topHref()].filter(Boolean);
-    for (const p of profiles) for (const sc of p.screens || []) {
-      const mu = sc.match && sc.match.url, mt = sc.match && sc.match.title;
-      const okU = !mu || hrefs.some((h) => textMatch(mu, h));
-      const okT = !mt || texts.some((t) => textMatch(mt, t));
-      // 주소·제목 조건이 둘 다 있으면 둘 다 맞아야. 하나만 있으면 그것만.
-      if ((mu || mt) && okU && okT) return { p, sc, hit: mt ? (texts.find((t) => textMatch(mt, t)) || sc.name) : sc.name };
-    }
-    return null;
-  }
   let lastSent = "", noneLogged = "";
   // 이 프레임이 알려 둔 업무가 더는 화면에 없으면 지우게 한다
   function forget() { if (lastSent) { lastSent = ""; chrome.runtime.sendMessage({ type: "frameNav" }).catch(() => {}); } }
   function detect() {
     if (globalThis.SEC_SKIP_URL && globalThis.SEC_SKIP_URL.test(location.pathname)) { forget(); return; }
     const texts = candidates();
-    const m = screenMatch(texts);
     let ctx = null;
-    // rank: 저장된 화면 규칙(-1) > 기본 규칙 순서 — 여러 프레임이 서로 다른 업무를 알아보면 더 구체적인 쪽을 쓴다
-    if (m) ctx = { q: m.sc.q || m.sc.name, title: m.sc.name || m.hit, screenId: m.sc.id, profileId: m.p.id, draft: m.sc.draft || "", proc: m.sc.proc || "", rank: -1 };
-    if (!m) {                                           // 기관 ERP 의 주소가 정확한 화면(신청서 팝업 등)은 주소가 먼저
+    // rank: 규칙 순서 — 여러 프레임이 서로 다른 업무를 알아보면 더 구체적인(앞쪽) 규칙을 쓴다
+    {                                                   // 기관 ERP 의 주소가 정확한 화면(신청서 팝업 등)은 주소가 먼저
       const base = (globalThis.SEC_RULES || []).length;
       for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) {
         if (rx.test(location.pathname)) { ctx = { q, title: q, proc: proc || "", rank: base + i, byUrl: true }; break; }
       }
     }
-    if (!m && !ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
+    if (!ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
       const hit = texts.find((t) => rx.test(t));
       // '잔여연차 : 9.29' 처럼 숫자 섞인 긴 문구는 화면 이름으로 쓰지 않는다(개인 정보·매번 바뀜)
       if (hit) { ctx = { q, title: (/\d/.test(hit) && hit.length > 10 ? q : hit).slice(0, 40), proc: proc || "", rank: i }; break; }
@@ -367,13 +267,14 @@
     }
     const key = JSON.stringify(ctx);
     // 어느 프레임에서 찾았든 서비스 워커가 맨 위 프레임의 🗂 버튼에 다시 알려 준다
-    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: m ? "화면 규칙" : ctx.byUrl ? "주소 규칙" : "기본 규칙", hit: m ? m.hit : ctx.byUrl ? location.pathname : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
+    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: ctx.byUrl ? "주소 규칙" : "기본 규칙", hit: ctx.byUrl ? location.pathname : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
   }
   let timer = null;
   const schedule = () => { clearTimeout(timer); timer = setTimeout(detect, 600); };
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("hashchange", schedule);
-  chrome.runtime.sendMessage({ type: "getProfiles", url: location.href }).then((r) => { profiles = (r && r.profiles) || []; schedule(); }).catch(() => schedule());
+  chrome.runtime.sendMessage({ type: "hello" }).catch(() => {});   // 이 탭에 확장이 붙었음을 알림(IE 모드 등 판별용)
+  schedule();
   setTimeout(() => { if (uiFrame()) setChip("", ""); }, TOP ? 0 : 800);   // 감지 전에도 🗂 버튼은 보이게(frameset 은 프레임이 다 뜬 뒤 판단)
 
   // ── 🗂 버튼(맨 위 프레임) ───────────────────────────────────

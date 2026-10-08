@@ -32,6 +32,7 @@ chrome.runtime.onInstalled.addListener(async (d) => {
       if (add.length) await chrome.storage.sync.set({ erpHosts: [...erpHosts, ...add] });
     }
   }
+  chrome.storage.local.remove(["myProfiles", "srvProfiles"]).catch(() => {});   // ERP 맞춤(🔧) 기능 삭제 — 옛 저장분 정리
   await registerExtraHosts();
   if (d.reason === "install" && !(await settings()).server) chrome.runtime.openOptionsPage();
 });
@@ -81,38 +82,7 @@ async function panelWindow(tab) {
     left: Math.max(0, (win.left || 0) + (win.width || 1200) - 440), top: win.top || 0 });
 }
 
-// ── ERP 프로필(화면 규칙·칸 매핑) — 기관 공유본(서버) + 내 브라우저본(로컬, 같은 화면 id 면 우선) ──
-async function serverProfiles(force) {
-  const { server } = await settings();
-  const { srvProfiles } = await chrome.storage.local.get("srvProfiles");
-  if (!server) return [];
-  if (!force && srvProfiles && Date.now() - srvProfiles.ts < 30 * 60 * 1000) return srvProfiles.list || [];
-  try {
-    const r = await fetch(server + "/api/secretary/erp/profiles", { cache: "no-store" });
-    const d = await r.json();
-    const list = (d && d.profiles) || [];
-    await chrome.storage.local.set({ srvProfiles: { ts: Date.now(), list, updated: d.updated || "" } });
-    diag("bg", "profiles.fetch", { ok: true, profiles: list.length, screens: list.reduce((a, p) => a + (p.screens || []).length, 0) });
-    return list;
-  } catch (e) { diag("bg", "profiles.fetch", { ok: false, err: e.message }); return (srvProfiles && srvProfiles.list) || []; }
-}
-async function allProfiles(force) {
-  const srv = await serverProfiles(force);
-  const { myProfiles } = await chrome.storage.local.get("myProfiles");
-  const mine = myProfiles || [];
-  const out = srv.map((p) => ({ ...p, screens: [...(p.screens || [])], source: "org" }));
-  for (const p of mine) {
-    const same = out.find((x) => x.hosts.some((h) => p.hosts.includes(h)));
-    if (!same) { out.push({ ...p, source: "mine" }); continue; }
-    for (const sc of p.screens || []) {
-      const i = same.screens.findIndex((x) => x.id === sc.id);
-      if (i >= 0) same.screens[i] = { ...sc, mine: true }; else same.screens.unshift({ ...sc, mine: true });
-    }
-  }
-  return out;
-}
 const hostMatch = (pat, url) => { try { const u = new URL(url); return pat.replace(/\/\*$/, "") === u.origin; } catch (e) { return false; } };
-async function profilesFor(url) { return (await allProfiles()).filter((p) => (p.hosts || []).some((h) => hostMatch(h, url))); }
 
 // 모든 프레임에서 내용 스크립트 함수 실행(같은 격리 공간이라 globalThis.__sec* 를 부를 수 있다)
 async function inFrames(tabId, fn, arg) {
@@ -120,28 +90,9 @@ async function inFrames(tabId, fn, arg) {
     const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true },
       func: (name, a) => (typeof globalThis[name] === "function" ? globalThis[name](a) : null), args: [fn, arg ?? null] });
     // 내용 스크립트가 없는 프레임(다른 출처·권한 밖)은 null — 진단에 프레임 수를 남긴다
-    if (fn !== "__secHighlight" && fn !== "__secPickStop") diag("bg", "frames." + fn, { frames: res.length, withScript: res.filter((r) => r.result !== null && r.result !== undefined).length });
+    diag("bg", "frames." + fn, { frames: res.length, withScript: res.filter((r) => r.result !== null && r.result !== undefined).length });
     return res.map((r) => r.result).filter((x) => x !== null && x !== undefined);
   } catch (e) { diag("bg", "frames.error", { fn, err: e.message }); throw e; }
-}
-
-// 초안 → 매핑된 칸들. 지금 감지된 화면 → 같은 초안을 쓰는 화면 순으로 고른다.
-async function fillMap(tabId, m) {
-  const tab = await chrome.tabs.get(tabId);
-  const ps = await profilesFor(tab.url || "");
-  const ctx = (state[tabId] || {}).context || {};
-  const screens = ps.flatMap((p) => p.screens || []);
-  let pick = screens.filter((sc) => sc.id === ctx.screenId && (sc.fields || []).length);
-  if (!pick.length && m.draft) pick = screens.filter((sc) => sc.draft === m.draft && (sc.fields || []).length);
-  if (m.screen) pick = [m.screen];
-  if (!pick.length) return { ok: false, mapped: false };
-  const fields = pick.flatMap((sc) => sc.fields || []);
-  const res = await inFrames(tabId, "__secFillMap", { fields, values: m.values || {}, test: !!m.test });
-  const filled = [...new Set(res.flatMap((r) => r.filled || []))];
-  const want = [...new Set(fields.map((f) => f.key))].filter((k) => m.test || String((m.values || {})[k] ?? "").trim());
-  const out = { ok: filled.length > 0, mapped: true, filled, missing: want.filter((k) => !filled.includes(k)), screen: pick[0].name };
-  diag("bg", "fillmap", { screen: out.screen, test: !!m.test, filled, missing: out.missing, perFrame: res.map((r) => ({ path: r.path, filled: r.filled, missing: r.missing, how: r.how })) });
-  return out;
 }
 
 // ── 서무비서 메타(절차·반려 점검 항목) — 결재 전 점검에 쓴다 ─────────────────
@@ -241,13 +192,30 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   if (m.type === "diag.get") {
     diagLoad().then(async (buf) => {
       const s = await settings();
-      const st = await chrome.storage.local.get(["myProfiles", "srvProfiles", "deadlines", "meta"]);
+      const st = await chrome.storage.local.get(["deadlines", "meta"]);
       reply({ log: buf, enabled: diagOn, settings: { ...s }, version: chrome.runtime.getManifest().version,
-        profiles: { mine: st.myProfiles || [], org: (st.srvProfiles && st.srvProfiles.list) || [] },
         deadlines: Object.fromEntries(Object.entries(st.deadlines || {}).map(([k, v]) => [k, (v.items || []).length])),
         meta: st.meta ? { ts: st.meta.ts, procedures: ((st.meta.data || {}).procedures || []).length } : null,
         state: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, { context: v.context || null, guard: v.guard ? { proc: v.guard.proc, n: (v.guard.pitfalls || []).length, enabled: v.guard.enabled } : null, focusFrame: v.focusFrame }])) });
     });
+    return true;
+  }
+  if (m.type === "diag.tabcheck") {                      // 진단 센터: 지금 이 탭에서 확장이 어떻게 동작하는지
+    (async () => {
+      const tab = await chrome.tabs.get(m.tabId);
+      const s = await settings();
+      let origin = ""; try { origin = new URL(tab.url).origin; } catch (e) {}
+      const listed = (s.erpHosts || []).some((h) => hostMatch(h, tab.url || ""));
+      const allowed = origin ? await chrome.permissions.contains({ origins: [origin + "/*"] }).catch(() => false) : false;
+      const st = state[m.tabId] || {};
+      let frames = null, frameErr = "";
+      try { frames = await chrome.scripting.executeScript({ target: { tabId: m.tabId, allFrames: true }, func: () => !!globalThis.__secSnapshot }); }
+      catch (e) { frameErr = e.message; }
+      reply({ ok: true, url: diagUrl(tab.url), title: tab.title || "", windowType: winType[tab.windowId] || "", listed, allowed,
+        cs: !!st.cs, frames: frames ? frames.length : 0, framesWithScript: frames ? frames.filter((f) => f.result).length : 0, frameErr,
+        context: st.context || null, guard: st.guard ? { proc: st.guard.proc, n: (st.guard.pitfalls || []).length, enabled: st.guard.enabled } : null,
+        focusFrame: st.focusFrame });
+    })().catch((e) => reply({ ok: false, error: e.message }));
     return true;
   }
   if (m.type === "diag.enable") { diagSetEnabled(m.on).then(() => reply({ ok: true })); return true; }
@@ -294,44 +262,9 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       .then((r) => { diag("bg", "insert", { frameId: opts.frameId, ok: !!(r && r.ok), where: r && r.where, len: String(m.text || "").length }); reply(r || { ok: false }); })
       .catch((e) => { diag("bg", "insert", { frameId: opts.frameId, ok: false, err: e.message }); reply({ ok: false, error: "ERP 화면과 연결되지 않았습니다. ERP 탭을 새로고침한 뒤 다시 시도하세요." }); });
     return true;
-  } else if (m.type === "getProfiles") {                 // 내용 스크립트: 이 사이트의 화면 규칙(= 이 탭에 확장이 붙었다)
+  } else if (m.type === "hello" || m.type === "getProfiles") {   // 내용 스크립트가 이 탭에 붙었다(맨 위 프레임)
     if (sender.tab && sender.frameId === 0) (state[tabId] = state[tabId] || {}).cs = true;
-    profilesFor(m.url || (sender.tab && sender.tab.url) || "").then((profiles) => reply({ profiles }));
-    return true;
-  } else if (m.type === "allProfiles") {                  // ERP 맞춤 도구·설정
-    allProfiles(!!m.force).then(async (profiles) => {
-      const { myProfiles, srvProfiles } = await chrome.storage.local.get(["myProfiles", "srvProfiles"]);
-      reply({ profiles, mine: myProfiles || [], org: (srvProfiles && srvProfiles.list) || [], orgUpdated: (srvProfiles && srvProfiles.updated) || "" });
-    });
-    return true;
-  } else if (m.type === "profilesChanged") {              // 저장 후: 열린 ERP 탭에 새 규칙 전달
-    allProfiles(!!m.force).then(async () => {
-      for (const t of await chrome.tabs.query({})) {
-        if (!t.url || !/^https?:/.test(t.url)) continue;
-        const profiles = await profilesFor(t.url);
-        chrome.tabs.sendMessage(t.id, { type: "profiles", profiles }).catch(() => {});
-      }
-      reply({ ok: true });
-    });
-    return true;
-  } else if (m.type === "analyze") {                      // ERP 구조 분석(모든 프레임)
-    inFrames(m.tabId, "__secAnalyze").then(async (frames) => {
-      const tab = await chrome.tabs.get(m.tabId);
-      reply({ ok: true, url: tab.url, title: tab.title, frames, context: (state[m.tabId] || {}).context || null });
-    }).catch((e) => reply({ ok: false, error: "이 탭의 화면을 읽을 수 없습니다. ERP 주소가 확장 설정에 들어 있는지, 탭을 새로고침했는지 확인하세요. (" + e.message + ")" }));
-    return true;
-  } else if (m.type === "highlight") {
-    inFrames(m.tabId, "__secHighlight", m.field).then((r) => reply({ ok: r.some(Boolean) })).catch(() => reply({ ok: false }));
-    return true;
-  } else if (m.type === "pickStart") {
-    inFrames(m.tabId, "__secPick").then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: e.message }));
-    return true;
-  } else if (m.type === "picked" && sender.tab) {         // 어느 프레임에서 골랐으면 나머지 프레임의 고르기 끝내기
-    inFrames(sender.tab.id, "__secPickStop").catch(() => {});
-    toPanel({ type: "picked", tabId, field: m.field });
-  } else if (m.type === "fillmap") {                      // 패널: 초안 → 매핑된 칸들
-    fillMap(m.tabId, m).then(reply).catch((e) => reply({ ok: false, error: e.message }));
-    return true;
+    reply && reply({ profiles: [] });
   } else if (m.type === "openHere" && sender.tab) {        // 서무비서 웹 화면의 '패널로 열기'
     openPanel(sender.tab);
   } else if (m.type === "getGuard" && sender.tab) {

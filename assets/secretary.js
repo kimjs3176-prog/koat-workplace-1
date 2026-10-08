@@ -42,6 +42,11 @@ function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
 function saveCases(c){ _lsPut(LS_CASES, c.slice(0,300)); if(typeof syncDeadlines==='function') syncDeadlines(); }
 let _toastT=null;
+// ── 내 AI 키(이 브라우저에만 저장) — 기관 키가 없어도 AI 분석을 켠다. 요청할 때만 헤더로 보내고 서버는 저장하지 않는다.
+const LS_AIKEY='koat-sec-aikey';
+function aiKey(){ const k=_ls(LS_AIKEY,null); return k&&k.key?k:null; }
+function aiOn(){ return !!(S.ai&&S.ai.available) || !!aiKey(); }
+function aiHeaders(h){ const k=aiKey(); return Object.assign({}, h||{}, k?{'X-AI-Key':k.key,'X-AI-Provider':k.provider||''}:{}); }
 function toast(m,ms){ const el=document.getElementById('toast'); if(!el) return; el.textContent=m; el.classList.add('show');
   clearTimeout(_toastT); _toastT=setTimeout(()=>el.classList.remove('show'), ms||2600); }
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -321,7 +326,7 @@ function homeView(){
     cats.map(([cat,ps])=>`<div class="sec-cat"><div class="sec-cat-h">${esc(cat)}</div>`+ps.map(p=>`<button class="sec-proc-l" data-a="proc" data-id="${esc(p.id)}"><span>${esc(p.icon||'📌')}</span><span>${esc(shortTitle(p.title))}</span>${p._layer!=='common'?`<span class="sec-layer ${p._layer}">${LAYER_LABEL[p._layer]}</span>`:''}</button>`).join('')+`</div>`).join('')+
     `</div></div>`;
   const how=`<div class="sec-how"><b>서무비서는 이렇게 돕습니다</b> — ① 상황을 말하면 해당 절차를 찾고 ② 기준일을 넣으면 단계별 기한을 계산해 다음 할 일을 짚어 주며 ③ 단계마다 필요한 서식(원본)과 근거 조문, 문서 초안을 바로 꺼내 줍니다. 진행 상황은 <b>처리 이력</b>에 남아 담당자가 바뀌어도 이어갈 수 있어요.</div>`;
-  return extHero()+ex+todo+grid+how;
+  return extHero()+ex+aiKeyHint()+todo+grid+how;
 }
 // ── 확장이 메인: 웹 화면은 설치 안내·보조 ─────────────────────────────────
 // 확장이 설치되어 있으면 서무비서 웹 화면에 data-sec-ext(버전)를 달아 준다(확장의 marker.js).
@@ -526,6 +531,12 @@ function historyView(){
 }
 
 // ── 관리(층별 등록·수정·삭제) ─────────────────────────────────────────────
+function aiKeyCard(){
+  const k=aiKey(), org=S.ai&&S.ai.available;
+  return `<div class="sec-card"><div class="sec-card-h">✦ AI 분석 <span class="sec-sub">${org?`기관 AI 사용 중(${esc(S.ai.provider||'')})`:k?`내 AI 키 사용 중(${esc(k.provider)})`:'꺼짐'}</span></div>`+
+    `<div class="sec-hint">상황을 문장으로 말하면 AI가 맞는 절차와 고른 이유, 더 확인할 점, 특히 조심할 반려 점검 항목을 안내합니다. 절차·규정 내용은 등록된 것만 쓰고 AI가 지어내지 않습니다.</div>`+
+    `<div class="sec-row"><button class="sec-btn${org?' ghost':''}" data-a="aikey">${k?'내 AI 키 바꾸기·지우기':'내 AI 키 넣기'}</button></div></div>`;
+}
 function manageView(){
   const procs=allProcs(); const hid=hiddenProcs();
   const orgInfo=S.org.updated?`기관 절차 ${S.org.procedures.length}건 · 최종 갱신 ${esc(S.org.updated)}${S.org.updated_by?' ('+esc(S.org.updated_by)+')':''}`:'기관 절차 없음';
@@ -541,7 +552,7 @@ function manageView(){
     `<div class="sec-row"><button class="sec-btn primary" data-a="newproc">＋ 새 절차 만들기</button>`+
     `<button class="sec-btn ghost" data-a="reload">↻ 기관 절차 새로고침</button></div>`+
     `<div class="sec-card">${rows}${hidRows}</div>`+
-    healthCard()+impactCard()+insightsCard()+mappingCard()+packCard()+configCard()+
+    aiKeyCard()+healthCard()+impactCard()+insightsCard()+mappingCard()+packCard()+configCard()+
     `<div class="sec-hint">규정·지침이 개정되면: 근거 조문은 내규 원문(업로드 반영)에서 자동으로 최신본을 보여 줍니다. 근거 규정이 개정된 절차에는 '재확인 필요'가 표시되니, 원문과 대조한 뒤 <b>수정</b>해 기관 층으로 다시 저장하세요.</div>`;
 }
 
@@ -812,7 +823,7 @@ function openDraft(key){
   body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
       (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
     `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
-    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP 맞춤으로 연결한 칸들에 한 번에 넣고, 연결이 없으면 ERP에서 마지막으로 누른 칸에 넣습니다">📥 ERP에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
+    `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP에서 마지막으로 누른 입력란에 넣습니다(넣을 수 없는 편집기는 복사해 두니 Ctrl+V)">📥 ERP에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
     `<div id="secFormsRow">${formsRow(key)}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
   const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
@@ -821,9 +832,7 @@ function openDraft(key){
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
     if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
     else if(b.dataset.da==='erp'){ S._lastInsert=txt;
-      // ERP 맞춤(칸 연결)이 있는 화면이면 항목별로 여러 칸에 — 항목 값과 초안 전체를 함께 보낸다
-      const vals={}; (d.fields||[]).forEach(f=>{ const v=String(S._draft.vals[f.k]||'').trim(); if(v) vals[f.k]=v; });
-      toExt({type:'insert', text:txt, draft:key, values:vals}); }
+      toExt({type:'insert', text:txt, draft:key}); }
     else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
     else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
     else if(b.dataset.da==='fgen'){ formsGenerate(d, S._draft.vals); }
@@ -989,6 +998,7 @@ function bind(panel){
       case 'calmove': { const n=Number(D.d); if(!n){ S.calYM=null; } else { let {y,m}=S.calYM; m+=n; if(m<1){m=12;y--;} if(m>12){m=1;y++;} S.calYM={y,m}; } render(); break; }
       case 'calics': calIcs(); break;
       case 'aiask': aiUnderstand(S.query, true); break;
+      case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
       case 'audit': runAudit(); break;
@@ -1148,9 +1158,9 @@ async function addReceipts(files){
     const r={id:uid(), name:String(f.name||'증빙').slice(0,60), date:'', end_date:'', amount:0, vendor:'', kind:'기타', payment:'알수없음', nights:0, route:'', items:'', note:'', confidence:'', ai:false};
     try{
       r.thumb=await imgToJpeg(f, 220, .7);
-      if(S.ai.available){
+      if(aiOn()){
         const big=await imgToJpeg(f, 1600, .85);
-        const resp=await fetch('/api/secretary/ai/receipt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:big, context:p.title, year})});
+        const resp=await fetch('/api/secretary/ai/receipt',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({image:big, context:p.title, year})});
         const d=await resp.json();
         if(d.success){ Object.assign(r, d.receipt, {ai:true}); } else { r.note=d.error||'인식하지 못했습니다 — 직접 입력하세요.'; }
       }
@@ -1207,9 +1217,9 @@ function receiptHtml(p, c){
       `${r.route?`<span class="sec-sub">${esc(r.route)}</span>`:''}${r.items?`<span class="sec-sub">${esc(r.items)}</span>`:''}`+
       `<button class="sec-x" data-a="rcdel" data-id="${esc(r.id)}" aria-label="증빙 삭제">✕</button></div></div>`).join('');
   const checks=receiptChecks(p, c);
-  return `<div class="sec-card sec-rcard"><div class="sec-card-h">🧾 증빙 첨부 <span class="sec-sub">${S.ai.available?'영수증·승차권 사진을 올리면 AI가 날짜·금액을 읽습니다':'사진을 올리고 날짜·금액을 입력하세요(AI 인식은 관리자가 AI 키를 설정하면 켜집니다)'}</span></div>`+
+  return `<div class="sec-card sec-rcard"><div class="sec-card-h">🧾 증빙 첨부 <span class="sec-sub">${aiOn()?'영수증·승차권 사진을 올리면 AI가 날짜·금액을 읽습니다':'사진을 올리고 날짜·금액을 입력하세요(AI 인식은 관리자가 AI 키를 설정하면 켜집니다)'}</span></div>`+
     `<label class="sec-drop"><input type="file" accept="image/*" multiple data-a="rcfile" hidden>`+
-      `<span>📷 사진 선택 또는 촬영</span><span class="sec-sub">여러 장 가능 · 사진은 서버에 저장하지 않습니다${S.ai.available?' (AI 분석에만 사용)':''}</span></label>`+
+      `<span>📷 사진 선택 또는 촬영</span><span class="sec-sub">여러 장 가능 · 사진은 서버에 저장하지 않습니다${aiOn()?' (AI 분석에만 사용)':''}</span></label>`+
     (busy?`<div class="assist-loading sm"><div class="spinner"></div><span>증빙 ${busy}장 읽는 중...</span></div>`:'')+
     (rs.length?`<div class="sec-rc-list">${rows}</div>`+
       `<div class="sec-rc-sum">합계 <b>${won(total)}원</b> `+Object.entries(sums).map(([k,v])=>`<span class="sec-doc">${esc(k)} ${won(v)}원</span>`).join('')+`</div>`+
@@ -1242,18 +1252,21 @@ function localPlan(q, matches){
   return out.length>=2 ? out.sort((a,b)=>a.pos-b.pos).slice(0,4).map(x=>x.id) : null;
 }
 function needAI(q, matches){
-  if(!S.ai.available) return false;
+  if(!aiOn()) return false;
   if(!matches.length) return true;
+  if(q.length>=10 && /\s/.test(q)) return true;          // 상황을 문장으로 말했으면 AI 가 분석(맞는 절차·확인할 점·주의할 점)
   if(COMPOUND.test(q)) return !localPlan(q, matches);   // 섞인 문장인데 절차를 하나밖에 못 찾았으면 AI로
   return matches[0].sc<4;      // 약한 매칭(짧은 단어 하나)이면 AI로 확인
 }
 async function aiUnderstand(q, force){
-  if(!S.ai.available || (!force && !needAI(q, S.matches))) return;
+  if(!aiOn() || (!force && !needAI(q, S.matches))) return;
   S.aiRes={q, loading:true}; render();
-  const procs=allProcs().map(p=>({id:p.id, title:p.title, summary:p.summary||'', triggers:(p.triggers||[]).slice(0,15)}));
-  try{ const r=await fetch('/api/secretary/ai/understand',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q, procedures:procs})});
+  const procs=allProcs().map(p=>({id:p.id, title:p.title, summary:p.summary||'', triggers:(p.triggers||[]).slice(0,15),
+    steps:(p.steps||[]).map(x=>String(x.t||'').slice(0,90)).slice(0,12), pitfalls:(p.pitfalls||[]).map(x=>String(x.t||'').slice(0,120)).slice(0,10)}));
+  try{ const r=await fetch('/api/secretary/ai/understand',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({q, procedures:procs})});
     const d=await r.json(); if(S.query!==q) return;
-    S.aiRes=d.success?{q, ids:(d.procedure_ids||[]).filter(id=>getProc(id)), summary:d.summary, uncovered:d.uncovered}:{q, error:d.error||'AI가 이해하지 못했습니다.'};
+    S.aiRes=d.success?{q, ids:(d.procedure_ids||[]).filter(id=>getProc(id)), summary:d.summary, uncovered:d.uncovered,
+      reasons:d.reasons||[], facts:d.facts||[], questions:d.questions||[], cautions:d.cautions||[]}:{q, error:d.error||'AI가 이해하지 못했습니다.'};
   }catch(e){ if(S.query===q) S.aiRes={q, error:'AI에 연결하지 못했습니다.'}; }
   // 등록 절차를 못 찾았는데 AI가 하나를 골랐다면 바로 그 절차로
   if(S.view==='nomatch' && S.aiRes.ids && S.aiRes.ids.length===1){ openWithDates(S.aiRes.ids[0], q); return; }
@@ -1267,19 +1280,46 @@ function openWithDates(pid, q){
     selectProc(p.id,{keepQuery:true, caseId:S.caseId, keepNote:true}); return; }
   selectProc(p.id,{keepQuery:true});
 }
+// AI 분석의 덧붙임: 고른 이유·상황에서 읽은 사실·더 확인할 점·특히 조심할 반려 점검 항목(원래 문장 그대로)
+function aiExtra(a){
+  if(!a || a.local) return '';
+  const why=(a.reasons||[]).filter(r=>getProc(r.id)).map(r=>`<li><b>${esc(shortTitle(getProc(r.id).title))}</b> — ${esc(r.why)}</li>`).join('');
+  const cau=(a.cautions||[]).map(c=>{ const p=getProc(c.id); const t=p&&(p.pitfalls||[])[c.idx]; return t?`<li>⚠ ${esc(t.t)} <span class="sec-sub">(${esc(shortTitle(p.title))})</span></li>`:''; }).join('');
+  return (why?`<div class="sec-ai-sec"><b>왜 이 절차인가요</b><ul>${why}</ul></div>`:'')+
+    ((a.facts||[]).length?`<div class="sec-ai-sec"><b>상황에서 읽은 내용</b><div class="sec-ai-chips">${a.facts.map(f=>`<span class="sec-chip static">${esc(f)}</span>`).join('')}</div></div>`:'')+
+    ((a.questions||[]).length?`<div class="sec-ai-sec"><b>더 확인할 점</b><ul>${a.questions.map(q=>`<li>❓ ${esc(q)}</li>`).join('')}</ul></div>`:'')+
+    (cau?`<div class="sec-ai-sec"><b>특히 조심할 점</b> <span class="sec-sub">반려 점검 항목</span><ul>${cau}</ul></div>`:'');
+}
+function aiKeyHint(){
+  if(aiOn()) return '';
+  return `<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aikey">✦ 내 AI 키를 넣으면 상황을 분석해 맞는 절차·확인할 점을 안내합니다</button></div>`;
+}
+function openAiKey(){
+  const k=aiKey()||{provider:'claude', key:''};
+  const body=modal('secAiKeyModal','✦ AI 분석 — 내 AI 키');
+  body.innerHTML=`<div class="sec-hint">기관이 AI 키를 설정하지 않았어도, 개인 AI 키를 넣으면 상황 문장을 분석해 맞는 절차·고른 이유·더 확인할 점·조심할 반려 점검 항목을 안내합니다. 영수증 인식·사전 감사의 AI 기능도 함께 켜집니다.</div>`+
+    `<label class="sec-f"><span>AI 서비스</span><select data-ak="provider"><option value="claude"${k.provider==='claude'?' selected':''}>Claude (Anthropic)</option><option value="gemini"${k.provider==='gemini'?' selected':''}>Gemini (Google)</option></select></label>`+
+    `<label class="sec-f"><span>API 키</span><input data-ak="key" type="password" autocomplete="off" value="${esc(k.key)}" placeholder="sk-ant-… 또는 AIza…"></label>`+
+    `<div class="sec-hint">🔒 키는 <b>이 브라우저에만</b> 저장됩니다. AI 분석을 누를 때만 서무비서 서버를 거쳐 AI 회사로 전달되며, 서버는 키를 저장하거나 기록하지 않습니다. 공용 PC에서는 쓰고 나서 지우세요. 사용 요금은 키 주인에게 청구됩니다.</div>`+
+    `<div class="sec-row"><button class="sec-btn primary" data-ak="save">저장</button>`+(aiKey()?`<button class="sec-btn ghost" data-ak="del">키 지우기</button>`:'')+`</div>`;
+  body.addEventListener('click', e=>{ const b=e.target.closest('[data-ak]'); if(!b||b.tagName==='SELECT'||b.tagName==='INPUT') return;
+    if(b.dataset.ak==='save'){ const key=body.querySelector('[data-ak="key"]').value.trim(), provider=body.querySelector('[data-ak="provider"]').value;
+      if(!key){ toast('키를 입력하세요.'); return; } _lsPut(LS_AIKEY,{provider,key}); closeModal('secAiKeyModal'); toast('AI 분석을 켰습니다.'); if(S.query){ S.aiRes=null; aiUnderstand(S.query,true); } else render(); }
+    else if(b.dataset.ak==='del'){ try{ localStorage.removeItem(LS_AIKEY); }catch(_){} closeModal('secAiKeyModal'); toast('키를 지웠습니다.'); render(); } });
+}
 function aiBox(){
-  const a=S.aiRes; if(!a || a.q!==S.query) return S.ai.available&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 다시 이해하기</button></div>`:'';
+  const a=S.aiRes; if(!a || a.q!==S.query) return aiOn()&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 분석하기</button></div>`:(S.query?aiKeyHint():'');
   if(a.loading) return `<div class="sec-notice ai"><div class="assist-loading sm"><div class="spinner"></div><span>✦ AI가 상황을 이해하는 중...</span></div></div>`;
   if(a.error) return `<div class="sec-notice ai">✦ ${esc(a.error)}</div>`;
   if(!a.ids.length) return `<div class="sec-notice ai">✦ ${esc(a.summary||'등록된 절차 가운데 맞는 것을 찾지 못했습니다.')}${a.uncovered?` <span class="sec-sub">(${esc(a.uncovered)})</span>`:''}</div>`;
   const ps=a.ids.map(getProc).filter(Boolean);
-  if(ps.length===1 && ps[0].id===S.procId) return `<div class="sec-notice ai">✦ AI도 이 절차로 이해했습니다 — ${esc(a.summary)}</div>`;
+  if(ps.length===1 && ps[0].id===S.procId) return `<div class="sec-notice ai"><div>✦ AI도 이 절차로 이해했습니다 — ${esc(a.summary)}</div>${aiExtra(a)}</div>`;
   const plan=ps.length>1?`<div class="sec-plan">`+ps.map((p,n)=>{ const c=cases().find(x=>x.procId===p.id&&x.status!=='done'); const nx=c?nextStep(c,p):{i:0,s:p.steps[0]};
       return `<div class="sec-plan-i"><span class="sec-plan-n">${n+1}</span><div class="sec-plan-m"><b>${esc(p.icon||'')} ${esc(shortTitle(p.title))}</b>`+
         `<span class="sec-sub">${nx&&nx.s?'먼저: '+esc(nx.s.t.slice(0,70)):''}</span></div><button class="sec-btn sm" data-a="aiopen" data-id="${esc(p.id)}">${p.id===S.procId?'보는 중':'열기'}</button></div>`; }).join('')+`</div>`:
     `<div class="sec-row"><button class="sec-btn sm primary" data-a="aiopen" data-id="${esc(ps[0].id)}">${esc(ps[0].icon||'')} ${esc(shortTitle(ps[0].title))} 열기</button></div>`;
   return `<div class="sec-notice ai"><div>${a.local?'🧩 <b>여러 업무가 섞인 상황</b>':'✦ <b>AI가 이해한 상황</b>'} — ${esc(a.summary)}${ps.length>1?` <span class="sec-sub">절차 ${ps.length}개를 순서대로 처리하세요</span>`:''}</div>${plan}`+
-    (a.uncovered?`<div class="sec-sub">등록 절차로 안내되지 않는 부분: ${esc(a.uncovered)}</div>`:'')+`</div>`;
+    aiExtra(a)+(a.uncovered?`<div class="sec-sub">등록 절차로 안내되지 않는 부분: ${esc(a.uncovered)}</div>`:'')+`</div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1304,7 +1344,7 @@ async function runAudit(){
   const inp=auditInput(p, c); const sig=auditSig(inp); const id=c.id;
   const proc={}; Object.keys(p).filter(k=>k[0]!=='_').forEach(k=>proc[k]=p[k]);
   S.auditBusy=id; render();
-  try{ const r=await fetch('/api/secretary/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({procedure:proc, case:inp, today:today(), ai:!!S.ai.available})});
+  try{ const r=await fetch('/api/secretary/audit',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({procedure:proc, case:inp, today:today(), ai:!!aiOn()})});
     const d=await r.json(); if(!d.success) throw new Error(d.error||'감사하지 못했습니다.');
     const prev=(c.audit&&c.audit.ack)||{};
     updateCase(x=>{ x.audit={at:today(), sig, findings:d.findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
@@ -1316,10 +1356,10 @@ async function runAudit(){
 function auditHtml(p, c){
   const a=c&&c.audit; const busy=c&&S.auditBusy===c.id;
   const stale=a && a.sig!==auditSig(auditInput(p, c));
-  const intro=`<span class="sec-sub">${S.ai.available?'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검하고, AI 감사관이 근거 조문과 대조합니다':'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검합니다(AI 감사는 관리자가 AI 키를 설정하면 켜집니다)'}</span>`;
+  const intro=`<span class="sec-sub">${aiOn()?'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검하고, AI 감사관이 근거 조문과 대조합니다':'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검합니다(AI 감사는 관리자가 AI 키를 설정하면 켜집니다)'}</span>`;
   const btn=`<button class="sec-btn sm ${a?'':'primary'}" data-a="audit" ${busy?'disabled':''}>${a?'🔁 다시 감사':'🔍 감사 실행'}</button>`;
   let body='';
-  if(busy) body=`<div class="assist-loading sm"><div class="spinner"></div><span>${S.ai.available?'규칙 점검 + AI 감사관이 조문과 대조하는 중...':'점검하는 중...'}</span></div>`;
+  if(busy) body=`<div class="assist-loading sm"><div class="spinner"></div><span>${aiOn()?'규칙 점검 + AI 감사관이 조문과 대조하는 중...':'점검하는 중...'}</span></div>`;
   else if(!a) body=`<div class="sec-hint">결재를 올리기 전에 눌러 보세요. 증빙을 첨부하고 초안을 '이력에 저장'해 두면 함께 점검합니다.</div>`;
   else {
     const fs=a.findings||[]; const ack=a.ack||{}; const open=auditOpen(c);
@@ -1351,7 +1391,7 @@ const IMP_KIND={changed:['내용 개정','warn'],moved:['조문 번호 이동','
 async function openImpact(reg, withAI){
   const body=modal('secImpModal','🔬 '+esc(reg)+' 개정 영향 분석');
   body.innerHTML=`<div class="assist-loading"><div class="spinner"></div><span>${withAI?'✦ AI가 단계 문장 갱신안을 만드는 중...':'이전 개정본과 조문을 비교하는 중...'}</span></div>`;
-  let d; try{ const r=await fetch('/api/secretary/impact?reg='+encodeURIComponent(reg)+(withAI?'&ai=1':'')); d=await r.json(); }catch(e){ d={success:false, error:'서버에 연결하지 못했습니다.'}; }
+  let d; try{ const r=await fetch('/api/secretary/impact?reg='+encodeURIComponent(reg)+(withAI?'&ai=1':''),{headers:aiHeaders()}); d=await r.json(); }catch(e){ d={success:false, error:'서버에 연결하지 못했습니다.'}; }
   if(!d.success){ body.innerHTML=`<div class="sec-notice warn">${esc(d.error||'분석하지 못했습니다.')}</div>`; return; }
   S._imp=d; renderImpact(body);
 }
@@ -1378,7 +1418,7 @@ function renderImpact(body){
     (d.ai_error?`<div class="sec-rc-ck info">✦ ${esc(d.ai_error)}</div>`:'')+arts+audit+
     (d.procedures.length?procs:`<div class="sec-rc-ck ok">✓ 등록된 절차가 근거로 쓰는 조문은 바뀌지 않았습니다.</div>`)+
     `<div class="sec-row">`+(d.procedures.length?`<button class="sec-btn primary" data-ia="apply">선택한 제안 적용 → 기관 층 저장</button>`:'')+
-      (S.ai.available&&!d.ai_used&&d.procedures.length?`<button class="sec-btn" data-ia="ai">✦ AI 문장 갱신안 받기</button>`:'')+
+      (aiOn()&&!d.ai_used&&d.procedures.length?`<button class="sec-btn" data-ia="ai">✦ AI 문장 갱신안 받기</button>`:'')+
       `<span class="sec-sub">적용 전 원문과 대조하세요. 저장하면 이 개정을 확인한 것으로 기록되어 '재확인 필요' 알림이 사라집니다.</span></div>`+
     (S.admin.token_required?`<label class="sec-f"><span>🔑 관리자 토큰</span><input type="password" id="secTokI" autocomplete="off" value="${esc(S._tok||'')}"></label>`:'')+`</div>`;
   body.onclick=e=>{ const b=e.target.closest('[data-ia]'); if(!b) return;
@@ -1617,8 +1657,8 @@ function extView(){
   return `<div class="sec-card sec-ext-hero"><div class="sec-ext-ic">🧩</div><div><div class="sec-card-h">서무비서 ERP 확장 <span class="sec-sub">${esc(bname)}용 · 버전 ${esc(i.version||'')}</span></div>`+
       `<ul class="sec-tips"><li>ERP·그룹웨어 화면 <b>옆 패널</b>에서 절차·기한·서식·근거·사전 감사를 봅니다.</li>`+
       `<li>ERP에서 출장·휴가·지출결의 같은 화면을 열면 <b>이 업무 안내</b>를 바로 띄웁니다.</li>`+
-      `<li>만든 초안을 <b>ERP의 여러 칸에 한 번에</b> 넣습니다(제목·기간·출장지·본문…).</li>`+
-      `<li>어떤 ERP든 <b>🔧 ERP 맞춤</b>으로 화면 구조를 분석해 칸을 연결합니다.</li>`+
+      `<li>만든 초안을 <b>ERP에서 누른 입력란</b>에 바로 넣습니다(안 되는 편집기는 복사 → Ctrl+V).</li>`+
+      `<li>잘 안 될 때는 패널의 <b>🩺 진단</b>이 원인(IE 모드·주소 설정·못 알아본 화면)을 찾아 줍니다.</li>`+
       `<li>ERP에서 <b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 보여 줍니다.</li>`+
       `<li>도구 모음 아이콘에 <b>다가오는 기한</b>을 표시하고, 오늘·내일 기한은 바탕화면으로 알립니다.</li></ul></div></div>`+
     (installed?`<div class="sec-notice ${verLt(S.extVersion,i.version)?'warn':'info'}">${verLt(S.extVersion,i.version)?`⚠ 설치된 확장 ${esc(S.extVersion)} — 새 버전 ${esc(i.version)}을 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.`:`✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).`}</div>`:'')+
@@ -1632,12 +1672,6 @@ function extView(){
       step(5,`${load} <code>secretary-extension</code> 폴더를 고릅니다.`)+
       step(6,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
     `</ol><div class="sec-hint">새 버전이 나오면 1번에서 다시 받아 같은 폴더에 덮어쓰고, ${page} 에서 서무비서의 ↻(새로고침)을 누르면 됩니다. 처리 이력 등은 그대로 남습니다.</div></div>`+
-    `<div class="sec-card"><div class="sec-card-h">🔧 우리 ERP에 맞추기 <span class="sec-sub">어떤 ERP·그룹웨어든</span></div><ol class="sec-ext-steps">`+
-      step(1,`ERP에서 맞출 화면(예: 출장복명서 작성)을 엽니다.`)+
-      step(2,`서무비서 패널 위의 <b>🔧</b>(ERP 맞춤) → <b>이 화면 구조 분석</b>. 화면의 입력란·편집기·제목을 찾고, 이름이 맞는 칸은 초안 항목과 자동으로 연결해 둡니다.`)+
-      step(3,`연결을 고치고(👁로 위치 확인, 🎯로 화면에서 직접 고르기) <b>▶ 시험 채우기</b>로 확인합니다.`)+
-      step(4,`<b>내 브라우저에 저장</b> — 나만 쓰기. 관리자는 <b>기관 전체에 공유</b>하면 모든 직원의 확장이 같은 규칙을 받습니다.`)+
-    `</ol></div>`+
     `<details class="sec-card"><summary class="sec-card-h">관리자: 기관 PC 일괄 배포</summary><div class="sec-hint">`+
       `· 확장에 들어갈 ERP 주소는 <button class="sec-linkbtn" data-a="view" data-v="manage">⚙ 규정·절차 관리 › 🏢 기관 설정</button>의 'ERP·그룹웨어 주소'에서 바꿉니다.<br>`+
       `· 직원마다 설치하지 않으려면 받은 zip을 Chrome 웹 스토어·Edge 추가 기능에 <b>비공개(조직 한정)</b>로 올리고, 그룹 정책 <code>ExtensionInstallForcelist</code>에 확장 ID를 넣어 일괄 설치합니다.<br>`+
