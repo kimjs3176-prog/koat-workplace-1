@@ -71,7 +71,7 @@ async function load(force){
   if(S.loading && !force) return S.loading;
   S.loading=(async()=>{
     try{ const r=await fetch('/api/secretary/procedures'+(force?'?fresh=1':'')); const d=await r.json();
-      S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.revised=d.revised||[]; S.ai=d.ai||{available:false}; S.insights=d.insights||{available:false}; S.ins={};
+      S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.revised=d.revised||[]; S.alio=d.alio||null; S.ai=d.ai||{available:false}; S.insights=d.insights||{available:false}; S.ins={};
       S.common=deepTx(d.common||S.common); S.org=deepTx(d.org||S.org); S.admin=d.admin||{}; S.loaded=true;
       applyBranding(); checkPersonal();
     }catch(e){ S.loaded=false; throw e; }
@@ -564,7 +564,18 @@ function healthCard(){
     (bad.length?rows:`<div class="sec-hint">모든 절차의 근거 조문·서식이 우리 기관 규정에 연결되어 있고, 근거 규정 개정도 없습니다.</div>`)+
     (unv.length?`<div class="sec-hint">우리 기관 규정으로 확인 전 <b>${unv.length}</b>개: `+unv.map(p=>`<button class="sec-linkbtn" data-a="proc" data-id="${esc(p.id)}">${esc(shortTitle(p.title))}</button>`).join(', ')+
       ` — 다른 기관·다른 이름의 규정 기준으로 만든 절차입니다. 원문과 대조한 뒤 [수정 → 기관 층 저장]하면 확인 처리됩니다.</div>`:'')+
-    (apx.length?`<div class="sec-hint">근사 연결: 이름이 비슷한 규정에 자동으로 연결했습니다. 맞는지 아래 <b>규정명 매핑</b>에서 확인해 주세요.</div>`:'')+`</div>`;
+    (apx.length?`<div class="sec-hint">근사 연결: 이름이 비슷한 규정에 자동으로 연결했습니다. 맞는지 아래 <b>규정명 매핑</b>에서 확인해 주세요.</div>`:'')+alioHint()+`</div>`;
+}
+// ALIO(공공기관 경영정보 공개시스템) 공시본 대비 최신성 — scripts/alio_sync.mjs 로 확인·등록
+function alioHint(){
+  const a=S.alio;
+  if(!a) return `<div class="sec-hint">📡 ALIO 공시 내규와 비교한 적이 없습니다. 기관 PC에서 <code>node scripts/alio_sync.mjs --apply</code>로 최신 내규를 받아 등록하세요.</div>`;
+  const rev=a.items.filter(x=>x.status==='revised'), nw=a.items.filter(x=>x.status==='new');
+  const when=(a.checked||'').slice(0,10);
+  if(!rev.length && !nw.length) return `<div class="sec-hint">📡 ALIO 공시 내규 기준 최신입니다(${esc(when)} 확인, ${a.current}건 일치).</div>`;
+  return `<div class="sec-hint">📡 ALIO 공시 내규(${esc(when)} 확인)보다 오래된 규정 <b>${rev.length}</b>건`+(nw.length?` · 서무비서에 없는 규정 <b>${nw.length}</b>건`:'')+
+    `: ${[...rev.map(x=>`${esc(x.title)}(ALIO ${esc(x.alio)})`),...nw.map(x=>`🆕${esc(x.title)}`)].slice(0,12).join(', ')}${rev.length+nw.length>12?' 등':''}`+
+    ` — <code>node scripts/alio_sync.mjs --apply</code>로 받아 등록하세요.</div>`;
 }
 // ── 관리: 규정명 매핑(다른 기관 도입의 핵심) ─────────────────────────────────
 const VIA_LABEL={exact:['정확','ok'],alias:['매핑','ok'],prefix:['기관명 접두어','ok'],approx:['근사 — 확인 필요','warn'],'':['연결 안 됨','bad']};

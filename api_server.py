@@ -1969,6 +1969,8 @@ def secretary_procedures():
                      "from": (m.get("history") or [{}])[0].get("revision", ""),
                      "at": (m.get("history") or [{}])[0].get("replaced_at", "")}
                     for m in _load_reg_manifest() if m.get("history")][:60],
+        # ALIO 공시본 대비 최신성(scripts/alio_sync.mjs 가 만든 상태 파일 — 없으면 null)
+        "alio": _sec_alio_status(),
         "ai": _sec_ai_status(),
         "insights": {"available": bool(_sec_ins_backend()), "min_n": max(1, int(_sec_ins_cfg().get("min_n") or 3))},
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
@@ -3518,6 +3520,18 @@ def secretary_diag_upload():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 502
     return jsonify({"success": True, "path": f"diag/{name}", "message": where})
+
+
+def _sec_alio_status():
+    """scripts/alio_sync.mjs 결과 요약: 확인일, ALIO 기준 개정·신규 규정."""
+    d = _sec_read_json(os.path.join(SEC_DIR, "alio_status.json"), None)
+    if not isinstance(d, dict):
+        return None
+    items = [{"title": str(x.get("title", ""))[:80], "status": x.get("status", ""),
+              "alio": str(x.get("alioDate", ""))[:20], "ours": str(x.get("ours", ""))[:40]}
+             for x in (d.get("items") or []) if isinstance(x, dict) and x.get("status") in ("revised", "new")][:80]
+    return {"checked": str(d.get("checked", ""))[:25], "org": str(d.get("org", ""))[:40],
+            "alio": d.get("alio", 0), "current": d.get("current", 0), "items": items}
 
 
 def _sec_tx(text: str, cfg: dict) -> str:

@@ -5,7 +5,7 @@
     python scripts/import_regs.py ./내규폴더 --dry-run    # 등록할 목록만 확인
 
 파일명 규칙: "규정명(개정 정보).hwpx" — 예) 여비규정(2025년도 3월 일부개정).hwpx
-지원 형식: .hwpx .docx .html .htm .txt .pdf (한글 .hwp 는 한글에서 .hwpx 로 저장한 뒤 올리세요)
+지원 형식: .hwpx .docx .html .htm .txt .md .pdf (한글 .hwp 는 한글에서 .hwpx 로 저장한 뒤 올리세요)
 
 화면의 /upload 와 같은 변환·저장 로직을 그대로 쓰며, 로컬 파일에 씁니다.
 등록 뒤에는 git commit·push 로 배포본에 반영하고, 의미 검색을 쓰려면
@@ -25,7 +25,7 @@ os.environ.pop("REG_UPLOAD_TOKEN", None)
 
 import api_server as A  # noqa: E402
 
-EXTS = {".hwpx", ".docx", ".html", ".htm", ".txt", ".pdf"}
+EXTS = {".hwpx", ".docx", ".html", ".htm", ".txt", ".md", ".pdf"}
 
 
 def reset():
