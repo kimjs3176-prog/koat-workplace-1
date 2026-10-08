@@ -30,7 +30,8 @@ function findings() {
   if (latest && latest !== "?" && verLt(data.version, latest)) add("mid", `새 확장 ${latest}이 있습니다(지금 ${data.version}).`, "서무비서 웹 🧩 확장 설치에서 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.");
   if (!data.enabled) add("mid", "진단 기록이 꺼져 있습니다.", "위의 '진단 기록 켜기'를 켜야 문제를 찾을 수 있습니다.");
   // 확장이 화면 안에 들어가지 못한 탭(IE 모드 등)
-  const ie = L.filter((e) => /^detect\.tab/.test(e.ev) || (e.ev === "frames.error" && IE_RX.test((e.d || {}).err || "")));
+  // 1.4.1부터는 화면에 정말 들어가지 못했을 때만 detect.tab 을 남긴다(이전 판의 detect.tab.none 은 오판정이 섞여 제외)
+  const ie = L.filter((e) => (/^detect\.tab/.test(e.ev) && e.d && e.d.err) || (e.ev === "frames.error" && IE_RX.test((e.d || {}).err || "")));
   if (ie.length) {
     const pages = uniq(ie.map((e) => e.page || (e.d && e.d.url))).slice(0, 5);
     add("high", `확장이 화면 안에 들어가지 못한 탭이 있습니다(${ie.length}회).${pages.length ? " " + pages.join(", ") : ""}`,
