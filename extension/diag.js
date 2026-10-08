@@ -54,7 +54,13 @@ $("snap").addEventListener("click", async () => {
   const id = Number($("tabs").value); if (!id) { toast("ERP 탭을 먼저 여세요."); return; }
   $("snapOut").textContent = "기록하는 중...";
   const r = await chrome.runtime.sendMessage({ type: "diag.snapshot", tabId: id }).catch((e) => ({ ok: false, error: e.message }));
-  if (!r || !r.ok) { $("snapOut").textContent = "기록하지 못했습니다: " + ((r && r.error) || "") + "\n이 탭 주소가 확장 설정의 ERP 주소에 들어 있는지, 탭을 새로고침했는지 확인하세요."; return; }
+  if (!r || !r.ok) {
+    const err = (r && r.error) || "";
+    $("snapOut").textContent = "기록하지 못했습니다: " + err + (/not ready|Cannot access/i.test(err)
+      ? "\n이 탭은 Edge 'IE 모드'(주소창 왼쪽 e 아이콘) 등으로 열려 확장이 화면 안에 들어갈 수 없습니다. 주소·제목으로만 업무를 알아보고, 초안은 복사 → Ctrl+V 로 넣습니다."
+      : "\n이 탭 주소가 확장 설정의 ERP 주소에 들어 있는지, 탭을 새로고침했는지 확인하세요.");
+    return;
+  }
   const s = r.snap;
   $("snapOut").textContent = [`${s.title} — ${s.page}`, `감지: ${s.context ? s.context.title + " (" + (s.context.proc || "절차 없음") + ")" : "없음"}`,
     ...s.frames.map((f) => `▸ 프레임 '${f.path || "(맨 위)"}' ${f.url}\n   칸 ${f.fields.length}: ${f.fields.map((x) => x.label + "[" + x.kind + "]").join(", ").slice(0, 300)}\n   버튼: ${(f.buttons || []).map((b) => b.t).join(", ").slice(0, 300)}\n   iframe: ${(f.iframes || []).map((i) => (i.id || i.name || i.src) + (i.designMode === "on" || i.editable ? "(편집기)" : "")).join(", ")}\n   단서: ${(f.scriptHints || []).join(", ")}`)].join("\n");

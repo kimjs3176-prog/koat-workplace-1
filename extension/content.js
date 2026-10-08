@@ -348,15 +348,16 @@
     let ctx = null;
     // rank: 저장된 화면 규칙(-1) > 기본 규칙 순서 — 여러 프레임이 서로 다른 업무를 알아보면 더 구체적인 쪽을 쓴다
     if (m) ctx = { q: m.sc.q || m.sc.name, title: m.sc.name || m.hit, screenId: m.sc.id, profileId: m.p.id, draft: m.sc.draft || "", proc: m.sc.proc || "", rank: -1 };
-    else for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
-      const hit = texts.find((t) => rx.test(t));
-      if (hit) { ctx = { q, title: hit.slice(0, 40), proc: proc || "", rank: i }; break; }
-    }
-    if (!ctx) {                                         // 제목 문구가 없으면 주소 경로로(가장 덜 구체적)
+    if (!m) {                                           // 기관 ERP 의 주소가 정확한 화면(신청서 팝업 등)은 주소가 먼저
       const base = (globalThis.SEC_RULES || []).length;
       for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) {
         if (rx.test(location.pathname)) { ctx = { q, title: q, proc: proc || "", rank: base + i, byUrl: true }; break; }
       }
+    }
+    if (!m && !ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
+      const hit = texts.find((t) => rx.test(t));
+      // '잔여연차 : 9.29' 처럼 숫자 섞인 긴 문구는 화면 이름으로 쓰지 않는다(개인 정보·매번 바뀜)
+      if (hit) { ctx = { q, title: (/\d/.test(hit) && hit.length > 10 ? q : hit).slice(0, 40), proc: proc || "", rank: i }; break; }
     }
     if (!ctx) {
       // 업무를 알아보지 못한 화면 — 어떤 제목 문구가 있었는지 남겨 규칙을 보강한다(주소마다 한 번)
