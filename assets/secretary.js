@@ -459,7 +459,7 @@ function keyFacts(p){
   for(const t of src){
     const b=brief(t, 999); const txt=(b.head+(b.rest?' '+b.rest:'')).replace(/※ [^.]*?(?=\s|$)/g,'');
     for(let sen of txt.split(/(?<=[^\d\s]\.)\s+(?=[^\d\s])|\s—\s/)){
-      sen=sen.replace(/\s*[(（][^)）]*[)）]/g,'').replace(/[.。]$/,'').trim();
+      sen=sen.replace(/\s*[(（]([^)）]*)[)）]/g,(m,x)=>!/「/.test(x)&&(/\d/.test(x)||x.length<=4)?m:'')   // 숫자가 든 괄호·(Ⅰ) 같은 짧은 구분은 남긴다(빼면 뜻이 바뀜).replace(/[.。]$/,'').trim();
       const segs=sen.length<=50?[sen]:sen.split(/\s*[,;]\s+|\s→\s/);
       for(const seg of segs){
         const ms=[...seg.matchAll(KEY_RX)].filter(keyOf); if(!ms.length||seg.length>50||seg.length<4) continue;
