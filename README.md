@@ -238,3 +238,11 @@ node scripts/alio_sync.mjs --apply      # 받아서 scripts/import_regs.py 로 �
 
 **Q. 개정된 내규가 반영되지 않았어요.**
 관리자가 `/upload`에서 개정본을 올려야 반영됩니다.
+
+## 시험
+```bash
+pip install -r requirements.txt pytest jsonschema
+python -m pytest -q tests              # 서버 API·기본 절차 데이터(근거 조문·서식 연결)
+node --test tests/js/*.test.mjs        # 화면 도우미(강조·요약·날짜 인식·체크 이어받기·.ics)
+```
+PR 마다 GitHub Actions(`.github/workflows/ci.yml`)가 같은 시험을 돌립니다. 절차를 고치면 `test_every_basis_and_form_resolves`가 근거 조문·서식이 모두 연결되는지 확인합니다.

@@ -34,6 +34,7 @@
    "type": "object", "required": ["t"],
    "properties": {
     "t": {"type": "string", "maxLength": 400, "description": "할 일"},
+    "k": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,24}$", "description": "단계 키 — 순서를 바꾸거나 단계를 끼워도 처리 이력의 체크가 같은 단계에 남도록"},
     "when": {"type": "string", "maxLength": 60, "description": "시점 안내(예: 마친 날 다음 날부터 14일 이내)"},
     "optional": {"type": "boolean"},
     "deadline": {"type": "object", "required": ["ref", "days"],

@@ -98,6 +98,7 @@ async function load(force){
     try{ const r=await fetch('/api/secretary/procedures'+(force?'?fresh=1':'')); const d=await r.json();
       S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.revised=d.revised||[]; S.alio=d.alio||null; S.ai=d.ai||{available:false}; S.insights=d.insights||{available:false}; S.ins={};
       S.common=d.common||S.common; S.org=d.org||S.org; S.admin=d.admin||{}; S.loaded=true;
+      try{ reconcileAll(); }catch(e){}
       applyBranding(); checkPersonal();
     }catch(e){ S.loaded=false; throw e; }
     finally{ S.loading=null; }
@@ -208,6 +209,14 @@ function match(q){
 
 // ── 날짜·기한 ────────────────────────────────────────────────────────────
 function today(){ const d=new Date(); return ymd(d); }
+// 캘린더 파일(.ics) 한 줄은 75바이트를 넘으면 접어야 한다(RFC 5545) — 한글 제목이 길면 일부 캘린더가 줄을 버린다
+function icsFold(line){
+  const enc=new TextEncoder(); let out='', cur='', n=0;
+  for(const ch of String(line)){ const b=enc.encode(ch).length;
+    if(n+b>(out?74:75)){ out+=(out?'\r\n ':'')+cur; cur=''; n=0; }
+    cur+=ch; n+=b; }
+  return out?out+'\r\n '+cur:cur;
+}
 function ymd(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function addDays(s, n){ const [y,m,d]=String(s).split('-').map(Number); if(!y) return ''; const t=new Date(y,m-1,d); t.setDate(t.getDate()+n); return ymd(t); }
 function dday(s){ if(!s) return null; const [y,m,d]=s.split('-').map(Number); const a=new Date(y,m-1,d), b=new Date(); b.setHours(0,0,0,0);
@@ -228,10 +237,40 @@ function curCase(){ return S.caseId ? cases().find(c=>c.id===S.caseId)||null : n
 function ensureCase(){
   let c=curCase(); if(c) return c;
   const p=getProc(S.procId); if(!p) return null;
-  c={id:uid(), procId:p.id, title:p.title, created:today(), updated:Date.now(), query:S.query||'', dates:{}, checks:{}, note:'', drafts:{}, status:'open'};
+  c=Object.assign({id:uid(), procId:p.id, title:p.title, created:today(), updated:Date.now(), query:S.query||'', dates:{}, checks:{}, note:'', drafts:{}, status:'open'}, procKeys(p));
   const all=cases(); all.unshift(c); if(!saveCases(all)) return null; S.caseId=c.id; return c;
 }
 function updateCase(fn){ return updateCaseById(S.caseId, fn); }
+// ── 단계·반려 점검 체크를 '순서'가 아니라 '어느 단계인지'로 지킨다 ─────────────────
+// 체크는 단계 번호로 저장되므로, 관리자가 단계를 끼우거나 순서를 바꾸면 다른 단계로 옮겨 붙는다.
+// 건마다 저장 당시의 단계 키 목록(sk·pk)을 두고, 절차가 바뀌었으면 키로 찾아 번호를 다시 맞춘다.
+function _h(t){ let h=5381; for(const ch of String(t||'')) h=((h<<5)+h+ch.codePointAt(0))|0; return (h>>>0).toString(36); }
+function stepKey(st){ return st&&st.k ? String(st.k) : 'h'+_h(st&&st.t); }
+function procKeys(p){ return {sk:(p.steps||[]).map(stepKey), pk:(p.pitfalls||[]).map(x=>'h'+_h(x&&x.t))}; }
+function reconcileCase(c, p){
+  if(!c||!p) return false;
+  const {sk, pk}=procKeys(p); let changed=false;
+  const remap=(old, now, vals, pre)=>{          // vals: {번호(접두어 포함): 값}
+    const at={}; old.forEach((k,i)=>{ if(!(k in at)) at[k]=i; });
+    const out={};
+    for(const [key,v] of Object.entries(vals||{})){
+      const m=String(key).match(pre?/^p(\d+)$/:/^(\d+)$/); if(!m){ out[key]=v; continue; }   // 'r…'·'s…' 같은 다른 항목은 그대로
+      const j=now.indexOf(old[Number(m[1])]); if(j>=0) out[(pre||'')+j]=v;                      // 사라진 단계의 체크는 버린다
+    }
+    return out;
+  };
+  const same=(a,b)=>a&&a.length===b.length&&a.every((x,i)=>x===b[i]);
+  if(!c.sk){ c.sk=sk; changed=true; }                                   // 예전 건: 지금 순서를 기준으로 삼는다
+  else if(!same(c.sk, sk)){ c.checks=remap(c.sk, sk, c.checks); c.checkAt=remap(c.sk, sk, c.checkAt); c.sk=sk; changed=true; }
+  if(!c.pk){ c.pk=pk; changed=true; }
+  else if(!same(c.pk, pk)){ c.pchecks=remap(c.pk, pk, c.pchecks, 'p'); c.pk=pk; changed=true; }
+  return changed;
+}
+function reconcileAll(){
+  const all=cases(); let n=0;
+  for(const c of all){ const p=getProc(c.procId); if(p && reconcileCase(c, p)) n++; }
+  if(n) saveCases(all);
+}
 // 같은 절차의 진행 건 중 이번 기준일과 어긋나지 않는 건(비어 있거나 같은 날짜)은 이어서 쓴다 — 같은 물음을 다시 해도 건이 늘지 않게
 // 남에게 받은 처리 이력 파일 — 알려진 칸만 형식을 맞춰 받는다(엉뚱한 값이 화면을 깨거나 코드가 끼어들지 않게)
 function normCase(c){
@@ -818,9 +857,10 @@ async function packIn(layer){
   if(await saveOrg((S.org.procedures||[]).filter(p=>!ids.has(p.id)).concat(pv.procedures), tok)){ S._packPreview=null; S.regMap=null; render(); }
 }
 
-function blankProc(){ return {id:'p-'+uid().slice(-6), icon:'📌', category:'기타', title:S.query||'', summary:'', approval:'', triggers:S.query?[S.query]:[], dates:[], steps:[{t:''}], forms:[], tips:[]}; }
+function blankProc(){ return {id:'p-'+uid().slice(-6), icon:'📌', category:'기타', title:S.query||'', summary:'', approval:'', triggers:S.query?[S.query]:[], dates:[], steps:[{t:'', k:'s'+uid().slice(-6)}], forms:[], tips:[]}; }
 function editView(){
   const src=S.editId?rawProc(S.editId):null; const p=S._draftProc||(src?JSON.parse(JSON.stringify(src)):blankProc());
+  (p.steps||[]).forEach(st=>{ if(!st.k) st.k=stepKey(st); });   // 고치기 전 키를 붙여 둔다 — 문장을 고쳐도 같은 단계로 남게
   S._draftProc=p;
   const lay=S.editLayer;
   const f=(k,l,v,ph,extra)=>`<label class="sec-f"><span>${l}</span><input data-a="ef" data-k="${k}" value="${esc(v||'')}" placeholder="${esc(ph||'')}" ${extra||''}></label>`;
@@ -894,6 +934,7 @@ function editorField(el){
 function cleanForSave(p){
   const o=JSON.parse(JSON.stringify(p)); Object.keys(o).forEach(k=>{ if(k.startsWith('_')) delete o[k]; });
   o.steps=(o.steps||[]).filter(s=>String(s.t||'').trim());
+  o.steps.forEach(s=>{ if(!s.k) s.k=stepKey(s); });      // 단계 키 — 순서를 바꿔도 처리 이력의 체크가 따라간다
   return o;
 }
 async function saveEditor(){
@@ -905,7 +946,7 @@ async function saveEditor(){
   if(!S.editId && allProcs().some(x=>x.id===p.id)){ toast('이미 있는 ID입니다. 다른 ID를 쓰세요.'); return; }
   if(S.editLayer==='personal'){
     const per=personal(); per.procedures=per.procedures.filter(x=>x.id!==p.id); per.procedures.push(p); savePersonal(per);
-    toast('개인 절차로 저장했습니다.'); S._draftProc=null; S.editId=null; selectProc(p.id); return;
+    reconcileAll(); toast('개인 절차로 저장했습니다.'); S._draftProc=null; S.editId=null; selectProc(p.id); return;
   }
   const list=(S.org.procedures||[]).filter(x=>x.id!==p.id).concat([p]);
   if(await saveOrg(list)){ S._draftProc=null; S.editId=null; selectProc(p.id); }
@@ -1088,7 +1129,7 @@ function addDeadlinesToCalendar(){
       'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${shortTitle(p.title)} — ${s.t.replace(/[.。]$/,'').slice(0,50)}`),
       'DESCRIPTION:'+icsEsc(deadlineText(s)+(s.basis&&s.basis.length?' / 근거: '+s.basis.map(basisLabel).join(', '):'')),'END:VEVENT'].join('\r\n')); });
   if(!ev.length){ toast('남은 기한이 없습니다(완료했거나 기준일이 필요한 단계가 없음).'); return; }
-  const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//KOAT//Secretary//KO','CALSCALE:GREGORIAN',...ev,'END:VCALENDAR'].join('\r\n');
+  const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//KOAT//Secretary//KO','CALSCALE:GREGORIAN',...ev,'END:VCALENDAR'].map(icsFold).join('\r\n');
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
   a.download=`서무비서_${shortTitle(p.title)}_기한.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
   toast(`📅 기한 ${ev.length}건을 캘린더 파일로 받았습니다. Outlook·구글 캘린더에서 열어 추가하세요.`, 4200);
@@ -1109,7 +1150,7 @@ function bind(panel){
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','pimport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -1162,7 +1203,6 @@ function bind(panel){
         ensureCase(); updateCase(c=>{ c.status='done'; c.doneAt=today(); }); shareDone(curCase()); toast('완료 처리했습니다. 처리 이력에서 다시 볼 수 있어요.'); render(); break;
       case 'casedel': if(confirm('이 처리 이력을 삭제할까요?')){ saveCases(cases().filter(c=>c.id!==D.id)); if(S.caseId===D.id) S.caseId=null; render(); } break;
       case 'hexport': download('서무비서_처리이력_'+today()+'.json', {kind:'koat-secretary-cases', exported:today(), cases:cases(), notes:personal().notes, rejects:personal().rejects||{}}); break;
-      case 'pexport': download('서무비서_개인절차_'+today()+'.json', {kind:'koat-secretary-personal', exported:today(), procedures:personal().procedures, notes:personal().notes}); break;
       case 'reload': load(true).then(()=>{ render(); toast('기관 절차를 다시 불러왔습니다.'); }).catch(()=>toast('불러오지 못했습니다.')); break;
       case 'cat': S.catFilter=D.c; render(); break;
       case 'newproc': S.editId=null; S._draftProc=null; S.editLayer='personal'; S.view='edit'; render(); break;
@@ -1176,7 +1216,7 @@ function bind(panel){
         break; }
       case 'rjpromote': { const dp=S._draftProc; if(!dp) break; const have=new Set((dp.pitfalls||[]).map(x=>x.t));
         dp.pitfalls=(dp.pitfalls||[]).concat(rejects(dp.id).filter(x=>!have.has(x.t)).map(x=>({t:x.t}))); render(); toast('반려 기록을 점검 항목에 넣었습니다. 저장해야 반영됩니다.'); break; }
-      case 'esadd': S._draftProc.steps.push({t:''}); render(); break;
+      case 'esadd': S._draftProc.steps.push({t:'', k:'s'+uid().slice(-6)}); render(); break;
       case 'esdel': S._draftProc.steps.splice(Number(D.i),1); render(); break;
       case 'esmove': { const st=S._draftProc.steps, i=Number(D.i), j=i+Number(D.d); if(j>=0&&j<st.length){ [st[i],st[j]]=[st[j],st[i]]; render(); } break; }
       case 'save': saveEditor(); break;
@@ -1199,9 +1239,6 @@ function bind(panel){
         per.rejects=per.rejects||{}; for(const k in (d.rejects||{})){ const ids=new Set((per.rejects[k]||[]).map(x=>x.id)); per.rejects[k]=(per.rejects[k]||[]).concat((d.rejects[k]||[]).filter(x=>x&&x.id&&!ids.has(x.id))); }
         savePersonal(per); }
       toast(`처리 이력 ${add.length}건을 가져왔습니다.`); render(); });
-    else if(a==='pimport') readJsonFile(el, d=>{ if(!d||!Array.isArray(d.procedures)){ toast('개인 절차 파일이 아닙니다.'); return; }
-      const per=personal(); const got=d.procedures.map(normProc).filter(Boolean); const ids=new Set(got.map(p=>p.id)); per.procedures=per.procedures.filter(p=>!ids.has(p.id)).concat(got);
-      if(d.notes) per.notes=Object.assign({}, per.notes, d.notes); savePersonal(per); toast(`개인 절차 ${d.procedures.length}건을 가져왔습니다.`); render(); });
   });
   panel.addEventListener('input', e=>{
     const el=e.target; const a=el.dataset&&el.dataset.a;
@@ -1265,7 +1302,7 @@ function calIcs(){
   const body=ev.map(e=>{ const d=e.date.replace(/-/g,''), nx=addDays(e.date,1).replace(/-/g,'');
     return ['BEGIN:VEVENT',`UID:${e.caseId}-${e.i}@secretary`,'DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z',
       'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${e.proc} — ${e.step.replace(/[.。]$/,'').slice(0,50)}`),'END:VEVENT'].join('\r\n'); });
-  const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...body,'END:VCALENDAR'].join('\r\n');
+  const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...body,'END:VCALENDAR'].map(icsFold).join('\r\n');
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
   a.download=`서무비서_전체기한_${today()}.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
   toast(`📅 기한 ${ev.length}건을 캘린더 파일로 받았습니다.`, 3600);
