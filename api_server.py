@@ -147,8 +147,9 @@ def _load_reg_manifest() -> list:
 
 # ── 서식(별표·별지) 라이브러리 — 번들 규정 HTML에서 서식 '정의'만 집계(캐시) ──────
 _REG_FORMS_CACHE = None
-_FORM_BRACKET_RE = re.compile(r'[\[［]\s*(별[표지][^\]］]{0,22})[\]］]')
+_FORM_BRACKET_RE = re.compile(r'[\[［〔]\s*(별[표지][^\]］〕]{0,22})[\]］〕]')   # [별지 …] ［…］ 〔…〕
 # 참조(‘…에 의한다/과 같다/에 따라’)와 정의(뒤에 서식명이 오는 경우)를 구분하는 조사·서술어
+_FORM_HEAD_WORDS = {"작성", "담당", "책임", "결재", "확인", "부서장", "팀장", "실장", "전결", "검토"}
 _FORM_REF_HEAD = re.compile(
     r'^(에|의|와|과|및|을|를|은|는|이|가|로|으로|에서|에는|에게|부터|까지|따라|같|의한|의하여|규정|호)(?:\s|다|$)')
 
@@ -185,7 +186,7 @@ def _reg_forms_index():
                 continue
             after = text[m.end():m.end() + 120]
             for _ in range(3):                             # <제N조 관련>·<개정 …> 등 주석 반복 제거
-                new = re.sub(r"^\s*[<＜][^>＞]*[>＞]", "", after)
+                new = re.sub(r"^\s*[<＜〈][^>＞〉]*[>＞〉]", "", after)
                 if new == after:
                     break
                 after = new
@@ -196,6 +197,16 @@ def _reg_forms_index():
             title = re.sub(r"\s+", " ", title)[:40].strip()
             # 서식명은 한글 2자 이상 포함해야 인정(숫자·기호·표셀 노이즈 제거)
             if len(re.findall(r"[가-힣]", title)) < 2:
+                continue
+            if re.sub(r"\s+", "", title) in _FORM_HEAD_WORDS:
+                # 결재란(담당·책임·부서장…)이 먼저 나오는 서식 — 그 아래 첫 제목 줄을 서식명으로
+                cand = [re.sub(r"\s+", " ", x).strip() for x in re.split(r"[\r\n|]", text[m.end():m.end() + 300])]
+                title = next((x[:40] for x in cand if len(re.findall(r"[가-힣]", x)) >= 2
+                              and re.sub(r"\s+", "", x).strip("“”\"'") not in _FORM_HEAD_WORDS
+                              and not x.startswith(("<", "＜", "〈"))), "")
+                if not title:
+                    continue
+            if re.search(r"(한다|하여야|하여|에 따라|제출|신청하|관리하되)", title):   # 본문 문장(서식명 아님)
                 continue
             key = re.sub(r"\s+", "", label)
             if key in seen:
