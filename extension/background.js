@@ -295,7 +295,13 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   if (m.type === "focus" && sender.tab) {                 // ERP 의 어느 프레임에서 입력란을 눌렀는지
     (state[tabId] = state[tabId] || {}).focusFrame = sender.frameId; saveState();   // 초안을 쓰는 사이 워커가 쉬어도 기억
   } else if (m.type === "context" && sender.tab) {        // 화면 감지 결과 — 프레임 중 가장 구체적인 것
-    if (!applyContext(sender.tab, sender.frameId, m.context, sender)) { reply && reply({ ignored: true }); return; }
+    // 설정에서 뺀 ERP 주소는 기본 탑재 주소(manifest)라 내용 스크립트가 붙더라도 안내·점검을 하지 않는다
+    settings().then(({ erpHosts }) => {
+      const listed = [sender.tab.url, sender.url].some((u) => u && (erpHosts || []).some((h) => hostMatch(h, u)));   // 탭 주소를 못 읽는 포털 안 ERP 프레임도
+      if (!listed) { diag("bg", "context.unlisted", { page: diagUrl(sender.tab.url) }, sender); reply && reply({ ignored: true }); return; }
+      reply && reply(applyContext(sender.tab, sender.frameId, m.context, sender) ? { ok: true } : { ignored: true });
+    });
+    return true;
   } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
     const st = state[tabId];
     if (st && st.context && st.ctxFrame === sender.frameId) {

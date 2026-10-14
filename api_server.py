@@ -1791,6 +1791,8 @@ def _sec_clean_proc(p: dict) -> dict | None:
         if not isinstance(s, dict) or not _sec_clean_str(s.get("t")):
             continue
         st = {"t": _sec_clean_str(s.get("t"), 400)}
+        if isinstance(s.get("k"), str) and re.match(r"^[A-Za-z0-9_-]{1,24}$", s["k"]):
+            st["k"] = s["k"]                                 # 단계 키(순서가 바뀌어도 처리 이력 체크 유지)
         for k in ("when", "draft"):
             if s.get(k):
                 st[k] = _sec_clean_str(s.get(k), 60)
