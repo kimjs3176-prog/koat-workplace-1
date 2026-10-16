@@ -17,6 +17,14 @@ function ask(q) {
   dlog("ask", { q, ready }); post({ type: "ask", q });
 }
 
+// 메일에서 고른 글 → 앱의 업무 달력 일정 창(같은 글이 두 길로 오면 한 번만, 원문으로 다시 오면 바꿔 연다)
+let lastSched = { q: "", t: 0 };
+function sched(q, replace) {
+  if (!q || (!replace && q === lastSched.q && Date.now() - lastSched.t < 5000)) return;
+  lastSched = { q, t: Date.now() };
+  dlog("sched", { len: q.length, ready }); post({ type: "sched", text: q });
+}
+
 function showCtx(c) {
   ctx = c;
   const b = $("ctx");
@@ -39,7 +47,8 @@ async function refreshContext(askNow) {
   const r = await chrome.runtime.sendMessage({ type: "getContext", tabId, fixed: !!params.get("tab") }).catch(() => null);
   if (r && r.ask && r.tabId != null && r.tabId !== tabId && !params.get("tab")) { bound = tabId = r.tabId; }
   showCtx(r && r.context);
-  if (r && r.ask) ask(r.ask);
+  if (r && r.ask && r.kind === "sched") sched(r.ask);
+  else if (r && r.ask) ask(r.ask);
   else if (askNow && r && r.context) { lastAuto = r.context.q; ask(r.context.q); }
 }
 
@@ -89,6 +98,7 @@ chrome.runtime.onMessage.addListener((m) => {
   if (m.type === "ask" && !params.get("tab") && m.tabId != null && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
     bound = tabId = m.tabId; refreshContext(false); ask(m.q); return;
   }
+  if (m.type === "sched") { if (!params.get("tab") || m.tabId === tabId) sched(m.q, m.replace); return; }   // 일정은 탭과 무관
   // ERP 팝업 창(기안 작성 창 등)에서 업무를 알아보면 이 창의 패널이 그 팝업 탭에 붙는다
   if (m.type === "context" && m.context && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
     bound = tabId = m.tabId;

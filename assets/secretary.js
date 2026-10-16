@@ -211,6 +211,7 @@ function match(q){
 function today(){ const d=new Date(); return ymd(d); }
 // 캘린더 파일(.ics) 한 줄은 75바이트를 넘으면 접어야 한다(RFC 5545) — 한글 제목이 길면 일부 캘린더가 줄을 버린다
 function icsFold(line){
+  if(/\r?\n/.test(line)) return String(line).split(/\r?\n/).map(icsFold).join('\r\n');   // 여러 줄 묶음(VEVENT)은 줄마다
   const enc=new TextEncoder(); let out='', cur='', n=0;
   for(const ch of String(line)){ const b=enc.encode(ch).length;
     if(n+b>(out?74:75)){ out+=(out?'\r\n ':'')+cur; cur=''; n=0; }
@@ -322,6 +323,7 @@ async function start(opts){
     // 확장 → 앱: ERP 화면에서 감지한 업무로 바로 안내(패널을 다시 읽지 않아 진행 상태가 유지됨)
     window.addEventListener('message', e=>{ const m=e.data; if(e.source!==window.parent || e.origin!==EXT_ORIGIN || !m || m.src!=='koat-sec-ext') return;
       if(m.type==='ask' && m.q){ S.view='home'; ask(String(m.q).slice(0,200)); }
+      else if(m.type==='sched' && m.text){ S.view='cal'; render(); openSched(null, '', parseSchedText(String(m.text).slice(0,5000))); }
       else if(m.type==='hello'){ S.extVersion=String(m.version||''); checkExtUpdate(); }
       else if(m.type==='inserted'){
         if(m.ok){ toast('ERP 입력란(마지막으로 누른 칸)에 넣었습니다. 내용을 확인하세요.', 4200); return; }
@@ -435,7 +437,9 @@ function syncDeadlines(){
   _dlTimer=setTimeout(()=>{
     const lo=addDays(today(),-60), hi=addDays(today(),60);
     const items=allDeadlines().filter(d=>d.date>=lo && d.date<=hi).slice(0,200)
-      .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}));
+      .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}))
+      .concat(scheds().filter(x=>!x.done && x.date>=today() && x.date<=hi).slice(0,50)      // 내 일정(오늘 이후)도 확장 배지·알림에
+        .map(x=>({date:x.date, proc:'일정', step:schedLabel(x).slice(0,80), caseId:'sch:'+x.id, i:0, optional:false})));
     const key=JSON.stringify(items); if(key===_dlLast) return; _dlLast=key;
     if(EMBED) toExt({type:'deadlines', items});
     else window.postMessage({src:'koat-sec', type:'deadlines', items}, location.origin);
@@ -1143,6 +1147,14 @@ function bind(panel){
   if(panel._secBound) return; panel._secBound=true;
   panel.addEventListener('toggle', e=>{ const t=e.target; if(!t.classList) return; if(t.classList.contains('sec-cfg')) S._cfgOpen=t.open;
     if(t.classList.contains('sec-more')&&t.dataset.k) S.moreOpen[t.dataset.k]=t.open; }, true);
+  // 업무 달력: 메일 글·초대장(.ics)·메일 파일(.eml)을 끌어다 놓으면 일정 창을 채워 연다
+  const calDrop=e=>S.view==='cal' && e.target.closest && e.target.closest('.sec-cal-layout');
+  let _dropCell=null; const mark=c=>{ if(_dropCell===c) return; if(_dropCell) _dropCell.classList.remove('drop'); _dropCell=c; if(c) c.classList.add('drop'); };
+  panel.addEventListener('dragover', e=>{ if(!calDrop(e)) return; e.preventDefault(); e.dataTransfer.dropEffect='copy';
+    mark(e.target.closest('[data-day]')); panel.querySelector('.sec-cal-layout').classList.add('dropping'); });
+  panel.addEventListener('dragleave', e=>{ if(e.relatedTarget && panel.contains(e.relatedTarget)) return; mark(null); const l=panel.querySelector('.sec-cal-layout'); l&&l.classList.remove('dropping'); });
+  panel.addEventListener('drop', e=>{ if(!calDrop(e)) return; e.preventDefault(); const c=e.target.closest('[data-day]'); mark(null);
+    const l=panel.querySelector('.sec-cal-layout'); l&&l.classList.remove('dropping'); schedFromDrop(e.dataTransfer, c?c.dataset.day:''); });
   // role=button 인 칸(처리 이력 줄 등)도 키보드 Enter·Space 로 누를 수 있게
   panel.addEventListener('keydown', e=>{ if(e.key!=='Enter'&&e.key!==' ') return; const t=e.target;
     if(t&&t.getAttribute&&t.getAttribute('role')==='button'&&t.dataset&&t.dataset.a&&t.tagName!=='BUTTON'){ e.preventDefault(); t.click(); } });
@@ -1176,6 +1188,8 @@ function bind(panel){
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
+      case 'schedadd': openSched(null, D.d||''); break;
+      case 'sched': openSched(D.id); break;
       case 'calmove': { const n=Number(D.d); if(!n){ S.calYM=null; } else { let {y,m}=S.calYM; m+=n; if(m<1){m=12;y--;} if(m>12){m=1;y++;} S.calYM={y,m}; } render(); break; }
       case 'calics': calIcs(); break;
       case 'aiask': aiUnderstand(S.query, true); break;
@@ -1202,7 +1216,7 @@ function bind(panel){
         if(hi && !confirm(`사전 감사에서 '높음' 지적 ${hi}건이 아직 확인되지 않았습니다. 그래도 완료 처리할까요?`)) break; }
         ensureCase(); updateCase(c=>{ c.status='done'; c.doneAt=today(); }); shareDone(curCase()); toast('완료 처리했습니다. 처리 이력에서 다시 볼 수 있어요.'); render(); break;
       case 'casedel': if(confirm('이 처리 이력을 삭제할까요?')){ saveCases(cases().filter(c=>c.id!==D.id)); if(S.caseId===D.id) S.caseId=null; render(); } break;
-      case 'hexport': download('서무비서_처리이력_'+today()+'.json', {kind:'koat-secretary-cases', exported:today(), cases:cases(), notes:personal().notes, rejects:personal().rejects||{}}); break;
+      case 'hexport': download('서무비서_처리이력_'+today()+'.json', {kind:'koat-secretary-cases', exported:today(), cases:cases(), notes:personal().notes, rejects:personal().rejects||{}, schedules:scheds()}); break;
       case 'reload': load(true).then(()=>{ render(); toast('기관 절차를 다시 불러왔습니다.'); }).catch(()=>toast('불러오지 못했습니다.')); break;
       case 'cat': S.catFilter=D.c; render(); break;
       case 'newproc': S.editId=null; S._draftProc=null; S.editLayer='personal'; S.view='edit'; render(); break;
@@ -1238,7 +1252,8 @@ function bind(panel){
       if(d.notes||d.rejects){ const per=personal(); per.notes=Object.assign({}, d.notes||{}, per.notes);
         per.rejects=per.rejects||{}; for(const k in (d.rejects||{})){ const ids=new Set((per.rejects[k]||[]).map(x=>x.id)); per.rejects[k]=(per.rejects[k]||[]).concat((d.rejects[k]||[]).filter(x=>x&&x.id&&!ids.has(x.id))); }
         savePersonal(per); }
-      toast(`처리 이력 ${add.length}건을 가져왔습니다.`); render(); });
+      let ns=0; if(Array.isArray(d.schedules)){ const cur=scheds(); const ids=new Set(cur.map(x=>x.id)); const got=d.schedules.map(normSched).filter(x=>x&&!ids.has(x.id)); ns=got.length; if(ns) saveScheds(cur.concat(got)); }
+      toast(`처리 이력 ${add.length}건${ns?` · 일정 ${ns}건`:''}을 가져왔습니다.`); render(); });
   });
   panel.addEventListener('input', e=>{
     const el=e.target; const a=el.dataset&&el.dataset.a;
@@ -1257,6 +1272,133 @@ function bind(panel){
 // ═══════════════════════════════════════════════════════════════════════════
 // ① 업무 달력 — 진행 중인 모든 건의 기한을 한 달 달력과 '이번 주 할 일'로
 // ═══════════════════════════════════════════════════════════════════════════
+// ── 내 일정 — 회의·교육·외부 일정 등 절차와 무관한 일정을 달력에 직접 넣는다(이 브라우저에만 저장) ─────────
+const LS_SCHED='koat_sec_sched';
+const _D=/^\d{4}-\d{2}-\d{2}$/, _T=/^([01]\d|2[0-3]):[0-5]\d$/;
+function normSched(x){
+  if(!x||typeof x!=='object'||!_D.test(x.date||'')||typeof x.title!=='string'||!x.title.trim()) return null;
+  return {id:String(x.id||uid()).slice(0,40), date:x.date, end:_D.test(x.end||'')&&x.end>x.date?x.end:'', time:_T.test(x.time||'')?x.time:'',
+    title:x.title.trim().slice(0,80), memo:typeof x.memo==='string'?x.memo.slice(0,500):'', done:!!x.done};
+}
+function scheds(){ const a=_ls(LS_SCHED,[]); return Array.isArray(a)?a.map(normSched).filter(Boolean):[]; }
+function saveScheds(a){ const ok=_lsPut(LS_SCHED, a.slice(0,1000)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
+function schedDays(x){ const out=[x.date]; let d=x.date; for(let i=0;i<62 && x.end && d<x.end;i++){ d=addDays(d,1); out.push(d); } return out; }
+function schedLabel(x){ return (x.time?x.time+' ':'')+x.title; }
+// ── 메일에서 일정 가져오기 — 끌어다 놓은 글·붙여 넣은 글·.ics·.eml 에서 제목·날짜·시각·장소를 읽는다 ─────────
+const _MAIL_HEAD=/^(보낸\s*사람|받는\s*사람|참조|숨은\s*참조|보낸\s*날짜|받은\s*날짜|날짜|from|to|cc|bcc|date|sent|첨부)\s*[:：]/i;
+function htmlToText(h){
+  try{ const d=new DOMParser().parseFromString(String(h||''),'text/html'); d.querySelectorAll('script,style').forEach(x=>x.remove());
+    d.querySelectorAll('br').forEach(x=>x.replaceWith('\n')); d.querySelectorAll('p,div,tr,li,h1,h2,h3,h4').forEach(x=>x.append('\n'));
+    return (d.body&&d.body.textContent||'').replace(/\u00a0/g,' '); }catch(e){ return String(h||'').replace(/<[^>]+>/g,' '); }
+}
+function schedTime(t){
+  // 14:00 · 오후 2시 · 오전 10시 30분 · 2시 반 (‘2시간’은 제외)
+  const m=String(t).match(/(오전|오후|am|pm)?\s*([01]?\d|2[0-3])\s*(?::\s*([0-5]\d)|시(?!간)\s*(?:([0-5]?\d)\s*분|(반))?)/i);
+  if(!m) return '';
+  let h=Number(m[2]); const ap=(m[1]||'').toLowerCase(); const mi=m[3]?Number(m[3]):m[4]?Number(m[4]):m[5]?30:0;
+  if((ap==='오후'||ap==='pm') && h<12) h+=12; if((ap==='오전'||ap==='am') && h===12) h=0;
+  if(!ap && !m[3] && h>=1 && h<=6) h+=12;                       // '3시 회의' → 근무 시간대(오후)로
+  return String(h).padStart(2,'0')+':'+String(mi).padStart(2,'0');
+}
+function parseSchedText(text, base){
+  // 한 줄로 이어 붙은 글(확장 메뉴·일부 메일 화면)도 '제목:'·'일시:'·'장소:' 앞에서 줄을 나눠 읽는다
+  const raw=String(text||'').replace(/\r/g,'').replace(/[ \t]+(?=(?:제목|일시|일정|시간|기간|장소|위치|회의실|보낸\s*사람|받는\s*사람|보낸\s*날짜|참조)\s*[:：])/g,'\n');
+  const lines=raw.split('\n').map(l=>l.trim()).filter(Boolean);
+  const field=re=>{ for(const l of lines){ const m=l.match(re); if(m&&m[1].trim()) return m[1].trim(); } return ''; };
+  const subj=field(/^(?:제목|subject|건명|행사명|회의명|교육명|일정명)\s*[:：]\s*(.+)$/i);
+  const when=field(/^(?:일시|일정|시간|기간|날짜\s*및\s*시간|when)\s*[:：]\s*(.+)$/i);
+  const place=field(/^(?:장소|위치|회의실|location|where)\s*[:：]\s*(.+)$/i);
+  // 날짜·시각은 '일시:' 줄을 먼저, 없으면 본문 전체(머리글 줄 제외 — 보낸 날짜가 일정으로 잡히지 않게)
+  const bodyNoHead=lines.filter(l=>!_MAIL_HEAD.test(l)).join('\n');
+  // 일정 안내는 앞으로의 일 — '개최하기로 했습니다' 같은 말 때문에 작년 날짜로 읽지 않게 지난 일 표현을 뺀다
+  const pd=parseDates((when||bodyNoHead).replace(new RegExp(PAST_CUE.source,'g'),' '), base||today()); const ds=(pd.dates||[]).slice().sort();
+  const time=schedTime(when||bodyNoHead.split('\n').find(l=>/\d\s*(?::|시)/.test(l)&&!/\d{4}[.\-\/]\d/.test(l.replace(/\d{1,2}:\d{2}/,'')))||when||bodyNoHead);
+  let title=subj||lines.find(l=>!_MAIL_HEAD.test(l) && !/^(일시|일정|시간|장소|위치|기간)\s*[:：]/.test(l) && /[가-힣a-z]{2}/i.test(l) && l.length<=80)||'';
+  title=title.replace(/^((re|fw|fwd|회신|전달)\s*[:：]\s*)+/i,'').replace(/^\[[^\]]{0,20}\]\s*/,'').replace(/\s+/g,' ').trim().slice(0,80);
+  const memo=place?'장소: '+place:'';
+  return {title, date:ds[0]||'', end:ds[1]&&ds[1]>ds[0]&&!when.match(/(?:^|\D)\d{1,2}:\d{2}\s*[~\-–]\s*\d{1,2}:\d{2}/)?ds[ds.length-1]:'', time, memo:memo.slice(0,500)};
+}
+// .ics(일정 초대장) — VEVENT 의 제목·시작·끝·장소. 여러 개면 모두
+function parseIcs(text){
+  const un=String(text||'').replace(/\r?\n[ \t]/g,'');                      // 접힌 줄 펴기
+  const out=[];
+  for(const blk of un.split(/BEGIN:VEVENT/).slice(1)){
+    const get=k=>{ const m=blk.match(new RegExp('^'+k+'(?:;[^:\\r\\n]*)?:(.*)$','m')); return m?m[1].replace(/\\n/gi,'\n').replace(/\\([,;\\])/g,'$1').trim():''; };
+    const dt=v=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/); return m?{d:`${m[1]}-${m[2]}-${m[3]}`, t:m[4]?`${m[4]}:${m[5]}`:''}:null; };
+    const s0=dt(get('DTSTART')); if(!s0) continue; const e0=dt(get('DTEND'));
+    let end=''; if(e0){ end=e0.t?e0.d:addDays(e0.d,-1); if(end<=s0.d) end=''; }   // 종일 일정의 DTEND 는 다음 날
+    const loc=get('LOCATION');
+    out.push({title:(get('SUMMARY')||'일정').slice(0,80), date:s0.d, end, time:s0.t, memo:[loc?'장소: '+loc:'', get('DESCRIPTION').slice(0,300)].filter(Boolean).join('\n')});
+  }
+  return out;
+}
+// .eml(메일 파일) — 제목과 본문(text/plain 우선, quoted-printable·base64 풀기)
+function emlToText(raw){
+  raw=String(raw||''); const hdrEnd=raw.search(/\r?\n\r?\n/); const head=hdrEnd>0?raw.slice(0,hdrEnd):''; const body=hdrEnd>0?raw.slice(hdrEnd):raw;
+  const dec=w=>w.replace(/=\?([^?]+)\?([bq])\?([^?]*)\?=/gi,(m,cs,enc,txt)=>{ try{
+      const bytes=enc.toLowerCase()==='b'?Uint8Array.from(atob(txt),c=>c.charCodeAt(0)):Uint8Array.from(txt.replace(/_/g,' ').replace(/=([0-9a-f]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16))),c=>c.charCodeAt(0));
+      return new TextDecoder(cs).decode(bytes); }catch(e){ return txt; } });
+  const subj=(head.replace(/\r?\n[ \t]+/g,' ').match(/^subject:\s*(.*)$/im)||[])[1]||'';
+  let part=body; const pm=body.match(/content-type:\s*text\/plain[^]*?\r?\n\r?\n([^]*?)(?:\r?\n--|$)/i); if(pm) part=pm[1];
+  const qp=/quoted-printable/i.test(body), b64=/content-transfer-encoding:\s*base64/i.test(body);
+  try{ if(b64 && pm) part=new TextDecoder('utf-8').decode(Uint8Array.from(atob(part.replace(/\s+/g,'')),c=>c.charCodeAt(0)));
+    else if(qp) part=new TextDecoder('utf-8').decode(Uint8Array.from(part.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16))),c=>c.charCodeAt(0))); }catch(e){}
+  if(/<html|<body|<div/i.test(part)) part=htmlToText(part);
+  return (subj?'제목: '+dec(subj)+'\n':'')+part;
+}
+// 끌어다 놓기·붙여넣기·확장 메뉴에서 온 내용 → 일정 입력 창(사용자가 확인 후 저장)
+async function schedFromDrop(dt, day){
+  const files=[...(dt&&dt.files||[])];
+  for(const f of files){
+    const name=(f.name||'').toLowerCase(); if(f.size>2e6) continue;
+    if(name.endsWith('.ics')||f.type==='text/calendar'){ const evs=parseIcs(await f.text());
+      if(evs.length>1){ if(!confirm(`초대장에 일정 ${evs.length}건이 있습니다. 모두 내 일정에 추가할까요?`)) return;
+        const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.`); render(); return; }
+      if(evs.length===1){ openSched(null, day, evs[0]); return; } }
+    if(name.endsWith('.eml')||f.type==='message/rfc822'){ openSched(null, day, parseSchedText(emlToText(await f.text()))); return; }
+    if(name.endsWith('.txt')||/^text\//.test(f.type)){ openSched(null, day, parseSchedText(await f.text())); return; }
+  }
+  if(files.length){ toast('읽을 수 있는 파일은 .ics(초대장)·.eml(메일)·.txt 입니다. 메일 본문 글을 끌어다 놓아도 됩니다.', 4200); return; }
+  const txt=(dt.getData('text/plain')||'').trim() || htmlToText(dt.getData('text/html')||'').trim();
+  if(!txt){ toast('끌어다 놓은 내용에서 글을 찾지 못했습니다.'); return; }
+  if(/BEGIN:VEVENT/.test(txt)){ const evs=parseIcs(txt); if(evs.length){ openSched(null, day, evs[0]); return; } }
+  openSched(null, day, parseSchedText(txt));
+}
+function openSched(id, date, pre){
+  const cur=id?scheds().find(x=>x.id===id):null;
+  const x=cur||Object.assign({id:'', date:'', end:'', time:'', title:'', memo:'', done:false}, pre||{});
+  if(!x.date) x.date=date||today();          // 메일에 날짜가 있으면 그 날짜, 없으면 놓은 날짜 칸(또는 오늘)
+  const body=modal('secSchedModal', cur?'🗓 일정 고치기':(pre?'🗓 메일에서 가져온 일정 — 확인 후 저장':'🗓 일정 추가'));
+  body.innerHTML=(cur?'':`<details class="sec-paste"${pre?'':' open'}><summary>📨 메일 내용으로 채우기</summary>`+
+      `<textarea data-sk="paste" rows="3" placeholder="메일의 일정 안내(제목·일시·장소 부분)를 붙여 넣으세요. 달력에 메일 글을 끌어다 놓아도 됩니다."></textarea>`+
+      `<button class="sec-btn sm" data-sk="parse" type="button">읽어서 채우기</button></details>`)+
+    `<label class="sec-f"><span>제목 *</span><input data-sk="title" maxlength="80" value="${esc(x.title)}" placeholder="예) 운영위원회 회의, 정보보안 교육"></label>`+
+    `<div class="sec-eg"><label class="sec-f"><span>날짜 *</span><input type="date" data-sk="date" value="${esc(x.date)}"></label>`+
+    `<label class="sec-f"><span>끝나는 날(여러 날)</span><input type="date" data-sk="end" value="${esc(x.end)}"></label>`+
+    `<label class="sec-f"><span>시각(선택)</span><input type="time" data-sk="time" value="${esc(x.time)}"></label></div>`+
+    `<label class="sec-f"><span>메모</span><textarea data-sk="memo" rows="2" maxlength="500" placeholder="장소·준비물·담당자 등">${esc(x.memo)}</textarea></label>`+
+    `<div class="sec-hint">내 일정은 <b>이 브라우저에만</b> 저장됩니다. 업무 달력·이번 주 할 일·캘린더 파일(.ics)·확장 알림에 함께 나옵니다.</div>`+
+    `<div class="sec-row"><button class="sec-btn primary" data-sk="save">저장</button>`+
+    (cur?`<button class="sec-btn" data-sk="done">${cur.done?'↩ 완료 취소':'✓ 완료'}</button><button class="sec-btn ghost" data-sk="del">삭제</button>`:'')+`</div>`;
+  setTimeout(()=>{ const t=body.querySelector('[data-sk="title"]'); t&&t.focus(); },0);
+  body.onclick=e=>{ const b=e.target.closest('button[data-sk]'); if(!b) return;
+    if(b.dataset.sk==='parse'){ const txt=(body.querySelector('[data-sk="paste"]')||{}).value||''; if(!txt.trim()){ toast('메일 내용을 붙여 넣으세요.'); return; }
+      const r=parseSchedText(txt); const set=(k,v)=>{ const el=body.querySelector(`[data-sk="${k}"]`); if(el&&v) el.value=v; };
+      set('title',r.title); set('date',r.date); set('end',r.end); set('time',r.time); if(r.memo){ const mm=body.querySelector('[data-sk="memo"]'); mm.value=(mm.value?mm.value+'\n':'')+r.memo; }
+      toast(r.date?'메일 내용으로 채웠습니다. 확인 후 저장하세요.':'날짜를 찾지 못했습니다. 날짜를 직접 넣어 주세요.', 3600); return; }
+    const all=scheds(); const i=cur?all.findIndex(y=>y.id===cur.id):-1; const v=k=>(body.querySelector(`[data-sk="${k}"]`)||{}).value||'';
+    if(b.dataset.sk==='save'){
+      const n=normSched({id:cur?cur.id:uid(), date:v('date'), end:v('end'), time:v('time'), title:v('title'), memo:v('memo'), done:cur?cur.done:false});
+      if(!n){ toast(v('title').trim()?'날짜를 넣어 주세요.':'제목을 입력하세요.'); return; }
+      if(v('end') && v('end')<v('date')){ toast('끝나는 날이 시작일보다 앞입니다.'); return; }
+      if(i>=0) all[i]=n; else all.push(n);
+      if(!saveScheds(all)) return;
+      closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm}; toast(cur?'일정을 고쳤습니다.':'일정을 추가했습니다.'); render(); }
+    else if(b.dataset.sk==='done' && i>=0){ all[i].done=!all[i].done; saveScheds(all); closeModal('secSchedModal'); render(); }
+    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
+  };
+  body.onkeydown=e=>{ if(e.key==='Enter' && e.target.tagName==='INPUT' && e.target.dataset.sk!=='paste'){ e.preventDefault(); const b=body.querySelector('[data-sk="save"]'); b&&b.click(); } };
+}
 function allDeadlines(){
   const out=[];
   cases().filter(c=>c.status!=='done').forEach(c=>{ const p=getProc(c.procId); if(!p) return;
@@ -1270,17 +1412,28 @@ function calView(){
   const {y,m}=S.calYM; const first=`${y}-${String(m).padStart(2,'0')}-01`;
   const startW=new Date(y,m-1,1).getDay(); const days=new Date(y,m,0).getDate();
   const ev=allDeadlines(); const by={}; ev.forEach(e=>{ (by[e.date]=by[e.date]||[]).push(e); });
+  const sc=scheds(); const sby={}; sc.forEach(x=>schedDays(x).forEach(d=>{ (sby[d]=sby[d]||[]).push(x); }));
+  Object.values(sby).forEach(a=>a.sort((p,q)=>(p.time||'99')<(q.time||'99')?-1:1));
   const cells=[];
   for(let i=0;i<startW;i++) cells.push(`<div class="sec-cal-c out"></div>`);
   for(let d=1; d<=days; d++){ const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const w=(startW+d-1)%7; const hol=S.holidays[ds]; const list=by[ds]||[];
+    const w=(startW+d-1)%7; const hol=S.holidays[ds]; const list=by[ds]||[]; const sl=sby[ds]||[];
     const cls=['sec-cal-c', ds===t?'today':'', w===0||hol?'sun':'', w===6&&!hol?'sat':'', ds<t&&list.length?'past':''].filter(Boolean).join(' ');
-    cells.push(`<div class="${cls}"><div class="sec-cal-d"><b>${d}</b>${hol?`<span class="sec-cal-h">${esc(hol)}</span>`:''}</div>`+
-      list.slice(0,3).map(e=>`<button class="sec-cal-e${e.date<t?' over':''}${e.optional?' opt':''}" data-a="case" data-id="${esc(e.caseId)}" title="${esc(e.proc+' — '+e.step)}">${esc(e.icon)} ${esc(e.proc)}</button>`).join('')+
-      (list.length>3?`<span class="sec-cal-more">+${list.length-3}</span>`:'')+`</div>`); }
+    const chips=[...sl.map(x=>`<button class="sec-cal-e sch${x.done?' done':''}" data-a="sched" data-id="${esc(x.id)}" title="${esc(schedLabel(x)+(x.memo?' — '+x.memo:''))}">🗓 ${esc(schedLabel(x))}</button>`),
+      ...list.map(e=>`<button class="sec-cal-e${e.date<t?' over':''}${e.optional?' opt':''}" data-a="case" data-id="${esc(e.caseId)}" title="${esc(e.proc+' — '+e.step)}">${esc(e.icon)} ${esc(e.proc)}</button>`)];
+    cells.push(`<div class="${cls}" data-day="${ds}"><div class="sec-cal-d"><b>${d}</b>${hol?`<span class="sec-cal-h">${esc(hol)}</span>`:''}`+
+      `<button class="sec-cal-add" data-a="schedadd" data-d="${ds}" title="${m}월 ${d}일 일정 추가" aria-label="${m}월 ${d}일 일정 추가">＋</button></div>`+
+      chips.slice(0,3).join('')+(chips.length>3?`<span class="sec-cal-more">+${chips.length-3}</span>`:'')+`</div>`); }
   const [ws,we]=weekRange(t);
-  const over=ev.filter(e=>e.date<t && !e.optional), week=ev.filter(e=>e.date>=t && e.date<=we), next=ev.filter(e=>e.date>we && e.date<=addDays(we,7));
-  const row=e=>{ const dd=dday(e.date); return `<button class="sec-next" data-a="case" data-id="${esc(e.caseId)}"><span class="sec-next-ic">${esc(e.icon)}</span>`+
+  // 이번 주·다음 주 목록에는 내 일정(완료 전)도 함께 — 여러 날 일정은 기간이 걸치면 표시
+  const sItems=sc.filter(x=>!x.done).map(x=>({sched:x, date:x.date<t&&(x.end||x.date)>=t?t:x.date, last:x.end||x.date}));
+  const mix=(arr,lo,hi)=>[...arr, ...sItems.filter(x=>x.last>=lo && x.date<=hi)].sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+  const over=ev.filter(e=>e.date<t && !e.optional), week=mix(ev.filter(e=>e.date>=t && e.date<=we),t,we), next=mix(ev.filter(e=>e.date>we && e.date<=addDays(we,7)),addDays(we,1),addDays(we,7));
+  const row=e=>{ if(e.sched){ const x=e.sched, dd=dday(x.date<t?t:x.date);
+      return `<button class="sec-next sch" data-a="sched" data-id="${esc(x.id)}"><span class="sec-next-ic">🗓</span>`+
+        `<span class="sec-next-m"><span class="sec-next-t">${esc(x.title)}</span><span class="sec-next-s">내 일정${x.time?' · '+esc(x.time):''}${x.end?' · '+esc(fmtDate(x.end))+'까지':''}${x.memo?' · '+esc(x.memo.slice(0,40)):''}</span></span>`+
+        `<span class="sec-dd ${dd.cls}">${esc(fmtDate(x.date))} · ${dd.label}</span></button>`; }
+    const dd=dday(e.date); return `<button class="sec-next" data-a="case" data-id="${esc(e.caseId)}"><span class="sec-next-ic">${esc(e.icon)}</span>`+
     `<span class="sec-next-m"><span class="sec-next-t">${esc(e.proc)}</span><span class="sec-next-s">${esc(e.i+1+'. '+e.step)}</span></span>`+
     `<span class="sec-dd ${dd.cls}">${esc(fmtDate(e.date))} · ${dd.label}</span>${offHtml(e.date)}</button>`; };
   const sec=(h,arr,empty)=>`<div class="sec-card-h" style="margin-top:6px;">${h} <span class="sec-sub">${arr.length}건</span></div>`+
@@ -1289,23 +1442,31 @@ function calView(){
     `<div class="sec-cal-top"><button class="sec-btn sm ghost" data-a="calmove" data-d="-1" aria-label="이전 달">‹</button>`+
     `<b class="sec-cal-title">${y}년 ${m}월</b><button class="sec-btn sm ghost" data-a="calmove" data-d="1" aria-label="다음 달">›</button>`+
     `<button class="sec-btn sm ghost" data-a="calmove" data-d="0">오늘</button><span class="sec-sp"></span>`+
-    `<button class="sec-btn sm" data-a="calics" ${ev.length?'':'disabled'}>📅 전체 기한 캘린더(.ics)</button></div>`+
+    `<button class="sec-btn sm primary" data-a="schedadd">＋ 일정 추가</button>`+
+    `<button class="sec-btn sm" data-a="calics" ${ev.length||sc.length?'':'disabled'}>📅 캘린더(.ics)</button></div>`+
     `<div class="sec-cal" role="grid" aria-label="${y}년 ${m}월 업무 기한">${'일월화수목금토'.split('').map((w,i)=>`<div class="sec-cal-w${i===0?' sun':i===6?' sat':''}">${w}</div>`).join('')}${cells.join('')}</div>`+
-    `<div class="sec-hint">처리 중인 건의 단계 기한이 표시됩니다(기준일을 넣은 건만). 빨간 날은 일요일·공휴일·기관 휴일입니다.</div></div></div>`+
+    `<div class="sec-hint">처리 중인 건의 단계 기한과 🗓 내 일정이 표시됩니다. 날짜의 ＋를 누르면 그날 일정을 넣을 수 있어요. 빨간 날은 일요일·공휴일·기관 휴일입니다.</div>`+
+    `<div class="sec-drop-hint">📨 <b>메일에서 일정 가져오기</b> — 메일의 일정 안내 글을 골라 달력(날짜 칸)에 끌어다 놓거나, 초대장(.ics)·메일 파일(.eml)을 놓으세요. 제목·날짜·시각·장소를 읽어 일정 창을 채워 줍니다.</div></div></div>`+
     `<aside class="sec-side"><div class="sec-card">`+
-      (over.length?sec('⏰ 기한 지남',over,''):'')+sec('📌 이번 주 할 일',week,'이번 주에 기한이 있는 일이 없습니다.')+sec('🗓 다음 주',next,'다음 주 기한이 없습니다.')+
+      (over.length?sec('⏰ 기한 지남',over,''):'')+sec('📌 이번 주 할 일',week,'이번 주에 기한·일정이 없습니다.')+sec('🗓 다음 주',next,'다음 주 기한·일정이 없습니다.')+
     `</div></aside></div>`;
 }
 function calIcs(){
-  const ev=allDeadlines(); if(!ev.length){ toast('기한이 있는 진행 건이 없습니다.'); return; }
+  const ev=allDeadlines(), sc=scheds().filter(x=>!x.done); if(!ev.length && !sc.length){ toast('기한이 있는 진행 건이나 일정이 없습니다.'); return; }
   const o=S.cfg.org||{};
   const body=ev.map(e=>{ const d=e.date.replace(/-/g,''), nx=addDays(e.date,1).replace(/-/g,'');
     return ['BEGIN:VEVENT',`UID:${e.caseId}-${e.i}@secretary`,'DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z',
       'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${e.proc} — ${e.step.replace(/[.。]$/,'').slice(0,50)}`),'END:VEVENT'].join('\r\n'); });
+  const stamp='DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z';
+  sc.forEach(x=>{ const d=x.date.replace(/-/g,''); const ev2=['BEGIN:VEVENT',`UID:sch-${x.id}@secretary`,stamp];
+    if(x.time && !x.end){ const hm=x.time.replace(':',''); const [h,mi]=x.time.split(':').map(Number); const eh=String(Math.min(23,h+1)).padStart(2,'0');
+      ev2.push(`DTSTART:${d}T${hm}00`,`DTEND:${d}T${eh}${String(mi).padStart(2,'0')}00`); }       // 시각만 있으면 1시간 일정(현지 시각)
+    else ev2.push('DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+addDays(x.end||x.date,1).replace(/-/g,''));
+    ev2.push('SUMMARY:'+icsEsc(x.title)); if(x.memo) ev2.push('DESCRIPTION:'+icsEsc(x.memo)); ev2.push('END:VEVENT'); body.push(ev2.join('\r\n')); });
   const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...body,'END:VCALENDAR'].map(icsFold).join('\r\n');
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
-  a.download=`서무비서_전체기한_${today()}.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
-  toast(`📅 기한 ${ev.length}건을 캘린더 파일로 받았습니다.`, 3600);
+  a.download=`서무비서_업무달력_${today()}.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast(`📅 기한 ${ev.length}건${sc.length?` · 일정 ${sc.length}건`:''}을 캘린더 파일로 받았습니다.`, 3600);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
