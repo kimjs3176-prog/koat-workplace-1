@@ -70,3 +70,61 @@ test("icsFold: 75바이트마다 접고 이어 붙이면 원문", () => {
   assert.equal(lines.map((l, i) => (i ? l.slice(1) : l)).join(""), L);
   assert.equal(T.icsFold("SHORT"), "SHORT");
 });
+
+test("icsFold: 여러 줄 묶음은 줄마다 접고 짧은 줄은 그대로", () => {
+  const block = ["BEGIN:VEVENT", "DTSTART;VALUE=DATE:20261022", "SUMMARY:" + "정보보안 교육 ".repeat(8), "END:VEVENT"].join("\r\n");
+  const out = T.icsFold(block).split("\r\n");
+  assert.equal(out[1], "DTSTART;VALUE=DATE:20261022");
+  assert.ok(out.every((l) => Buffer.byteLength(l) <= 75));
+  assert.equal(out.filter((l) => !l.startsWith(" ")).length, 4);
+});
+
+test("parseSchedText: 그룹웨어 메일(머리글+일시·장소 줄)", () => {
+  const mail = `보낸사람: 기획조정실 <plan@koat.or.kr>
+보낸날짜: 2026-10-14 (수) 09:12
+제목: [회의] 2026년 4분기 운영위원회 개최 안내
+안녕하세요. 아래와 같이 운영위원회를 개최하오니 참석 바랍니다.
+일시: 2026. 10. 22.(목) 14:00~16:00
+장소: 본관 3층 대회의실`;
+  const r = plain(T.parseSchedText(mail, "2026-10-16"));
+  assert.equal(r.title, "2026년 4분기 운영위원회 개최 안내");
+  assert.equal(r.date, "2026-10-22");
+  assert.equal(r.time, "14:00");
+  assert.equal(r.end, "");
+  assert.equal(r.memo, "장소: 본관 3층 대회의실");
+});
+
+test("parseSchedText: 문장 속 날짜·'오후 2시'·여러 날", () => {
+  const r = plain(T.parseSchedText("RE: 정보보안 교육 안내\n10월 27일부터 28일까지 오후 2시에 교육장에서 진행합니다.", "2026-10-16"));
+  assert.equal(r.title, "정보보안 교육 안내");
+  assert.deepEqual([r.date, r.end, r.time], ["2026-10-27", "2026-10-28", "14:00"]);
+});
+
+test("schedTime: 시각 표현과 '2시간' 제외", () => {
+  assert.equal(T.schedTime("오전 10시 30분"), "10:30");
+  assert.equal(T.schedTime("3시 반 회의"), "15:30");
+  assert.equal(T.schedTime("약 2시간 소요"), "");
+  assert.equal(T.schedTime("09:00 시작"), "09:00");
+});
+
+test("parseIcs: 초대장 — 시각 일정·종일 여러 날·접힌 줄", () => {
+  const ics = ["BEGIN:VCALENDAR", "BEGIN:VEVENT", "DTSTART;TZID=Asia/Seoul:20261022T140000", "DTEND;TZID=Asia/Seoul:20261022T160000",
+    "SUMMARY:운영위원회", "LOCATION:본관 3층 대회의실", "END:VEVENT",
+    "BEGIN:VEVENT", "DTSTART;VALUE=DATE:20261027", "DTEND;VALUE=DATE:20261029", "SUMMARY:정보보안 교육 (전 직원 ", " 대상)", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+  const ev = plain(T.parseIcs(ics));
+  assert.equal(ev.length, 2);
+  assert.deepEqual([ev[0].title, ev[0].date, ev[0].time, ev[0].end], ["운영위원회", "2026-10-22", "14:00", ""]);
+  assert.ok(ev[0].memo.includes("본관 3층"));
+  assert.deepEqual([ev[1].title, ev[1].date, ev[1].end], ["정보보안 교육 (전 직원 대상)", "2026-10-27", "2026-10-28"]);
+});
+
+test("parseSchedText: '~했습니다'가 있어도 앞으로의 날짜로", () => {
+  const r = plain(T.parseSchedText("제목: 워크숍 일정 확정\n1월 15일 워크숍을 열기로 결정했습니다.", "2026-10-16"));
+  assert.equal(r.date, "2027-01-15");
+});
+
+test("parseSchedText: 한 줄로 이어 붙은 글(확장 메뉴 선택 글)", () => {
+  const r = plain(T.parseSchedText("제목: 청렴교육 실시 안내 일시: 11월 3일(화) 오전 10시 장소: 2층 교육장 대상: 전 직원", "2026-10-16"));
+  assert.deepEqual([r.title, r.date, r.time], ["청렴교육 실시 안내", "2026-11-03", "10:00"]);
+  assert.ok(r.memo.startsWith("장소: 2층 교육장"));
+});

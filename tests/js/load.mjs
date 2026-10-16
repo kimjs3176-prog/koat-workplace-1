@@ -26,7 +26,8 @@ export function load(today = "2026-10-08") {
     slice("const WD='일월화수목금토';", "\n// ──"),
     slice("// ── 한눈에 읽기", "function keyFactsHtml(p){"),
     slice("function _h(t)", "function reconcileAll(){"),
-    "this.T={icsFold,hl,brief,keyFacts,parseDates,reconcileCase,procKeys,stepKey};",
+    slice("// ── 메일에서 일정 가져오기", "// 끌어다 놓기·붙여넣기"),
+    "this.T={parseSchedText,parseIcs,schedTime,icsFold,hl,brief,keyFacts,parseDates,reconcileCase,procKeys,stepKey};",
   ].join("\n");
   vm.runInContext(code, ctx);
   return ctx.T;
