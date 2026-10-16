@@ -23,8 +23,11 @@ const uniq = (arr) => [...new Set(arr.filter(Boolean))];
 const IE_RX = /not ready|Cannot access|cannot be scripted/i;
 const SUBMIT_LIKE = /상신|결재\s*(올|요청)|올림|제출|기안\s*완료|승인\s*요청/;
 const MENU_LIKE = /\(\d+(\/\d+)?\)$|대기|함$|현황|목록|ERP결재|온-나라|^결재$/;
+// 지금 판이 남긴 기록(v)만 문제로 센다 — 예전 판의 오류가 3000건 기록에 남아 계속 보이지 않게
+const curLog = () => data.log.filter((e) => e.v === data.version);
 function findings() {
-  const L = data.log, out = [];
+  const L = curLog(), out = [];
+  const old = data.log.length - L.length;
   const add = (sev, title, fix) => out.push({ sev, title, fix });
   if (!data.settings.server) add("high", "서무비서 주소가 설정되어 있지 않습니다.", "확장 설정(⚙)에서 서무비서 주소를 넣거나, 서무비서 웹의 🧩 확장 설치에서 기관 맞춤 확장을 다시 받으세요.");
   if (latest && latest !== "?" && verLt(data.version, latest)) add("mid", `새 확장 ${latest}이 있습니다(지금 ${data.version}).`, "서무비서 웹 🧩 확장 설치에서 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.");
@@ -58,6 +61,7 @@ function findings() {
   const det = uniq(L.filter((e) => e.ev === "context" && e.d).map((e) => e.d.title)).slice(0, 6);
   if (det.length) add("good", `알아본 업무 화면: ${det.join(", ")}`, "");
   if (!out.some((f) => f.sev === "high" || f.sev === "mid")) add("good", L.length ? "큰 문제는 찾지 못했습니다." : "아직 기록이 없습니다. ERP 화면에서 서무비서를 써 본 뒤 다시 보세요.", "");
+  if (old) add("info", `예전 판 확장이 남긴 기록 ${old}건은 진단에서 뺐습니다.`, "필요 없으면 '기록 지우기'로 지우세요.");
   const order = { high: 0, mid: 1, info: 2, good: 3 };
   return out.sort((a, b) => order[a.sev] - order[b.sev]);
 }
@@ -114,12 +118,13 @@ function report() {
     state: data.state, deadlines: data.deadlines, meta: data.meta, latest, findings: findings(), log: data.log };
 }
 function summary() {
-  const r = report(); const L = r.log;
+  const r = report(); const L = curLog(); const old = r.log.length - L.length;
   const notes = L.filter((e) => e.ev === "note").map((e) => `- ${e.t.slice(11, 16)} ${e.d.text}`);
   const errs = L.filter(isErr).slice(-15).map((e) => `- ${e.t.slice(11, 19)} ${e.src}/${e.ev} ${JSON.stringify(e.d || {}).slice(0, 200)}`);
   const none = [...new Set(L.filter((e) => e.ev === "detect.none").map((e) => (e.d.texts || []).slice(0, 6).join(" | ")))].slice(0, 5);
-  const btn = [...new Set(L.filter((e) => e.ev === "button").map((e) => `${e.d.label}${e.d.submit ? "(점검함)" : "(점검 안 함)"}`))].slice(0, 15);
-  return [`서무비서 진단 요약 · 확장 ${r.version} · ${r.created.slice(0, 16)}`, `기록 ${L.length}건 · 오류·실패 ${L.filter(isErr).length}건`,
+  const btn = [...new Set(L.filter((e) => e.ev === "button").map((e) => `${e.d.label}${e.d.submit ? "(점검함)" : "(점검 안 함)"}` +
+    (e.d.path ? ` [${e.d.tag || ""}${e.d.menu ? "·메뉴" : ""} ${e.d.path}]` : "")))].slice(0, 20);
+  return [`서무비서 진단 요약 · 확장 ${r.version} · ${r.created.slice(0, 16)}`, `기록 ${L.length}건(지금 판)${old ? ` · 예전 판 ${old}건 제외` : ""} · 오류·실패 ${L.filter(isErr).length}건`,
     "자동 진단:\n" + r.findings.map((f) => `- [${f.sev}] ${f.title}`).join("\n"),
     notes.length ? "메모:\n" + notes.join("\n") : "메모: 없음", errs.length ? "오류·실패(최근):\n" + errs.join("\n") : "오류·실패: 없음",
     none.length ? "업무를 알아보지 못한 화면의 제목 문구:\n" + none.map((x) => "- " + x).join("\n") : "", btn.length ? "누른 결재 관련 버튼: " + btn.join(", ") : ""].filter(Boolean).join("\n\n");

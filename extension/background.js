@@ -33,6 +33,7 @@ async function settings() {
 
 // 도구 모음 아이콘을 누르면 사이드 패널(지원하지 않는 브라우저는 작은 창)
 chrome.runtime.onInstalled.addListener(async (d) => {
+  if (d && d.reason === "update") diag("bg", "updated", { from: d.previousVersion, to: chrome.runtime.getManifest().version });
   if (!PANEL_FALLBACK) chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: "sec-ask", title: "서무비서에 묻기: “%s”", contexts: ["selection"] });

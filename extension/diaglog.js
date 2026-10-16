@@ -3,6 +3,7 @@
 // 화면 구조(칸 이름·종류·프레임 위치·버튼 이름)와 동작 결과만 남긴다. 기록은 이 브라우저 안에만 있고,
 // 사용자가 진단 센터에서 '보고서 받기'나 '서버로 보내기'를 눌렀을 때만 밖으로 나간다.
 const DIAG_MAX = 3000;
+const DIAG_VER = chrome.runtime.getManifest().version;
 let diagBuf = null, diagLoading = null, diagTimer = null, diagOn = true;
 
 // 서비스 워커가 깨어날 때 여러 프레임의 기록이 한꺼번에 들어와도 버퍼를 한 번만 읽는다(겹쳐 읽으면 앞 기록이 사라짐)
@@ -37,7 +38,7 @@ function diagUrl(u) {
 async function diag(src, ev, data, sender) {
   await diagLoad();
   if (!diagOn) return;
-  const e = { t: new Date().toISOString(), src, ev };
+  const e = { t: new Date().toISOString(), v: DIAG_VER, src, ev };   // v: 기록을 남긴 확장 판(이전 판 기록과 구분)
   if (sender && sender.tab) { e.tab = sender.tab.id; e.page = diagUrl(sender.tab.url); }
   if (sender && sender.frameId !== undefined) e.fid = sender.frameId;
   if (data !== undefined) e.d = diagScrub(data);
