@@ -6,6 +6,10 @@
   let guard = null;                  // {proc, title, pitfalls:[{t,basis}], enabled}
   let bypass = false;
   const SUBMIT = /^(결재\s*)?상신(하기)?$|결재\s*(요청|올리기|올림|상신)|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$/;
+  // 진단 기록(2026-10-16)의 KOAT ERP 제출 버튼 — 업무 화면에서만(메뉴의 같은 이름 링크는 아래 MENU 로 거른다)
+  const SUBMIT_ERP = /^(출장|여비\s*정산|근태|휴가|시간외(근무)?)\s*신청$|^서무\s*확정\s*요청$|^(정산|확정)\s*요청$/;
+  // 왼쪽 메뉴·상단 메뉴·트리·탭 안의 같은 이름은 화면을 여는 링크라 점검하지 않는다
+  const inMenu = (el) => !!el.closest('nav,[role="menu"],[role="menubar"],[role="tree"],[role="tablist"],[class*="menu" i],[id*="menu" i],[class*="lnb" i],[class*="gnb" i],[class*="snb" i],[class*="tree" i]');   // (class 'tab' 은 table 과 겹쳐 쓰지 않는다)
   const ackKey = () => "secGuardAck:" + (guard && guard.proc);
   const acked = () => { try { return Date.now() - Number(sessionStorage.getItem(ackKey()) || 0) < 10 * 60 * 1000; } catch (e) { return false; } };
 
@@ -21,9 +25,9 @@
     const el = e.target.closest && e.target.closest('button,a,input[type="button"],input[type="submit"],[role="button"],[onclick]');
     if (!el) return;
     const t = labelOf(el);
-    const isSubmit = !!t && t.length <= 14 && SUBMIT.test(t);
+    const isSubmit = !!t && t.length <= 14 && (SUBMIT.test(t) || (SUBMIT_ERP.test(t) && el.tagName !== "A" && !inMenu(el)));
     if (t && t.length <= 20 && (isSubmit || MAYBE.test(t))) {
-      dlog("button", { label: t, submit: isSubmit, tag: el.tagName.toLowerCase(), id: el.id || "",
+      dlog("button", { label: t, submit: isSubmit, tag: el.tagName.toLowerCase(), id: el.id || "", menu: inMenu(el), path: location.pathname.slice(0, 80),
         guard: guard ? { proc: guard.proc, n: (guard.pitfalls || []).length, enabled: guard.enabled } : null, acked: acked() });
     }
     if (!guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
@@ -37,7 +41,7 @@
   document.addEventListener("submit", (e) => {
     if (bypass || !guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
     const el = e.submitter; const t = el ? labelOf(el) : "";
-    if (!t || t.length > 14 || !SUBMIT.test(t)) return;
+    if (!t || t.length > 14 || !(SUBMIT.test(t) || (SUBMIT_ERP.test(t) && !inMenu(el)))) return;
     e.preventDefault(); e.stopImmediatePropagation();
     dlog("guard.show", { label: t, proc: guard.proc, n: guard.pitfalls.length, via: "submit" });
     show(el, t);

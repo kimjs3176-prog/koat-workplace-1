@@ -42,4 +42,5 @@ globalThis.SEC_URL_RULES = [
   [/\/bms\/dct\/|\/bms\/.*(draft|Draft|write|Write|regist|Regist)/, "기안 결재", "doc-approval"]   // 문서관리카드(기안 작성 창)
 ];
 // 업무를 알아보지 않을 화면(주소 경로) — 메일·일정·자원예약·게시판은 제목에 '세미나실' 같은 말이 있어도 업무 화면이 아니다
-globalThis.SEC_SKIP_URL = /\/mail2?\/|bizboxMail|\/schedule\/|\/board\//i;
+// 진단 기록(2026-10-16): 배너 프레임·포털 포틀릿(결재현황 등)·문서뷰어·로그인 화면도 업무 화면이 아니다
+globalThis.SEC_SKIP_URL = /\/mail2?\/|bizboxMail|\/schedule\/|\/board\/|\/gw\/html\/|\/portlet\/|SynapDocView|\/uat\/uia\/|[Ll]ogin/i;
