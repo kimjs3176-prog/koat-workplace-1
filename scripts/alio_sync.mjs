@@ -40,9 +40,10 @@ async function loadAlio() {
   return { dir, ...client, extractDocument: text.extractDocument, pickZipEntry: text.pickZipEntry };
 }
 
-// 규정명 비교: 기관명 접두어·괄호의 개정 표기·공백·가운뎃점을 뗀다
+// 규정명 비교: 전각·반각(R＆D/R&D)을 맞추고, 기관명 접두어·괄호의 개정 표기·옛 이름 '(구 …)'·공백·가운뎃점을 뗀다
 function normTitle(t, orgName, baseTitle) {
-  let s = baseTitle ? baseTitle(t) : String(t || "");
+  let s = String(t || "").normalize("NFKC").replace(/\s*\(\s*구\s[^)]*\)/g, "");
+  s = baseTitle ? baseTitle(s) : s;
   for (const o of [orgName, "한국농업기술진흥원"]) if (o) s = s.split(o.replace(/\s+/g, "")).join("");
   return s.replace(/[\s·ㆍ・「」『』"']/g, "");
 }
@@ -78,10 +79,14 @@ async function main() {
   const rules = A.markSuperseded(await A.searchRules(org)).filter((r) => !r.superseded);
   const manifest = await readJson(path.join(ROOT, "regulations_manifest.json"), []);
   const ours = new Map(manifest.map((m) => [normTitle(m.title, orgName, A.baseTitle), m]));
+  // 이름이 바뀐 규정: 기관 설정 reg_aliases(다른 이름 → 등록 규정명)로 잇는다 — 없으면 '신규'로 잘못 받아 중복 등록된다
+  const alias = new Map(Object.entries(cfg.reg_aliases || {}).filter(([, v]) => v)
+    .map(([k, v]) => [normTitle(k, orgName, A.baseTitle), normTitle(v, orgName, A.baseTitle)]));
   const seen = new Set();
   const rows = [];
   for (const r of rules) {
-    const k = normTitle(r.title, orgName, A.baseTitle);
+    const k0 = normTitle(r.title, orgName, A.baseTitle);
+    const k = ours.has(k0) ? k0 : (alias.get(k0) || k0);
     const m = ours.get(k);
     if (m) seen.add(k);
     const a = ymd(r.enfDate), o = m ? ymd(m.revision) : null;

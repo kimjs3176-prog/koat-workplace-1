@@ -17,6 +17,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: alio-sync
@@ -78,6 +79,16 @@ jobs:
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
             echo "열린 PR 이 이미 있어 같은 가지를 갱신했습니다."; exit 0
           fi
-          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
-            --title "ALIO 공시 내규 반영($(date +%Y-%m-%d))" \
-            --body "scripts/alio_sync.mjs 결과입니다. 바뀐 규정을 확인한 뒤, 관리 › 호환성 점검에서 근거 규정이 개정된 절차를 영향 분석으로 확인하세요."
+          TITLE="ALIO 공시 내규 반영($(date +%Y-%m-%d))"
+          BODY="scripts/alio_sync.mjs 결과입니다. 바뀐 규정을 확인한 뒤, 관리 › 호환성 점검에서 근거 규정이 개정된 절차를 영향 분석으로 확인하세요."
+          if gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" --title "$TITLE" --body "$BODY"; then exit 0; fi
+          # 저장소 설정(Actions 의 PR 생성 허용)이 꺼져 있으면 PR 을 못 만든다 — 받은 내규가 묻히지 않게 이슈로 알린다
+          CMP="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...$BRANCH?expand=1"
+          NOTE="$BODY
+
+          ⚠ 자동 PR 을 만들지 못했습니다(저장소 Settings › Actions › General › 'Allow GitHub Actions to create and approve pull requests' 가 꺼져 있음).
+          받은 내규는 \`$BRANCH\` 가지에 있습니다 — [비교·PR 만들기]($CMP)"
+          echo "$NOTE" >> "$GITHUB_STEP_SUMMARY"
+          OPEN=$(gh issue list --state open --search "ALIO 공시 내규 반영 in:title" --json number --jq '.[0].number')
+          if [ -n "$OPEN" ]; then gh issue comment "$OPEN" --body "$NOTE"; else gh issue create --title "$TITLE — PR 대기" --body "$NOTE"; fi
+          echo "::warning::자동 PR 생성이 막혀 이슈로 알렸습니다: $CMP"

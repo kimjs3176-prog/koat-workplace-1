@@ -190,6 +190,8 @@ node scripts/alio_sync.mjs --apply      # 받아서 scripts/import_regs.py 로 �
 - 비교 기준: ALIO 시행일 vs 등록본 개정 정보(`2025년도 1월 일부개정`). 다른 경로(`../alio-mcp` 아님)면 `--alio <경로>` 또는 `ALIO_MCP_DIR`.
 - 결과는 화면 **규정·절차 관리 › 호환성 점검**에 '📡 ALIO 공시 내규보다 오래된 규정 N건'으로 보입니다. 등록 후에는 근거 규정이 바뀐 절차가 '개정됨'으로 표시되어 **🔬 영향 분석**으로 이어집니다.
 - **자동**: `.github/workflows/alio-sync.yml`이 매주 월요일 아침 비교·등록해 PR을 엽니다(수동 실행 가능). GitHub 러너(해외)에서는 ALIO 접속이 가끔 실패하니, 그때는 기관 PC에서 `--apply`를 실행하세요.
+  - PR을 자동으로 열려면 저장소 **Settings › Actions › General › Workflow permissions**에서 *Allow GitHub Actions to create and approve pull requests*를 켜야 합니다. 꺼져 있으면 받은 내규를 `alio-sync` 가지에 올리고, 비교 링크를 담은 **이슈**로 알립니다.
+  - 이름이 바뀐 규정(ALIO 이름 ≠ 등록 이름)은 관리 화면의 규정명 매핑(`reg_aliases`: ALIO 이름 → 등록 이름)에 넣어 두면 '신규'로 중복 등록하지 않습니다. 전각·반각(`R＆D`/`R&D`)과 `(구 …)` 표기는 자동으로 맞춥니다.
 - **Claude Code에서 ALIO 직접 검색**: 저장소의 `.mcp.json`에 alio 서버가 등록되어 있습니다(`ALIO_MCP_DIR`, 기본 `../alio-mcp`). "우리 기관 여비규정 최신 조문 보여줘", "다른 기관 유연근무 규정과 비교해줘"처럼 물으면 됩니다.
 
 ---

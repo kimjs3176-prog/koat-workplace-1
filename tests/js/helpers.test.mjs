@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { load } from "./load.mjs";
 
+process.env.TZ = "Asia/Seoul";                        // 초대장 UTC 시각 → 한국 시각 시험
+
 const T = load("2026-10-08");
 const plain = (v) => JSON.parse(JSON.stringify(v));   // vm 안에서 만든 값은 다른 realm 이라 깊은 비교 전에 평범한 값으로
 const marks = (html) => [...html.matchAll(/<mark class="sec-k (\w)">([^<]*)<\/mark>/g)].map((m) => `${m[1]}:${m[2]}`);
@@ -127,4 +129,56 @@ test("parseSchedText: 한 줄로 이어 붙은 글(확장 메뉴 선택 글)", (
   const r = plain(T.parseSchedText("제목: 청렴교육 실시 안내 일시: 11월 3일(화) 오전 10시 장소: 2층 교육장 대상: 전 직원", "2026-10-16"));
   assert.deepEqual([r.title, r.date, r.time], ["청렴교육 실시 안내", "2026-11-03", "10:00"]);
   assert.ok(r.memo.startsWith("장소: 2층 교육장"));
+});
+
+test("parseIcs: UTC(Z) 시각은 한국 시각으로 — 아침 일정이 전날로 넘어가지 않게", () => {
+  const ics = ["BEGIN:VEVENT", "DTSTART:20261020T050000Z", "DTEND:20261020T060000Z", "SUMMARY:주간회의", "END:VEVENT",
+    "BEGIN:VEVENT", "DTSTART:20261019T230000Z", "DTEND:20261020T000000Z", "SUMMARY:조찬", "END:VEVENT"].join("\r\n");
+  const ev = plain(T.parseIcs(ics));
+  assert.deepEqual([ev[0].date, ev[0].time, ev[0].end], ["2026-10-20", "14:00", ""]);
+  assert.deepEqual([ev[1].date, ev[1].time, ev[1].end], ["2026-10-20", "08:00", ""]);
+});
+
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+const qp = (s) => [...Buffer.from(s, "utf8")].map((b) => "=" + b.toString(16).toUpperCase().padStart(2, "0")).join("");
+const latin = (buf) => String.fromCharCode(...buf);
+
+test("emlToText: 단일 파트 base64 본문(머리글에 인코딩)", () => {
+  const eml = `Subject: =?UTF-8?B?${b64("운영위원")}?= =?UTF-8?B?${b64("회 안내")}?=\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64("일시: 10월 30일 오후 2시")}\r\n`;
+  assert.equal(T.emlToText(eml), "제목: 운영위원회 안내\n일시: 10월 30일 오후 2시");
+});
+
+test("emlToText: QP 본문 + base64 첨부 — 본문 파트만 자기 인코딩으로", () => {
+  const eml = ["Subject: hi", 'Content-Type: multipart/mixed; boundary="B1"', "", "--B1",
+    "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", qp("장소: 대회의실"), "--B1",
+    "Content-Type: application/pdf", "Content-Disposition: attachment; filename=a.pdf", "Content-Transfer-Encoding: base64", "", "JVBERi0xLjQK", "--B1--", ""].join("\r\n");
+  assert.ok(T.emlToText(eml).includes("장소: 대회의실"));
+});
+
+test("emlToText: euc-kr(ks_c_5601-1987) 8bit 본문을 바이트 그대로 읽어 풀기", () => {
+  const body = new TextDecoder("euc-kr").decode(new Uint8Array([0xc8, 0xb8, 0xc0, 0xc7])) === "회의"
+    ? Buffer.from([0xc8, 0xb8, 0xc0, 0xc7]) : null;
+  if (!body) return;                                  // ICU 가 없는 node 면 건너뜀
+  const eml = latin(Buffer.concat([Buffer.from("Subject: x\r\nContent-Type: text/plain; charset=ks_c_5601-1987\r\n\r\n"), body]));
+  assert.ok(T.emlToText(eml).endsWith("회의"));
+});
+
+test("guard: 상신 버튼 이름 — 메뉴(결재요청함)·취소는 제외, ERP 제출 버튼은 포함", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("../../extension/guard.js", import.meta.url), "utf8");
+  const rx = (name) => eval(src.match(new RegExp(`const ${name} = (/.*/[a-z]*);`))[1]);
+  const S = rx("SUBMIT"), E = rx("SUBMIT_ERP");
+  const hit = (t) => S.test(t) || E.test(t);
+  for (const t of ["상신", "결재요청", "결재 상신하기", "제출", "서무확정요청", "여비정산신청", "출장신청"]) assert.ok(hit(t), t);
+  for (const t of ["결재요청함", "결재상신함", "결재 요청 취소", "결재요청 현황", "보내기", "신청 내역"]) assert.ok(!hit(t), t);
+});
+
+test("parseSchedText: 회신·제출 기한과 'N일 전까지'는 일정 날짜가 아님, 끝나는 날은 기간일 때만", () => {
+  const a = plain(T.parseSchedText("10월 30일 오후 2시 운영위원회\n자료는 2일 전까지 제출", "2026-10-16"));
+  assert.deepEqual([a.title, a.date, a.end, a.time], ["운영위원회", "2026-10-30", "", "14:00"]);
+  const b = plain(T.parseSchedText("회신은 10월 25일까지\n10월 30일 회의", "2026-10-16"));
+  assert.deepEqual([b.title, b.date, b.end], ["회의", "2026-10-30", ""]);
+  const c = plain(T.parseSchedText("워크숍 10월 27일(화) ~ 10월 29일(목)", "2026-10-16"));
+  assert.deepEqual([c.date, c.end], ["2026-10-27", "2026-10-29"]);
+  assert.equal(T.schedTime("2:30 ~ 4:00"), "14:30");
 });

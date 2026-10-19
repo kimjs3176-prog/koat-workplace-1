@@ -139,7 +139,10 @@
       const v = el.tagName === "INPUT" ? (text.split("\n").map((x) => x.trim()).find(Boolean) || "") : text;
       const proto = el.tagName === "INPUT" ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-      if (mode === "insert") {
+      // 날짜·숫자 칸은 커서 위치가 없고, 형식이 안 맞는 글은 브라우저가 빈 값으로 버린다 — 통째로 넣고 들어갔는지 확인
+      const typed = el.tagName === "INPUT" && /^(number|date)$/i.test(el.type || "");
+      if (typed) { setter.call(el, v); if (el.value !== v) return false; }
+      else if (mode === "insert") {
         const start = el.selectionStart ?? el.value.length, end = el.selectionEnd ?? el.value.length;
         setter.call(el, el.value.slice(0, start) + v + el.value.slice(end));
         try { el.selectionStart = el.selectionEnd = start + v.length; } catch (e) {}
@@ -182,7 +185,9 @@
     let ok = false, err = "";
     try { ok = setValue(el, text, "insert"); } catch (e) { err = e.message; }
     dlog("insert", { ok, kind: kindOf(el), label: labelOf(el), err, len: String(text).length });
-    return { ok, where: el.name || el.id || el.tagName.toLowerCase() };
+    const typed = el.tagName === "INPUT" && /^(number|date)$/i.test(el.type || "");
+    return { ok, where: el.name || el.id || el.tagName.toLowerCase(),
+      error: ok ? "" : typed ? "마지막으로 누른 칸이 날짜·숫자 칸이라 글을 넣을 수 없습니다. 내용 칸을 누른 뒤 다시 넣어 주세요." : err ? "넣지 못했습니다: " + err : "" };
   }
 
   // ── 구조 분석(진단 센터의 📸 화면 구조 기록이 부름) ──────────────────

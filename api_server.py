@@ -245,7 +245,7 @@ def _norm_key(s: str) -> str:
 
 def _save_reg_manifest(man: list) -> None:
     """manifest 저장 — 기존 파일과 같은 포맷(indent=1)으로 써서 diff 를 최소화한다."""
-    tmp = REG_MANIFEST_PATH + ".tmp"
+    tmp = f"{REG_MANIFEST_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"   # 동시에 쓰는 요청끼리 임시 파일이 섞이지 않게
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(man, f, ensure_ascii=False, indent=1)
         f.write("\n")
@@ -303,6 +303,8 @@ REG_MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 REG_UPLOAD_TOKEN = os.environ.get("REG_UPLOAD_TOKEN", "").strip()
 SEC_DIAG_BRANCH = os.environ.get("SECRETARY_DIAG_BRANCH", "secretary-diag").strip() or "secretary-diag"
 REG_UPLOAD_MAX_MB = int(os.environ.get("REG_UPLOAD_MAX_MB", "40"))
+# 화면이 알려 주는 업로드 한도와 실제 본문 상한을 맞춘다(양식 칸 여유 1MB)
+app.config["MAX_CONTENT_LENGTH"] = max(app.config.get("MAX_CONTENT_LENGTH") or 0, (REG_UPLOAD_MAX_MB + 1) * 1024 * 1024)
 REG_CATEGORIES = ["정관", "규정", "규칙", "세칙", "예규", "매뉴얼", "기타"]
 _ALLOWED_EXT = {".hwpx", ".hwp", ".docx", ".pdf", ".html", ".htm", ".txt", ".md"}
 _KST = timezone(timedelta(hours=9))
@@ -834,7 +836,15 @@ def _write_reg_files(slug: str, view_html: str, text: str,
     return stored
 
 
+_MANIFEST_LOCK = threading.RLock()   # manifest 읽고-고치고-쓰기를 한 번에 하나씩(동시 업로드에 등록이 사라지지 않게)
+
+
 def _upsert_manifest(entry: dict, backup_name: str = "") -> dict:
+    with _MANIFEST_LOCK:
+        return _upsert_manifest_locked(entry, backup_name)
+
+
+def _upsert_manifest_locked(entry: dict, backup_name: str = "") -> dict:
     """
     manifest 에 등록/갱신. 같은 규정명이 있으면 개정판으로 교체하고
     이전 항목 전체를 이력에 남긴다(되돌리기로 복원 가능).
@@ -863,18 +873,43 @@ def _upsert_manifest(entry: dict, backup_name: str = "") -> dict:
 
 
 def _local_request() -> bool:
-    """이 컴퓨터에서 직접 연 요청인지(프록시를 거치지 않은 127.0.0.1·::1)."""
-    return (request.remote_addr in ("127.0.0.1", "::1")
-            and not request.headers.get("X-Forwarded-For") and not os.environ.get("VERCEL"))
+    """이 컴퓨터에서 직접 연 요청인지(프록시를 거치지 않은 127.0.0.1·::1).
+
+    같은 PC 의 nginx·IIS(ARR)·터널 뒤에 두면 모든 요청이 127.0.0.1 로 보인다 — 프록시가 붙이는 머리글이
+    하나라도 있으면 '이 컴퓨터'로 보지 않는다. 그런 배치에서는 REG_UPLOAD_TOKEN 을 설정해야 저장할 수 있다.
+    """
+    proxied = any(request.headers.get(h) for h in ("X-Forwarded-For", "X-Real-IP", "Forwarded", "Via",
+                                                   "X-Forwarded-Host", "X-Original-URL", "X-ARR-LOG-ID"))
+    return request.remote_addr in ("127.0.0.1", "::1") and not proxied and not os.environ.get("VERCEL")
 
 
 def _client_ip() -> str:
-    """요청한 쪽 IP — X-Forwarded-For 는 믿을 수 있는 프록시 뒤일 때만(Vercel 은 직접 덮어쓴다, 그 밖은 TRUST_PROXY=1)."""
-    if os.environ.get("VERCEL") or os.environ.get("TRUST_PROXY", "").strip() in ("1", "true"):
-        xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        if xff:
-            return xff
+    """요청한 쪽 IP — 전달 머리글은 믿을 수 있는 프록시 뒤일 때만.
+
+    Vercel 은 X-Real-IP·X-Forwarded-For 를 직접 덮어쓴다. 그 밖(TRUST_PROXY=1)은 우리 프록시가 X-Forwarded-For
+    '맨 뒤'에 붙인 값을 쓴다 — 맨 앞 값은 요청한 쪽이 마음대로 넣을 수 있어 속도 제한을 피하는 데 쓰인다.
+    """
+    if os.environ.get("VERCEL"):
+        ip = (request.headers.get("X-Real-IP") or (request.headers.get("X-Forwarded-For") or "").split(",")[0]).strip()
+        if ip:
+            return ip
+    elif os.environ.get("TRUST_PROXY", "").strip() in ("1", "true"):
+        parts = [x.strip() for x in (request.headers.get("X-Forwarded-For") or "").split(",") if x.strip()]
+        if parts:
+            return parts[-1]
     return request.remote_addr or "?"
+
+
+def _rate_prune(hits: dict, window: float) -> None:
+    """속도 제한 기록이 너무 많아지면 창이 지난 기록만 지운다(전부 지우면 제한이 풀린다)."""
+    if len(hits) <= 5000:
+        return
+    now = time.time()
+    for k in [k for k, v in hits.items() if not v or now - v[-1] >= window]:
+        hits.pop(k, None)
+    if len(hits) > 20000:                     # 그래도 넘치면 가장 오래 조용한 것부터
+        for k in sorted(hits, key=lambda k: hits[k][-1] if hits[k] else 0)[:len(hits) - 10000]:
+            hits.pop(k, None)
 
 
 def _upload_authorized() -> tuple[bool, str]:
@@ -1280,6 +1315,10 @@ def reg_upload():
     slug = _reg_slug(title)
     if not slug:
         return jsonify({"error": "규정명에서 저장 폴더명을 만들 수 없습니다."}), 400
+    # 이름은 다른데 폴더명이 같아지는 규정('A:B규정'과 'AB규정')은 서로의 파일을 덮어쓰므로 받지 않는다
+    clash = next((m for m in _load_reg_manifest() if m.get("slug") == slug and _norm_key(m.get("title", "")) != _norm_key(title)), None)
+    if clash:
+        return jsonify({"error": f"이미 등록된 '{clash.get('title')}'과(와) 저장 폴더명이 같아집니다. 규정명을 확인하세요."}), 409
 
     stored_ext = ".pdf" if ext == ".pdf" else ext
     entry = {
@@ -1458,6 +1497,11 @@ def _gh_revert(slug: str):
 
 @app.route("/api/regs/upload/delete", methods=["POST"])
 def reg_upload_delete():
+    with _MANIFEST_LOCK:
+        return _reg_upload_delete()
+
+
+def _reg_upload_delete():
     """
     업로드한 개정 내규 되돌리기.
       · 이전 개정이 있으면 그 개정본(파일·manifest 항목)으로 복원한다
@@ -1466,7 +1510,7 @@ def reg_upload_delete():
     _ok, _why = _upload_authorized()
     if not _ok:
         return jsonify({"error": _why}), 401
-    slug = (request.form.get("slug") or (request.json or {}).get("slug") or "").strip()
+    slug = (request.form.get("slug") or (request.get_json(silent=True) or {}).get("slug") or "").strip()
     if not slug or "/" in slug or "\\" in slug or slug.startswith("."):
         return jsonify({"error": "slug 값이 올바르지 않습니다."}), 400
 
@@ -2048,7 +2092,7 @@ def secretary_procedures():
         # ALIO 공시본 대비 최신성(scripts/alio_sync.mjs 가 만든 상태 파일 — 없으면 null)
         "alio": _sec_alio_status(),
         "ai": _sec_ai_status(),
-        "insights": {"available": bool(_sec_ins_backend()), "min_n": max(1, int(_sec_ins_cfg().get("min_n") or 3))},
+        "insights": {"available": bool(_sec_ins_backend()), "min_n": _sec_ins_cfg()["min_n"]},
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
                   "github": _gh_enabled()},
     })
@@ -2195,6 +2239,12 @@ _SEC_READONLY_MSG = ("이 서버는 파일을 쓸 수 없습니다(읽기 전용
                      "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다.")
 
 
+def _sec_stale_base(base, current: dict) -> bool:
+    """화면이 불러온 판(updated)과 지금 저장된 판이 다르면 True — 관리자 두 명이 동시에 고칠 때 덮어쓰지 않게.
+    base 를 보내지 않는 옛 화면·스크립트는 검사하지 않는다."""
+    return isinstance(base, str) and base != str((current or {}).get("updated") or "")
+
+
 @app.route("/api/secretary/org", methods=["POST"])
 def secretary_org_save():
     """기관 층 저장(관리자). 내규 업로드와 같은 토큰을 쓰고, GitHub 연동 시 저장소에 커밋한다."""
@@ -2202,6 +2252,9 @@ def secretary_org_save():
     if not ok:
         return jsonify({"success": False, "error": why}), 401
     body = request.get_json(silent=True) or {}
+    if _sec_stale_base(body.get("base"), _sec_org_load(force=True)):
+        return jsonify({"success": False, "conflict": True,
+                        "error": "다른 관리자가 그사이 기관 절차를 저장했습니다. 화면을 새로 불러온 뒤 다시 고쳐 저장하세요."}), 409
     raw = body.get("procedures")
     if not isinstance(raw, list) or len(raw) > 200:
         return jsonify({"success": False, "error": "procedures 목록(최대 200건)이 필요합니다."}), 400
@@ -2250,6 +2303,9 @@ def secretary_config_save():
     body = (request.get_json(silent=True) or {}).get("config") or {}
     if not isinstance(body, dict):
         return jsonify({"success": False, "error": "config 객체가 필요합니다."}), 400
+    if _sec_stale_base((request.get_json(silent=True) or {}).get("base"), _sec_layer_load(_SEC_CFG_CACHE, SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, True)):
+        return jsonify({"success": False, "conflict": True,
+                        "error": "다른 관리자가 그사이 기관 설정을 저장했습니다. 화면을 새로 불러온 뒤 다시 저장하세요."}), 409
     org = body.get("org") or {}
     svc = body.get("service") or {}
     if not _sec_clean_str(org.get("name"), 60):
@@ -2283,12 +2339,25 @@ def secretary_config_save():
     erp_in = body.get("erp") if isinstance(body.get("erp"), dict) else {}
     hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (erp_in.get("hosts") or [])[:20]) if h]
     cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40)}
-    # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다
+    # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다.
+    # 저장소를 잠깐 못 읽었을 때 배포본의 옛 설정으로 덮어쓰지 않게, 읽기 실패(404 외)면 저장을 멈춘다.
+    if _gh_enabled():
+        try:
+            _gh("GET", f"/contents/{SEC_CONFIG_REPO_PATH}", params={"ref": GITHUB_BRANCH})
+        except Exception as e:
+            if getattr(e, "status", 0) != 404:
+                return jsonify({"success": False, "error": "저장소의 현재 설정을 읽지 못해 저장을 멈췄습니다. 잠시 뒤 다시 저장하세요."}), 503
     cur = _sec_config(force=True)
     for k in ("audit", "insights"):
         v = body.get(k) if isinstance(body.get(k), dict) else cur.get(k)
         if isinstance(v, dict) and v and len(json.dumps(v, ensure_ascii=False)) < 20000:
             cfg[k] = v
+    if "insights" in cfg:                                   # 숫자가 아닌 최소 인원("3명" 등)이 앱 전체를 멈추지 않게
+        ins = dict(cfg["insights"])
+        ins["min_n"] = _sec_int(ins.get("min_n"), 3, 1, 100)
+        if "enabled" in ins:
+            ins["enabled"] = ins["enabled"] not in (False, 0, "0", "false", "False", "off", "")
+        cfg["insights"] = ins
     payload = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     try:
         where = _sec_save_repo_file(SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, payload,
@@ -2375,8 +2444,7 @@ def _sec_ai_rate_ok() -> bool:
         return False
     hits.append(now)
     _SEC_AI_HITS[ip] = hits
-    if len(_SEC_AI_HITS) > 5000:             # 메모리 보호
-        _SEC_AI_HITS.clear()
+    _rate_prune(_SEC_AI_HITS, 600)          # 메모리 보호
     return True
 
 
@@ -3283,9 +3351,17 @@ _SEC_INS_HITS: dict = {}
 _SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft")
 
 
+def _sec_int(v, default: int, lo: int, hi: int) -> int:
+    """설정의 숫자 — '3명'·빈 값·이상한 값은 기본값으로, 범위 밖은 범위 안으로."""
+    m = re.search(r"-?\d+", str(v if v is not None else ""))
+    return max(lo, min(hi, int(m.group()))) if m else default
+
+
 def _sec_ins_cfg() -> dict:
     c = {"enabled": True, "min_n": 3}
-    c.update(_sec_config().get("insights") or {})
+    v = _sec_config().get("insights")
+    c.update(v if isinstance(v, dict) else {})
+    c["min_n"] = _sec_int(c.get("min_n"), 3, 1, 100)
     return c
 
 
@@ -3348,8 +3424,7 @@ def _sec_ins_rate_ok() -> bool:
         _SEC_INS_HITS[ip] = hits
         return False
     _SEC_INS_HITS[ip] = hits + [now]
-    if len(_SEC_INS_HITS) > 5000:
-        _SEC_INS_HITS.clear()
+    _rate_prune(_SEC_INS_HITS, 3600)
     return True
 
 
@@ -3447,7 +3522,7 @@ def _sec_ins_summary(h: dict, rj: dict, min_n: int) -> dict:
 def secretary_insights():
     """?procedure=id → 그 절차의 집단 지식. 없으면 전체 요약(관리 화면용)."""
     be = _sec_ins_backend()
-    min_n = max(1, int(_sec_ins_cfg().get("min_n") or 3))
+    min_n = _sec_ins_cfg()["min_n"]
     if not be:
         return jsonify({"success": True, "available": False, "min_n": min_n})
     pid = request.args.get("procedure") or ""
