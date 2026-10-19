@@ -63,7 +63,11 @@ async function registerExtraHosts() {
     if (builtin.includes(h)) continue;
     if (await chrome.permissions.contains({ origins: [h] })) extra.push(h);
   }
-  try { await chrome.scripting.unregisterContentScripts({ ids: ["sec-erp-extra", "sec-marker"] }); } catch (e) {}
+  // 등록돼 있는 것만 해제한다 — 없는 id 가 하나라도 섞이면 요청 전체가 실패해 옛 등록이 남고, 다시 등록할 때 'Duplicate script ID' 가 된다
+  try {
+    const ids = (await chrome.scripting.getRegisteredContentScripts()).map((c) => c.id).filter((id) => ["sec-erp-extra", "sec-marker"].includes(id));
+    if (ids.length) await chrome.scripting.unregisterContentScripts({ ids });
+  } catch (e) { diag("bg", "scripts.unregister", { ok: false, err: e.message }); }
   // 서무비서 웹 화면 표시·기한 전달(marker.js) — 기관 배포본은 manifest 에 들어 있고, 개발자 설치·주소 변경 때는 여기서 붙인다
   const { server } = await settings();
   if (server) {
@@ -80,12 +84,25 @@ async function registerExtraHosts() {
 }
 
 // 창 종류(일반·팝업)를 미리 알아 둔다 — sidePanel.open 은 사용자 클릭 직후 '기다림 없이' 불러야 해서 그때 물어볼 수 없다
+// 워커가 쉬었다 깨어나도 바로 쓸 수 있게 세션 저장소에도 둔다(주소창·ERP 팝업에서 처음 누를 때 웹 탭·작은 창으로 새지 않게)
 const winType = {};
 let lastNormalWin = null;
-chrome.windows.getAll().then((ws) => ws.forEach((w) => { winType[w.id] = w.type; if (w.type === "normal" && (w.focused || lastNormalWin == null)) lastNormalWin = w.id; })).catch(() => {});
-chrome.windows.onCreated.addListener((w) => { winType[w.id] = w.type; });
-chrome.windows.onRemoved.addListener((id) => { delete winType[id]; if (lastNormalWin === id) lastNormalWin = null; if (fallbackWin === id) fallbackWin = null; });
-chrome.windows.onFocusChanged.addListener((id) => { if (winType[id] === "normal") lastNormalWin = id; });
+const saveWin = () => chrome.storage.session.set({ winInfo: { winType, lastNormalWin, fallbackWin } }).catch(() => {});
+chrome.storage.session.get("winInfo").then(({ winInfo }) => {
+  if (!winInfo) return;
+  for (const [k, v] of Object.entries(winInfo.winType || {})) if (!(k in winType)) winType[k] = v;
+  if (lastNormalWin == null) lastNormalWin = winInfo.lastNormalWin ?? null;
+  if (fallbackWin == null) fallbackWin = winInfo.fallbackWin ?? null;
+}).catch(() => {});
+chrome.windows.getAll().then((ws) => {
+  for (const k of Object.keys(winType)) if (!ws.some((w) => String(w.id) === k)) delete winType[k];
+  ws.forEach((w) => { winType[w.id] = w.type; if (w.type === "normal" && (w.focused || lastNormalWin == null)) lastNormalWin = w.id; });
+  if (fallbackWin != null && !ws.some((w) => w.id === fallbackWin)) fallbackWin = null;
+  saveWin();
+}).catch(() => {});
+chrome.windows.onCreated.addListener((w) => { winType[w.id] = w.type; saveWin(); });
+chrome.windows.onRemoved.addListener((id) => { delete winType[id]; if (lastNormalWin === id) lastNormalWin = null; if (fallbackWin === id) fallbackWin = null; saveWin(); });
+chrome.windows.onFocusChanged.addListener((id) => { if (winType[id] === "normal" && lastNormalWin !== id) { lastNormalWin = id; saveWin(); } });
 
 // 패널 열기(+ 물을 말). ERP 가 띄운 작은 창(팝업)에는 옆 패널이 없으므로 원래 창의 옆 패널에서 연다.
 // 주의: sidePanel.open 앞에 await 를 두면 클릭(사용자 동작)으로 인정되지 않아 열리지 않는다.
@@ -112,7 +129,7 @@ async function panelWindow(tab) {
   const win = await chrome.windows.getCurrent();
   const w = await chrome.windows.create({ url, type: "popup", width: 440, height: Math.min(900, win.height || 900),
     left: Math.max(0, (win.left || 0) + (win.width || 1200) - 440), top: win.top || 0 });
-  fallbackWin = w && w.id;
+  fallbackWin = w && w.id; saveWin();
 }
 
 // 'https://erp.example.com/*' 또는 'https://*.example.com/*' 형식의 주소 규칙과 탭 주소 비교
@@ -320,6 +337,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     });
     return true;
   } else if (m.type === "frameNav" && sender.tab) {      // 업무를 알려 준 프레임이 다른 화면으로 — 이전 업무·점검을 지운다
+    stateReady.then(() => {                                // 깨어난 직후엔 되살린 상태를 기다린 뒤 지운다(안 그러면 옛 점검이 되살아난다)
     const st = state[tabId];
     if (st && st.context && st.ctxFrame === sender.frameId) {
       diag("bg", "context.clear", { was: st.context.title }, sender);
@@ -328,6 +346,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       chrome.tabs.sendMessage(tabId, { type: "chip", q: "", title: "" }).catch(() => {});
       toPanel({ type: "context", tabId, context: null });
     }
+    });
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
     openPanel(sender.tab, m.q || "");
   } else if (m.type === "getContext") {                   // 패널이 열릴 때 현재 탭 상태 요청
@@ -372,15 +391,17 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener((id) => { delete state[id]; saveState(); });
+chrome.tabs.onRemoved.addListener((id) => { stateReady.then(() => { delete state[id]; saveState(); }); });
 // 탭이 다른 주소로 넘어가면 감지 결과를 비운다(같은 탭에서 다른 업무 화면으로)
 chrome.tabs.onUpdated.addListener((id, info, tab) => {
-  if (info.status === "loading" && info.url && state[id]) {
+  // 깨어난 직후엔 세션 저장소의 옛 상태가 아직 안 돌아와 있다 — 되살린 뒤에 지워야 옛 점검이 다시 살아나지 않는다
+  if (info.status === "loading" && info.url) stateReady.then(() => {
+    if (!state[id]) return;
     const had = !!state[id].context;
     for (const k of ["cs", "context", "guard", "ctxFrame", "focusFrame"]) delete state[id][k];
     saveState();
     if (had) toPanel({ type: "context", tabId: id, context: null });   // 패널의 이전 업무 배지도 지운다
-  }
+  });
   if (info.status === "complete") setTimeout(() => urlContext(id).catch(() => {}), 2500);
 });
 

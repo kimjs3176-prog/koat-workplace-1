@@ -18,7 +18,7 @@ import sys
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUBMIT = re.compile(r"^(결재\s*)?상신(하기)?$|결재\s*(요청|올리기|올림|상신)|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$|^(출장|여비\s*정산|근태|휴가|시간외(근무)?)\s*신청$|^서무\s*확정\s*요청$|^(정산|확정)\s*요청$")
+SUBMIT = re.compile(r"^(결재\s*)?상신(하기)?$|^결재\s*(요청|올리기|올림|상신)(하기)?$|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$|^(출장|여비\s*정산|근태|휴가|시간외(근무)?)\s*신청$|^서무\s*확정\s*요청$|^(정산|확정)\s*요청$")
 
 
 def load_rules():

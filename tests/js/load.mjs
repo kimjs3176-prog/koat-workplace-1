@@ -14,7 +14,7 @@ function slice(from, to) {
 }
 
 export function load(today = "2026-10-08") {
-  const ctx = vm.createContext({ S: { moreOpen: {}, cfg: {}, holidays: {} }, console, TextEncoder });
+  const ctx = vm.createContext({ S: { moreOpen: {}, cfg: {}, holidays: {} }, console, TextEncoder, TextDecoder, atob });
   const code = [
     "const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));",
     "const norm=s=>String(s||'').replace(/\\s+/g,'').toLowerCase();",
@@ -27,7 +27,7 @@ export function load(today = "2026-10-08") {
     slice("// ── 한눈에 읽기", "function keyFactsHtml(p){"),
     slice("function _h(t)", "function reconcileAll(){"),
     slice("// ── 메일에서 일정 가져오기", "// 끌어다 놓기·붙여넣기"),
-    "this.T={parseSchedText,parseIcs,schedTime,icsFold,hl,brief,keyFacts,parseDates,reconcileCase,procKeys,stepKey};",
+    "this.T={parseSchedText,parseIcs,emlToText,schedTime,icsFold,hl,brief,keyFacts,parseDates,reconcileCase,procKeys,stepKey};",
   ].join("\n");
   vm.runInContext(code, ctx);
   return ctx.T;

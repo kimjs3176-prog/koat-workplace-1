@@ -1324,7 +1324,10 @@ function parseIcs(text){
   const out=[];
   for(const blk of un.split(/BEGIN:VEVENT/).slice(1)){
     const get=k=>{ const m=blk.match(new RegExp('^'+k+'(?:;[^:\\r\\n]*)?:(.*)$','m')); return m?m[1].replace(/\\n/gi,'\n').replace(/\\([,;\\])/g,'$1').trim():''; };
-    const dt=v=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/); return m?{d:`${m[1]}-${m[2]}-${m[3]}`, t:m[4]?`${m[4]}:${m[5]}`:''}:null; };
+    // 끝에 Z 가 붙은 시각(구글·Exchange 초대장 대부분)은 UTC — 이 PC 시각(한국)으로 바꾼다
+    const dt=v=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(?:\d{2})?(Z)?)?/); if(!m) return null;
+      if(m[6]){ const u=new Date(Date.UTC(+m[1],m[2]-1,+m[3],+m[4],+m[5])); return {d:ymd(u), t:String(u.getHours()).padStart(2,'0')+':'+String(u.getMinutes()).padStart(2,'0')}; }
+      return {d:`${m[1]}-${m[2]}-${m[3]}`, t:m[4]?`${m[4]}:${m[5]}`:''}; };
     const s0=dt(get('DTSTART')); if(!s0) continue; const e0=dt(get('DTEND'));
     let end=''; if(e0){ end=e0.t?e0.d:addDays(e0.d,-1); if(end<=s0.d) end=''; }   // 종일 일정의 DTEND 는 다음 날
     const loc=get('LOCATION');
@@ -1332,18 +1335,37 @@ function parseIcs(text){
   }
   return out;
 }
-// .eml(메일 파일) — 제목과 본문(text/plain 우선, quoted-printable·base64 풀기)
+// .eml(메일 파일) — 제목과 본문(text/plain 우선). 파트마다 자기 머리글의 전송 인코딩(QP·base64)과 문자셋(utf-8·euc-kr)으로 푼다
+const _CS=cs=>{ cs=String(cs||'utf-8').toLowerCase().replace(/["']/g,''); return /ks_c_5601|cp949|x-windows-949|uhc/.test(cs)?'euc-kr':cs; };
+function _bytesToText(bytes, cs){ try{ return new TextDecoder(_CS(cs)).decode(bytes); }catch(e){ return new TextDecoder('utf-8').decode(bytes); } }
+const _bin=s=>Uint8Array.from(s,c=>c.charCodeAt(0)&255);
+function _mimeLeaves(raw, depth){
+  const i=raw.search(/\r?\n\r?\n/); const head=i>=0?raw.slice(0,i):raw; const body=i>=0?raw.slice(i).replace(/^\r?\n\r?\n/,''):'';
+  const h=head.replace(/\r?\n[ \t]+/g,' '); const hv=k=>(h.match(new RegExp('^'+k+':\\s*(.*)$','im'))||[])[1]||'';
+  const ct=hv('content-type')||'text/plain'; const type=ct.split(';')[0].trim().toLowerCase();
+  const bd=(ct.match(/boundary\s*=\s*"?([^";]+)"?/i)||[])[1];
+  if(/^multipart\//.test(type) && bd && (depth||0)<6){
+    return body.split('--'+bd).slice(1).filter(p=>!/^--/.test(p)).flatMap(p=>_mimeLeaves(p.replace(/^\r?\n/,''), (depth||0)+1));
+  }
+  return [{type, head:h, cte:hv('content-transfer-encoding').trim().toLowerCase(), cs:(ct.match(/charset\s*=\s*"?([^";\s]+)"?/i)||[])[1]||'', disp:hv('content-disposition'), body}];
+}
 function emlToText(raw){
-  raw=String(raw||''); const hdrEnd=raw.search(/\r?\n\r?\n/); const head=hdrEnd>0?raw.slice(0,hdrEnd):''; const body=hdrEnd>0?raw.slice(hdrEnd):raw;
-  const dec=w=>w.replace(/=\?([^?]+)\?([bq])\?([^?]*)\?=/gi,(m,cs,enc,txt)=>{ try{
-      const bytes=enc.toLowerCase()==='b'?Uint8Array.from(atob(txt),c=>c.charCodeAt(0)):Uint8Array.from(txt.replace(/_/g,' ').replace(/=([0-9a-f]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16))),c=>c.charCodeAt(0));
-      return new TextDecoder(cs).decode(bytes); }catch(e){ return txt; } });
-  const subj=(head.replace(/\r?\n[ \t]+/g,' ').match(/^subject:\s*(.*)$/im)||[])[1]||'';
-  let part=body; const pm=body.match(/content-type:\s*text\/plain[^]*?\r?\n\r?\n([^]*?)(?:\r?\n--|$)/i); if(pm) part=pm[1];
-  const qp=/quoted-printable/i.test(body), b64=/content-transfer-encoding:\s*base64/i.test(body);
-  try{ if(b64 && pm) part=new TextDecoder('utf-8').decode(Uint8Array.from(atob(part.replace(/\s+/g,'')),c=>c.charCodeAt(0)));
-    else if(qp) part=new TextDecoder('utf-8').decode(Uint8Array.from(part.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16))),c=>c.charCodeAt(0))); }catch(e){}
-  if(/<html|<body|<div/i.test(part)) part=htmlToText(part);
+  // 파일은 바이트 그대로(문자 0~255) 읽어 넘긴다 — euc-kr 8bit 본문을 utf-8 로 먼저 읽으면 되돌릴 수 없어서
+  raw=String(raw||''); const bin=!/[^\x00-\xff]/.test(raw); const hdrEnd=raw.search(/\r?\n\r?\n/); const head=hdrEnd>0?raw.slice(0,hdrEnd):'';
+  // 인코딩된 조각이 이어지면 사이 공백은 버린다(RFC 2047) — '운영위원 회' 처럼 끊기지 않게
+  const dec=w=>w.replace(/(\?=)\s+(?==\?)/g,'$1').replace(/=\?([^?]+)\?([bq])\?([^?]*)\?=/gi,(m,cs,enc,txt)=>{ try{
+      const bytes=enc.toLowerCase()==='b'?_bin(atob(txt)):_bin(txt.replace(/_/g,' ').replace(/=([0-9a-f]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16))));
+      return _bytesToText(bytes, cs); }catch(e){ return txt; } });
+  let subj=(head.replace(/\r?\n[ \t]+/g,' ').match(/^subject:\s*(.*)$/im)||[])[1]||'';
+  if(bin && /[\x80-\xff]/.test(subj)) subj=_bytesToText(_bin(subj),'utf-8');
+  const leaves=_mimeLeaves(raw).filter(p=>!/attachment/i.test(p.disp));
+  const pick=leaves.find(p=>p.type==='text/plain')||leaves.find(p=>p.type==='text/html')||leaves[0];
+  let part='';
+  if(pick){ part=pick.body;
+    try{ if(pick.cte==='base64') part=_bytesToText(_bin(atob(part.replace(/[^A-Za-z0-9+/=]/g,''))), pick.cs);
+      else if(pick.cte==='quoted-printable') part=_bytesToText(_bin(part.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16)))), pick.cs);
+      else if(bin) part=_bytesToText(_bin(part), pick.cs||'utf-8'); }catch(e){}
+    if(pick.type==='text/html'||/<html|<body|<div/i.test(part)) part=htmlToText(part); }
   return (subj?'제목: '+dec(subj)+'\n':'')+part;
 }
 // 끌어다 놓기·붙여넣기·확장 메뉴에서 온 내용 → 일정 입력 창(사용자가 확인 후 저장)
@@ -1355,7 +1377,9 @@ async function schedFromDrop(dt, day){
       if(evs.length>1){ if(!confirm(`초대장에 일정 ${evs.length}건이 있습니다. 모두 내 일정에 추가할까요?`)) return;
         const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.`); render(); return; }
       if(evs.length===1){ openSched(null, day, evs[0]); return; } }
-    if(name.endsWith('.eml')||f.type==='message/rfc822'){ openSched(null, day, parseSchedText(emlToText(await f.text()))); return; }
+    if(name.endsWith('.eml')||f.type==='message/rfc822'){ const u8=new Uint8Array(await f.arrayBuffer()); let b='';
+      for(let i=0;i<u8.length;i+=8192) b+=String.fromCharCode.apply(null, u8.subarray(i,i+8192));
+      openSched(null, day, parseSchedText(emlToText(b))); return; }
     if(name.endsWith('.txt')||/^text\//.test(f.type)){ openSched(null, day, parseSchedText(await f.text())); return; }
   }
   if(files.length){ toast('읽을 수 있는 파일은 .ics(초대장)·.eml(메일)·.txt 입니다. 메일 본문 글을 끌어다 놓아도 됩니다.', 4200); return; }

@@ -5,11 +5,15 @@
   if (window.__secGuard) return; window.__secGuard = true;
   let guard = null;                  // {proc, title, pitfalls:[{t,basis}], enabled}
   let bypass = false;
-  const SUBMIT = /^(결재\s*)?상신(하기)?$|결재\s*(요청|올리기|올림|상신)|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$/;
+  // 이름 전체가 맞아야 한다 — '결재요청함'·'결재상신함'(메뉴)·'결재 요청 취소'는 상신이 아니다
+  const SUBMIT = /^(결재\s*)?상신(하기)?$|^결재\s*(요청|올리기|올림|상신)(하기)?$|^기안\s*완료$|^(제출|신청|승인\s*요청)(하기)?$|^결재\s*하기$/;
   // 진단 기록(2026-10-16)의 KOAT ERP 제출 버튼 — 업무 화면에서만(메뉴의 같은 이름 링크는 아래 MENU 로 거른다)
   const SUBMIT_ERP = /^(출장|여비\s*정산|근태|휴가|시간외(근무)?)\s*신청$|^서무\s*확정\s*요청$|^(정산|확정)\s*요청$/;
   // 왼쪽 메뉴·상단 메뉴·트리·탭 안의 같은 이름은 화면을 여는 링크라 점검하지 않는다
   const inMenu = (el) => !!el.closest('nav,[role="menu"],[role="menubar"],[role="tree"],[role="tablist"],[class*="menu" i],[id*="menu" i],[class*="lnb" i],[class*="gnb" i],[class*="snb" i],[class*="tree" i]');   // (class 'tab' 은 table 과 겹쳐 쓰지 않는다)
+  // 메뉴 안 링크·메뉴 항목은 화면을 여는 것 — 'menu' 가 이름에 든 도구 막대의 진짜 버튼은 그대로 점검한다
+  const menuLink = (el) => inMenu(el) && (el.tagName === "A" || /^(menuitem|treeitem|tab|link)$/.test(el.getAttribute("role") || ""));
+  const isSubmitLabel = (el, t) => !!t && t.length <= 14 && ((SUBMIT.test(t) && !menuLink(el)) || (SUBMIT_ERP.test(t) && el.tagName !== "A" && !inMenu(el)));
   const ackKey = () => "secGuardAck:" + (guard && guard.proc);
   const acked = () => { try { return Date.now() - Number(sessionStorage.getItem(ackKey()) || 0) < 10 * 60 * 1000; } catch (e) { return false; } };
 
@@ -19,13 +23,17 @@
   const dlog = (ev, data) => { try { chrome.runtime.sendMessage({ type: "log", src: "guard", ev, data }).catch(() => {}); } catch (e) {} };
   // 상신일 수도 있는 버튼(이름에 이런 말이 들어간 것) — 가로채지 않았을 때도 이름을 남겨 규칙을 보강한다
   const MAYBE = /상신|결재|제출|기안|신청|승인|요청|보내기|발송|완료/;
-  function labelOf(el) { return String(el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").replace(/\s+/g, " ").trim(); }
+  // 그림 버튼(<a><img alt="상신"></a>, <input type=image alt="상신">)도 이름을 읽는다
+  function labelOf(el) {
+    const img = el.querySelector && el.querySelector("img[alt]");
+    return String(el.innerText || (el.type !== "image" && el.value) || el.getAttribute("aria-label") || el.title || el.alt || (img && img.alt) || "").replace(/\s+/g, " ").trim();
+  }
   document.addEventListener("click", (e) => {
     if (bypass) return;
-    const el = e.target.closest && e.target.closest('button,a,input[type="button"],input[type="submit"],[role="button"],[onclick]');
+    const el = e.target.closest && e.target.closest('button,a,input[type="button"],input[type="submit"],input[type="image"],[role="button"],[onclick]');
     if (!el) return;
     const t = labelOf(el);
-    const isSubmit = !!t && t.length <= 14 && (SUBMIT.test(t) || (SUBMIT_ERP.test(t) && el.tagName !== "A" && !inMenu(el)));
+    const isSubmit = isSubmitLabel(el, t);
     if (t && t.length <= 20 && (isSubmit || MAYBE.test(t))) {
       dlog("button", { label: t, submit: isSubmit, tag: el.tagName.toLowerCase(), id: el.id || "", menu: inMenu(el), path: location.pathname.slice(0, 80),
         guard: guard ? { proc: guard.proc, n: (guard.pitfalls || []).length, enabled: guard.enabled } : null, acked: acked() });
@@ -41,7 +49,7 @@
   document.addEventListener("submit", (e) => {
     if (bypass || !guard || !guard.enabled || !(guard.pitfalls || []).length || acked()) return;
     const el = e.submitter; const t = el ? labelOf(el) : "";
-    if (!t || t.length > 14 || !(SUBMIT.test(t) || (SUBMIT_ERP.test(t) && !inMenu(el)))) return;
+    if (!isSubmitLabel(el, t)) return;
     e.preventDefault(); e.stopImmediatePropagation();
     dlog("guard.show", { label: t, proc: guard.proc, n: guard.pitfalls.length, via: "submit" });
     show(el, t);
