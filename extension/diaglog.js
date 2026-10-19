@@ -44,8 +44,20 @@ async function diag(src, ev, data, sender) {
   if (data !== undefined) e.d = diagScrub(data);
   diagBuf.push(e);
   if (diagBuf.length > DIAG_MAX) diagBuf.splice(0, diagBuf.length - DIAG_MAX);
+  if (ev === "snapshot") {                                  // 화면 구조 스냅샷은 커서(수십 KB) 최근 10건만 둔다
+    let n = 0;
+    for (let i = diagBuf.length - 1; i >= 0; i--) if (diagBuf[i].ev === "snapshot" && ++n > 10) diagBuf.splice(i, 1);
+  }
   clearTimeout(diagTimer);
-  diagTimer = setTimeout(() => chrome.storage.local.set({ diagLog: diagBuf }), 800);
+  diagTimer = setTimeout(diagSave, 800);
+}
+// 저장 한도(10MB)를 넘으면 오래된 기록 절반을 버리고 한 번만 다시 저장한다 — 실패를 '오류 기록'으로 남기면 무한 반복이 된다
+function diagSave() {
+  chrome.storage.local.set({ diagLog: diagBuf }).catch(() => {
+    diagBuf.splice(0, Math.ceil(diagBuf.length / 2));
+    diagBuf.push({ t: new Date().toISOString(), v: DIAG_VER, src: "bg", ev: "diag.trimmed", d: { kept: diagBuf.length } });
+    return chrome.storage.local.set({ diagLog: diagBuf }).catch(() => {});
+  });
 }
 async function diagSetEnabled(on) { diagOn = !!on; await chrome.storage.local.set({ diagEnabled: diagOn }); }
 async function diagClear() { await diagLoad(); diagBuf.length = 0; await chrome.storage.local.set({ diagLog: [] }); }

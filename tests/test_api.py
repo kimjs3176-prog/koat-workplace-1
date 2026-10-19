@@ -80,3 +80,18 @@ def test_broken_ai_json_is_clean_error(monkeypatch):
     with api_server.app.test_request_context(headers={"X-AI-Key": "AIzaTESTKEY0123456789", "X-AI-Provider": "gemini"}):
         with pytest.raises(api_server._SecAIError):
             api_server._sec_ai_json("sys", "text", {"type": "object"})
+
+
+def test_insights_min_n_bad_value_does_not_break(client, monkeypatch):
+    """설정의 최소 인원이 숫자가 아니어도('3명') 핵심 API 가 멈추지 않는다."""
+    real = api_server._sec_config
+    monkeypatch.setattr(api_server, "_sec_config", lambda force=False: {**real(force), "insights": {"min_n": "3명"}})
+    assert api_server._sec_ins_cfg()["min_n"] == 3
+    assert client.get("/api/secretary/procedures").status_code == 200
+    assert client.get("/api/secretary/insights").status_code == 200
+
+
+def test_local_admin_not_behind_proxy(client):
+    """토큰이 없는 서버: 같은 PC 프록시(X-Real-IP 등)를 거친 127.0.0.1 요청은 '이 컴퓨터'로 보지 않는다."""
+    r = client.post("/api/secretary/config", json={"config": {"org": {"name": "x"}}}, headers={"X-Real-IP": "10.9.9.9"})
+    assert r.status_code == 401

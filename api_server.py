@@ -863,9 +863,14 @@ def _upsert_manifest(entry: dict, backup_name: str = "") -> dict:
 
 
 def _local_request() -> bool:
-    """이 컴퓨터에서 직접 연 요청인지(프록시를 거치지 않은 127.0.0.1·::1)."""
-    return (request.remote_addr in ("127.0.0.1", "::1")
-            and not request.headers.get("X-Forwarded-For") and not os.environ.get("VERCEL"))
+    """이 컴퓨터에서 직접 연 요청인지(프록시를 거치지 않은 127.0.0.1·::1).
+
+    같은 PC 의 nginx·IIS(ARR)·터널 뒤에 두면 모든 요청이 127.0.0.1 로 보인다 — 프록시가 붙이는 머리글이
+    하나라도 있으면 '이 컴퓨터'로 보지 않는다. 그런 배치에서는 REG_UPLOAD_TOKEN 을 설정해야 저장할 수 있다.
+    """
+    proxied = any(request.headers.get(h) for h in ("X-Forwarded-For", "X-Real-IP", "Forwarded", "Via",
+                                                   "X-Forwarded-Host", "X-Original-URL", "X-ARR-LOG-ID"))
+    return request.remote_addr in ("127.0.0.1", "::1") and not proxied and not os.environ.get("VERCEL")
 
 
 def _client_ip() -> str:
@@ -2048,7 +2053,7 @@ def secretary_procedures():
         # ALIO 공시본 대비 최신성(scripts/alio_sync.mjs 가 만든 상태 파일 — 없으면 null)
         "alio": _sec_alio_status(),
         "ai": _sec_ai_status(),
-        "insights": {"available": bool(_sec_ins_backend()), "min_n": max(1, int(_sec_ins_cfg().get("min_n") or 3))},
+        "insights": {"available": bool(_sec_ins_backend()), "min_n": _sec_ins_cfg()["min_n"]},
         "admin": {"token_required": bool(REG_UPLOAD_TOKEN) or _gh_enabled(),
                   "github": _gh_enabled()},
     })
@@ -2283,12 +2288,25 @@ def secretary_config_save():
     erp_in = body.get("erp") if isinstance(body.get("erp"), dict) else {}
     hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (erp_in.get("hosts") or [])[:20]) if h]
     cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40)}
-    # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다
+    # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다.
+    # 저장소를 잠깐 못 읽었을 때 배포본의 옛 설정으로 덮어쓰지 않게, 읽기 실패(404 외)면 저장을 멈춘다.
+    if _gh_enabled():
+        try:
+            _gh("GET", f"/contents/{SEC_CONFIG_REPO_PATH}", params={"ref": GITHUB_BRANCH})
+        except Exception as e:
+            if getattr(e, "status", 0) != 404:
+                return jsonify({"success": False, "error": "저장소의 현재 설정을 읽지 못해 저장을 멈췄습니다. 잠시 뒤 다시 저장하세요."}), 503
     cur = _sec_config(force=True)
     for k in ("audit", "insights"):
         v = body.get(k) if isinstance(body.get(k), dict) else cur.get(k)
         if isinstance(v, dict) and v and len(json.dumps(v, ensure_ascii=False)) < 20000:
             cfg[k] = v
+    if "insights" in cfg:                                   # 숫자가 아닌 최소 인원("3명" 등)이 앱 전체를 멈추지 않게
+        ins = dict(cfg["insights"])
+        ins["min_n"] = _sec_int(ins.get("min_n"), 3, 1, 100)
+        if "enabled" in ins:
+            ins["enabled"] = ins["enabled"] not in (False, 0, "0", "false", "False", "off", "")
+        cfg["insights"] = ins
     payload = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     try:
         where = _sec_save_repo_file(SEC_CONFIG_REPO_PATH, SEC_CONFIG_PATH, payload,
@@ -3283,9 +3301,17 @@ _SEC_INS_HITS: dict = {}
 _SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft")
 
 
+def _sec_int(v, default: int, lo: int, hi: int) -> int:
+    """설정의 숫자 — '3명'·빈 값·이상한 값은 기본값으로, 범위 밖은 범위 안으로."""
+    m = re.search(r"-?\d+", str(v if v is not None else ""))
+    return max(lo, min(hi, int(m.group()))) if m else default
+
+
 def _sec_ins_cfg() -> dict:
     c = {"enabled": True, "min_n": 3}
-    c.update(_sec_config().get("insights") or {})
+    v = _sec_config().get("insights")
+    c.update(v if isinstance(v, dict) else {})
+    c["min_n"] = _sec_int(c.get("min_n"), 3, 1, 100)
     return c
 
 
@@ -3447,7 +3473,7 @@ def _sec_ins_summary(h: dict, rj: dict, min_n: int) -> dict:
 def secretary_insights():
     """?procedure=id → 그 절차의 집단 지식. 없으면 전체 요약(관리 화면용)."""
     be = _sec_ins_backend()
-    min_n = max(1, int(_sec_ins_cfg().get("min_n") or 3))
+    min_n = _sec_ins_cfg()["min_n"]
     if not be:
         return jsonify({"success": True, "available": False, "min_n": min_n})
     pid = request.args.get("procedure") or ""

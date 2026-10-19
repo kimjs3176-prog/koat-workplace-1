@@ -172,3 +172,13 @@ test("guard: 상신 버튼 이름 — 메뉴(결재요청함)·취소는 제외,
   for (const t of ["상신", "결재요청", "결재 상신하기", "제출", "서무확정요청", "여비정산신청", "출장신청"]) assert.ok(hit(t), t);
   for (const t of ["결재요청함", "결재상신함", "결재 요청 취소", "결재요청 현황", "보내기", "신청 내역"]) assert.ok(!hit(t), t);
 });
+
+test("parseSchedText: 회신·제출 기한과 'N일 전까지'는 일정 날짜가 아님, 끝나는 날은 기간일 때만", () => {
+  const a = plain(T.parseSchedText("10월 30일 오후 2시 운영위원회\n자료는 2일 전까지 제출", "2026-10-16"));
+  assert.deepEqual([a.title, a.date, a.end, a.time], ["운영위원회", "2026-10-30", "", "14:00"]);
+  const b = plain(T.parseSchedText("회신은 10월 25일까지\n10월 30일 회의", "2026-10-16"));
+  assert.deepEqual([b.title, b.date, b.end], ["회의", "2026-10-30", ""]);
+  const c = plain(T.parseSchedText("워크숍 10월 27일(화) ~ 10월 29일(목)", "2026-10-16"));
+  assert.deepEqual([c.date, c.end], ["2026-10-27", "2026-10-29"]);
+  assert.equal(T.schedTime("2:30 ~ 4:00"), "14:30");
+});

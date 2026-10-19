@@ -1297,7 +1297,7 @@ function schedTime(t){
   if(!m) return '';
   let h=Number(m[2]); const ap=(m[1]||'').toLowerCase(); const mi=m[3]?Number(m[3]):m[4]?Number(m[4]):m[5]?30:0;
   if((ap==='오후'||ap==='pm') && h<12) h+=12; if((ap==='오전'||ap==='am') && h===12) h=0;
-  if(!ap && !m[3] && h>=1 && h<=6) h+=12;                       // '3시 회의' → 근무 시간대(오후)로
+  if(!ap && h>=1 && h<=6) h+=12;                                // '3시 회의'·'2:30' → 근무 시간대(오후)로
   return String(h).padStart(2,'0')+':'+String(mi).padStart(2,'0');
 }
 function parseSchedText(text, base){
@@ -1311,12 +1311,24 @@ function parseSchedText(text, base){
   // 날짜·시각은 '일시:' 줄을 먼저, 없으면 본문 전체(머리글 줄 제외 — 보낸 날짜가 일정으로 잡히지 않게)
   const bodyNoHead=lines.filter(l=>!_MAIL_HEAD.test(l)).join('\n');
   // 일정 안내는 앞으로의 일 — '개최하기로 했습니다' 같은 말 때문에 작년 날짜로 읽지 않게 지난 일 표현을 뺀다
-  const pd=parseDates((when||bodyNoHead).replace(new RegExp(PAST_CUE.source,'g'),' '), base||today()); const ds=(pd.dates||[]).slice().sort();
+  let src=(when||bodyNoHead).replace(new RegExp(PAST_CUE.source,'g'),' ');
+  if(!when){
+    // '일시:' 줄이 없으면 본문에서 찾되, 회신·제출 기한 줄과 'N일 전까지' 같은 상대 기한은 일정 날짜가 아니다
+    const keep=src.split('\n').filter(l=>!/회신|제출|마감|송부|회람|신청\s*기한|까지\s*(?:알려|보내|답)/.test(l));
+    if(keep.some(l=>(parseDates(l, base||today()).dates||[]).length)) src=keep.join('\n');
+    src=src.replace(/\d{1,3}\s*일\s*(?:전|후|뒤)(?:까지)?/g,' ');
+  }
+  // 문서에 처음 나온 날짜가 시작일 — 끝나는 날은 '~'·'부터'로 이어진 기간일 때만
+  const pd=parseDates(src, base||today()); const ds=(pd.dates||[]).filter(Boolean);
+  const ranged=ds.length>1 && ds[1]>ds[0] && /(?:일|\d)\s*(?:\([^)]{1,4}\))?\s*(?:[~∼–]|-(?!\d{2}\b)|부터)/.test(src);
   const time=schedTime(when||bodyNoHead.split('\n').find(l=>/\d\s*(?::|시)/.test(l)&&!/\d{4}[.\-\/]\d/.test(l.replace(/\d{1,2}:\d{2}/,'')))||when||bodyNoHead);
-  let title=subj||lines.find(l=>!_MAIL_HEAD.test(l) && !/^(일시|일정|시간|장소|위치|기간)\s*[:：]/.test(l) && /[가-힣a-z]{2}/i.test(l) && l.length<=80)||'';
+  const DUE=/회신|제출|마감|송부|회람|신청\s*기한/;
+  let title=subj||lines.find(l=>!_MAIL_HEAD.test(l) && !/^(일시|일정|시간|장소|위치|기간)\s*[:：]/.test(l) && !DUE.test(l) && /[가-힣a-z]{2}/i.test(l) && l.length<=80)||'';
+  // 제목 줄 앞의 날짜·시각('10월 30일 오후 2시 운영위원회')은 일정 칸에 따로 들어가므로 뗀다
+  if(!subj) title=title.replace(/^(?:\s*(?:\d{4}\s*[.\-\/년]\s*)?\d{1,2}\s*(?:월\s*\d{1,2}\s*일|[\/.]\s*\d{1,2})(?:\s*\([^)]{1,4}\))?|\s*(?:오전|오후)?\s*\d{1,2}\s*(?::\s*\d{2}|시(?:\s*\d{1,2}\s*분|\s*반)?))+\s*/,'').trim()||title;
   title=title.replace(/^((re|fw|fwd|회신|전달)\s*[:：]\s*)+/i,'').replace(/^\[[^\]]{0,20}\]\s*/,'').replace(/\s+/g,' ').trim().slice(0,80);
   const memo=place?'장소: '+place:'';
-  return {title, date:ds[0]||'', end:ds[1]&&ds[1]>ds[0]&&!when.match(/(?:^|\D)\d{1,2}:\d{2}\s*[~\-–]\s*\d{1,2}:\d{2}/)?ds[ds.length-1]:'', time, memo:memo.slice(0,500)};
+  return {title, date:ds[0]||'', end:ranged?ds[ds.length-1]:'', time, memo:memo.slice(0,500)};
 }
 // .ics(일정 초대장) — VEVENT 의 제목·시작·끝·장소. 여러 개면 모두
 function parseIcs(text){
@@ -1976,8 +1988,8 @@ function formValues(d, vals){
     [f.l, f.l.replace(/\s+/g,''), ...(FIELD_ALIASES[f.k]||[])].forEach(k=>{ if(!(k in out)) out[k]=v; }); });
   return out;
 }
-async function formsFill(key, d, vals){
-  const mine=myForms(key); if(!mine) return;
+async function formsFill(key, d, vals, once){
+  const mine=once||myForms(key); if(!mine) return;
   const rep=await formsCall('fill', {form:mine.b64, values:formValues(d, vals)}, d.title);
   if(!rep) return;
   const got=new Set(rep.filled||[]);
@@ -1990,9 +2002,11 @@ function formsUpload(key, d, file){
   if(file.size>5*1024*1024){ toast('서식 파일은 5MB까지입니다.'); return; }
   const r=new FileReader();
   r.onload=()=>{ const b64=String(r.result).replace(/^data:[^,]*,/,'');
-    myForms(key, {name:file.name.replace(/\.hwpx$/i,''), b64});
+    const f={name:file.name.replace(/\.hwpx$/i,''), b64};
+    // 큰 서식은 이 브라우저에 기억하지 않고 이번 한 번만 채운다 — 저장 공간(약 5MB)을 처리 이력과 함께 쓰기 때문
+    if(b64.length<=1.5*1024*1024) myForms(key, f); else toast('서식이 커서(1MB 넘음) 기억하지 않고 이번에만 채웁니다.', 4200);
     const row=document.getElementById('secFormsRow'); if(row) row.innerHTML=formsRow(key);
-    formsFill(key, d, S._draft.vals); };
+    formsFill(key, d, S._draft.vals, f); };
   r.readAsDataURL(file);
 }
 
