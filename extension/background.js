@@ -282,6 +282,9 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((m, sender, reply) => {
+  // 진단 기록 읽기·지우기·칸 넣기·주소 등록은 확장 자신의 화면(옆 패널·진단 센터·설정)에서 온 것만 받는다 — ERP 화면 안 스크립트가 부르지 못하게
+  const fromExt = String(sender.url || "").startsWith(chrome.runtime.getURL(""));   // 작은 창·탭으로 연 확장 화면도 포함(내용 스크립트는 ERP 주소)
+  if (m && (/^diag\./.test(m.type || "") || m.type === "insert" || m.type === "hostsChanged") && !fromExt) { reply && reply({ ok: false, error: "허용되지 않은 요청" }); return; }
   // ── 진단 기록 ──
   if (m.type === "log") { diag(m.src || "content", m.ev, m.data, sender); return; }
   if (m.type === "diag.get") {

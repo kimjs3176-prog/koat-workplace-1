@@ -43,7 +43,13 @@ function personal(){ const p=_ls(LS_PERSONAL,{}); p.procedures=Array.isArray(p.p
 function savePersonal(p){ _lsPut(LS_PERSONAL,p); }
 function cases(){ const c=_ls(LS_CASES,[]); return Array.isArray(c)?c:[]; }
 function saveCases(c){
-  c=c.slice(0,300);
+  if(c.length>300){   // 300건을 넘으면 오래된 '완료' 건부터 지운다 — 진행 중인 건은 알림 없이 사라지지 않게
+    const drop=new Set(c.map((x,i)=>({x,i})).filter(o=>o.x.status==='done').sort((a,b)=>(a.x.updated||0)-(b.x.updated||0))
+      .slice(0, c.length-300).map(o=>o.i));
+    c=c.filter((x,i)=>!drop.has(i));
+    if(drop.size) toast(`처리 이력이 300건을 넘어 오래된 완료 건 ${drop.size}건을 정리했습니다. 보관하려면 이력 화면에서 내보내기 하세요.`, 5200);
+    if(c.length>400) c=c.slice(0,400);                // 진행 중인 건만 400건이 넘는 경우(비정상)만 자른다
+  }
   let ok=_lsQuiet(LS_CASES, c);
   if(!ok){   // 저장 공간이 차면 영수증 미리보기 사진부터 줄인다 — 지금 건 것만 남기고, 그래도 안 되면 모두
     const strip=keep=>c.forEach(x=>{ if(x.id!==keep) (x.receipts||[]).forEach(r=>{ delete r.thumb; }); });
@@ -99,7 +105,9 @@ async function load(force){
       S.cfg=d.config||S.cfg; S.holidays=d.holidays||{}; S.status=d.status||{}; S.regCount=d.regs||0; S.revised=d.revised||[]; S.alio=d.alio||null; S.ai=d.ai||{available:false}; S.insights=d.insights||{available:false}; S.ins={};
       S.common=d.common||S.common; S.org=d.org||S.org; S.admin=d.admin||{}; S.loaded=true;
       try{ reconcileAll(); }catch(e){}
-      applyBranding(); checkPersonal();
+      applyBranding();
+      // 개인 절차 호환성 결과가 늦게 오면 그때 한 번 다시 그린다(다음 화면 갱신까지 알림이 늦지 않게)
+      checkPersonal().then(()=>{ if(Object.values(S.pstatus||{}).some(x=>x&&x.ok===false) && document.getElementById('secWrap')) render(); });
     }catch(e){ S.loaded=false; throw e; }
     finally{ S.loading=null; }
   })();
@@ -247,16 +255,19 @@ function updateCase(fn){ return updateCaseById(S.caseId, fn); }
 // 건마다 저장 당시의 단계 키 목록(sk·pk)을 두고, 절차가 바뀌었으면 키로 찾아 번호를 다시 맞춘다.
 function _h(t){ let h=5381; for(const ch of String(t||'')) h=((h<<5)+h+ch.codePointAt(0))|0; return (h>>>0).toString(36); }
 function stepKey(st){ return st&&st.k ? String(st.k) : 'h'+_h(st&&st.t); }
-function procKeys(p){ return {sk:(p.steps||[]).map(stepKey), pk:(p.pitfalls||[]).map(x=>'h'+_h(x&&x.t))}; }
+// 키는 [[erp]] 같은 명칭을 바꾸기 전 원문으로 만든다 — 기관 설정에서 명칭을 바꿔도 체크가 사라지지 않게
+function procKeys(p){ const r=(typeof rawProc==='function' && p && p.id && rawProc(p.id)) || p;
+  return {sk:(r.steps||[]).map(stepKey), pk:(r.pitfalls||[]).map(x=>'h'+_h(x&&x.t)), pkT:(p.pitfalls||[]).map(x=>'h'+_h(x&&x.t))}; }
 function reconcileCase(c, p){
   if(!c||!p) return false;
-  const {sk, pk}=procKeys(p); let changed=false;
-  const remap=(old, now, vals, pre)=>{          // vals: {번호(접두어 포함): 값}
+  const {sk, pk, pkT}=procKeys(p); let changed=false;
+  const remap=(old, now, vals, pre, alt)=>{          // vals: {번호(접두어 포함): 값}
     const at={}; old.forEach((k,i)=>{ if(!(k in at)) at[k]=i; });
     const out={};
     for(const [key,v] of Object.entries(vals||{})){
       const m=String(key).match(pre?/^p(\d+)$/:/^(\d+)$/); if(!m){ out[key]=v; continue; }   // 'r…'·'s…' 같은 다른 항목은 그대로
-      const j=now.indexOf(old[Number(m[1])]); if(j>=0) out[(pre||'')+j]=v;                      // 사라진 단계의 체크는 버린다
+      let j=now.indexOf(old[Number(m[1])]); if(j<0 && alt) j=alt.indexOf(old[Number(m[1])]);   // 예전 판(명칭을 바꾼 문장으로 만든 키)
+      if(j>=0) out[(pre||'')+j]=v;                      // 사라진 단계의 체크는 버린다
     }
     return out;
   };
@@ -264,7 +275,7 @@ function reconcileCase(c, p){
   if(!c.sk){ c.sk=sk; changed=true; }                                   // 예전 건: 지금 순서를 기준으로 삼는다
   else if(!same(c.sk, sk)){ c.checks=remap(c.sk, sk, c.checks); c.checkAt=remap(c.sk, sk, c.checkAt); c.sk=sk; changed=true; }
   if(!c.pk){ c.pk=pk; changed=true; }
-  else if(!same(c.pk, pk)){ c.pchecks=remap(c.pk, pk, c.pchecks, 'p'); c.pk=pk; changed=true; }
+  else if(!same(c.pk, pk)){ c.pchecks=remap(c.pk, pk, c.pchecks, 'p', pkT); c.pk=pk; changed=true; }
   return changed;
 }
 function reconcileAll(){
@@ -279,16 +290,19 @@ function normCase(c){
   const str=(v,n)=>typeof v==='string'?v.slice(0,n||200):'';
   const D=/^\d{4}-\d{2}-\d{2}$/; const obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
   const dates={}; for(const [k,v] of Object.entries(obj(c.dates))) if(typeof v==='string'&&D.test(v)) dates[String(k).slice(0,30)]=v;
+  const keys=v=>Array.isArray(v)?v.slice(0,80).map(x=>String(x).slice(0,40)):undefined;
   const flags=v=>{ const o={}; for(const [k,x] of Object.entries(obj(v))) if(x) o[String(k).slice(0,40)]=true; return o; };
   const receipts=(Array.isArray(c.receipts)?c.receipts:[]).slice(0,20).filter(r=>r&&typeof r==='object').map(r=>({
     id:str(r.id,40)||uid(), name:str(r.name,60), date:D.test(r.date||'')?r.date:'', end_date:D.test(r.end_date||'')?r.end_date:'',
     amount:Math.max(0,Math.round(Number(r.amount)||0)), vendor:str(r.vendor,80), kind:str(r.kind,20), payment:str(r.payment,20),
     nights:Math.max(0,Math.round(Number(r.nights)||0)), route:str(r.route,80), items:str(r.items,200), note:str(r.note,200),
-    confidence:str(r.confidence,10), ai:!!r.ai, thumb:/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.thumb||'')?r.thumb:undefined }));
+    confidence:str(r.confidence,10), ai:!!r.ai, region:str(r.region,40), thumb:/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.thumb||'')?r.thumb:undefined }));
   const drafts={}; for(const [k,v] of Object.entries(obj(c.drafts))){ const o={}; for(const [f,x] of Object.entries(obj(v))) if(typeof x==='string') o[String(f).slice(0,40)]=x.slice(0,4000); drafts[String(k).slice(0,40)]=o; }
   return {id:str(c.id,40), procId:str(c.procId,48), title:str(c.title,120), created:D.test(c.created||'')?c.created:today(), updated:Number(c.updated)||Date.now(),
     query:str(c.query,200), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
-    status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined};
+    status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined,
+    // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
+    sk:keys(c.sk), pk:keys(c.pk)};
 }
 function reusableCase(pid, ds){
   return cases().filter(x=>x.procId===pid && x.status!=='done').sort((a,b)=>(b.updated||0)-(a.updated||0))
@@ -393,7 +407,17 @@ function render(){
   else if(S.view==='manage') body=manageView();
   else if(S.view==='edit') body=editView();
   else if(S.view==='ext') body=extView();
+  // 입력하다 화면이 다시 그려져도 그 칸(포커스·커서)과 스크롤 위치를 지킨다 — 같은 화면일 때만
+  const ae=document.activeElement, same=S._lastView===S.view;
+  const sig=el=>el&&el!==document.body&&w.contains(el)?el.tagName+(el.id?'#'+el.id:'')+[...el.attributes].filter(a=>/^data-|^name$/.test(a.name)).map(a=>`[${a.name}="${a.value}"]`).join(''):'';
+  const keep=same?{sig:sig(ae), ss:ae&&ae.selectionStart, se:ae&&ae.selectionEnd, y:window.scrollY}:null;
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
+  S._lastView=S.view;
+  if(keep){
+    if(keep.sig){ const el=[...w.querySelectorAll(ae.tagName)].find(x=>sig(x)===keep.sig);
+      if(el){ try{ el.focus({preventScroll:true}); if(keep.ss!=null && el.setSelectionRange) el.setSelectionRange(keep.ss, keep.se); }catch(e){} } }
+    if(Math.abs(window.scrollY-keep.y)>2) window.scrollTo(0, keep.y);
+  }
   if(S.view==='proc') loadOpenBasis();
   if(S.view==='forms') loadForms();
 }
@@ -438,8 +462,9 @@ function syncDeadlines(){
     const lo=addDays(today(),-60), hi=addDays(today(),60);
     const items=allDeadlines().filter(d=>d.date>=lo && d.date<=hi).slice(0,200)
       .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}))
-      .concat(scheds().filter(x=>!x.done && x.date>=today() && x.date<=hi).slice(0,50)      // 내 일정(오늘 이후)도 확장 배지·알림에
-        .map(x=>({date:x.date, proc:'일정', step:schedLabel(x).slice(0,80), caseId:'sch:'+x.id, i:0, optional:false})));
+      // 내 일정(오늘 이후, 이미 시작했지만 아직 안 끝난 여러 날 일정 포함)도 확장 배지·알림에 — 진행 중이면 오늘 날짜로(지난 기한으로 보이지 않게)
+      .concat(scheds().filter(x=>!x.done && (x.end||x.date)>=today() && x.date<=hi).slice(0,50)
+        .map(x=>({date:x.date>=today()?x.date:today(), proc:'일정', step:schedLabel(x).slice(0,80), caseId:'sch:'+x.id, i:0, optional:false})));
     const key=JSON.stringify(items); if(key===_dlLast) return; _dlLast=key;
     if(EMBED) toExt({type:'deadlines', items});
     else window.postMessage({src:'koat-sec', type:'deadlines', items}, location.origin);
@@ -632,9 +657,10 @@ async function loadOpenBasis(){
     const [i,bi]=key.split(':').map(Number); const b=((p.steps[i]||{}).basis||[])[bi]; if(!b) continue;
     const ck=JSON.stringify(b);
     let d=S.basisCache[ck];
-    if(!d){ try{ const qs=new URLSearchParams({reg:b.reg}); if(b.art) qs.set('art',b.art); if(b.q) qs.set('q',b.q);
-        const r=await fetch('/api/secretary/basis?'+qs); d=await r.json(); }catch(e){ d={success:false,error:'근거를 불러오지 못했습니다.'}; }
-      S.basisCache[ck]=d; }
+    if(!d){ let keep=true;   // 네트워크·서버 오류는 기억하지 않는다 — 다시 펼치면 다시 불러오게
+      try{ const qs=new URLSearchParams({reg:b.reg}); if(b.art) qs.set('art',b.art); if(b.q) qs.set('q',b.q);
+        const r=await fetch('/api/secretary/basis?'+qs); keep=r.status<500; d=await r.json(); }catch(e){ keep=false; d={success:false,error:'근거를 불러오지 못했습니다. 다시 펼치면 다시 불러옵니다.'}; }
+      if(keep) S.basisCache[ck]=d; }
     const el=document.getElementById(`secb_${i}_${bi}`); if(!el) continue;
     if(!d.success){ el.innerHTML=`<div class="sec-basis-err">${esc(d.error||'근거를 찾지 못했습니다.')}</div>`; continue; }
     const t=String(d.text||'').replace(/^(\S.*?제\s*\d+\s*조(?:의\s*\d+)?\s*[(（][^)）]*[)）])\s*/,'');
@@ -803,8 +829,8 @@ async function saveConfig(cfg, okMsg){
   const tok=(document.getElementById('secTokG')||{}).value||S._tok||'';
   if(S.admin.token_required && !tok){ toast('위쪽에 관리자 토큰을 입력하세요.'); const el=document.getElementById('secTokG'); if(el) el.focus(); return false; }
   try{ const r=await fetch('/api/secretary/config',{method:'POST',headers:{'Content-Type':'application/json','X-Upload-Token':tok},
-      body:JSON.stringify({config:cfg, editor:_ls(LS_EDITOR,'')})});
-    const d=await r.json(); if(!d.success){ toast(d.error||'저장하지 못했습니다.', 4200); return false; }
+      body:JSON.stringify({config:cfg, editor:_ls(LS_EDITOR,''), base:String((S.cfg||{}).updated||'')})});
+    const d=await r.json(); if(!d.success){ toast(d.error||'저장하지 못했습니다.', 5200); if(d.conflict){ await load(true); render(); } return false; }
     S._tok=tok; S._cfgDraft=null; S._aliasDraft=null; S.regMap=null; toast(okMsg||d.message, 4200);
     await load(true); render(); return true;
   }catch(e){ toast('서버에 저장하지 못했습니다.'); return false; }
@@ -962,9 +988,9 @@ async function saveOrg(list, tokArg){
   if(editor) _lsPut(LS_EDITOR, editor);
   try{
     const r=await fetch('/api/secretary/org',{method:'POST',headers:{'Content-Type':'application/json','X-Upload-Token':tok},
-      body:JSON.stringify({procedures:list, drafts:S.org.drafts||{}, editor})});
+      body:JSON.stringify({procedures:list, drafts:S.org.drafts||{}, editor, base:String((S.org||{}).updated||'')})});
     const d=await r.json();
-    if(!d.success){ toast(d.error||'저장하지 못했습니다.', 4200); return false; }
+    if(!d.success){ toast(d.error||'저장하지 못했습니다.', 5200); if(d.conflict){ try{ await load(true); }catch(e){} render(); } return false; }
     S._tok=tok; S.org=d.org||S.org; toast(d.message||'기관 절차를 저장했습니다.', 4200);
     try{ await load(true); }catch(e){} return true;
   }catch(e){ toast('서버에 저장하지 못했습니다.'); return false; }
@@ -1278,7 +1304,8 @@ const _D=/^\d{4}-\d{2}-\d{2}$/, _T=/^([01]\d|2[0-3]):[0-5]\d$/;
 function normSched(x){
   if(!x||typeof x!=='object'||!_D.test(x.date||'')||typeof x.title!=='string'||!x.title.trim()) return null;
   return {id:String(x.id||uid()).slice(0,40), date:x.date, end:_D.test(x.end||'')&&x.end>x.date?x.end:'', time:_T.test(x.time||'')?x.time:'',
-    title:x.title.trim().slice(0,80), memo:typeof x.memo==='string'?x.memo.slice(0,500):'', done:!!x.done};
+    title:x.title.trim().slice(0,80), memo:typeof x.memo==='string'?x.memo.slice(0,500):'', done:!!x.done,
+    ...(typeof x.uid==='string'&&x.uid?{uid:x.uid.slice(0,200)}:{})};          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
 }
 function scheds(){ const a=_ls(LS_SCHED,[]); return Array.isArray(a)?a.map(normSched).filter(Boolean):[]; }
 function saveScheds(a){ const ok=_lsPut(LS_SCHED, a.slice(0,1000)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
@@ -1343,7 +1370,8 @@ function parseIcs(text){
     const s0=dt(get('DTSTART')); if(!s0) continue; const e0=dt(get('DTEND'));
     let end=''; if(e0){ end=e0.t?e0.d:addDays(e0.d,-1); if(end<=s0.d) end=''; }   // 종일 일정의 DTEND 는 다음 날
     const loc=get('LOCATION');
-    out.push({title:(get('SUMMARY')||'일정').slice(0,80), date:s0.d, end, time:s0.t, memo:[loc?'장소: '+loc:'', get('DESCRIPTION').slice(0,300)].filter(Boolean).join('\n')});
+    out.push({title:(get('SUMMARY')||'일정').slice(0,80), date:s0.d, end, time:s0.t, memo:[loc?'장소: '+loc:'', get('DESCRIPTION').slice(0,300)].filter(Boolean).join('\n'),
+      uid:get('UID').slice(0,200), repeat:!!get('RRULE')});
   }
   return out;
 }
@@ -1385,10 +1413,16 @@ async function schedFromDrop(dt, day){
   const files=[...(dt&&dt.files||[])];
   for(const f of files){
     const name=(f.name||'').toLowerCase(); if(f.size>2e6) continue;
-    if(name.endsWith('.ics')||f.type==='text/calendar'){ const evs=parseIcs(await f.text());
-      if(evs.length>1){ if(!confirm(`초대장에 일정 ${evs.length}건이 있습니다. 모두 내 일정에 추가할까요?`)) return;
-        const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.`); render(); return; }
-      if(evs.length===1){ openSched(null, day, evs[0]); return; } }
+    if(name.endsWith('.ics')||f.type==='text/calendar'){ const got=parseIcs(await f.text());
+      // 이미 넣은 초대장(같은 UID)은 다시 넣지 않는다 · 반복 일정은 첫 회만 들어간다고 알린다
+      const have=new Map(scheds().filter(x=>x.uid).map(x=>[x.uid,x]));
+      const evs=got.filter(e=>!e.uid||!have.has(e.uid)); const dup=got.length-evs.length;
+      const rep=got.some(e=>e.repeat)?' 반복 일정은 첫 회만 넣었습니다.':'';
+      if(!evs.length && got.length===1){ const old=have.get(got[0].uid); toast('이미 추가한 초대장입니다 — 저장된 일정을 엽니다.', 3200); openSched(old.id); return; }
+      if(!evs.length && dup){ toast(`초대장의 일정 ${dup}건은 이미 추가돼 있습니다.`, 3200); return; }
+      if(evs.length>1){ if(!confirm(`초대장에 새 일정 ${evs.length}건이 있습니다${dup?`(이미 넣은 ${dup}건 제외)`:''}. 모두 내 일정에 추가할까요?`)) return;
+        const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.${rep}`, rep?5200:2600); render(); return; }
+      if(evs.length===1){ openSched(null, day, evs[0]); if(rep) toast(rep.trim(), 4200); return; } }
     if(name.endsWith('.eml')||f.type==='message/rfc822'){ const u8=new Uint8Array(await f.arrayBuffer()); let b='';
       for(let i=0;i<u8.length;i+=8192) b+=String.fromCharCode.apply(null, u8.subarray(i,i+8192));
       openSched(null, day, parseSchedText(emlToText(b))); return; }
@@ -1424,7 +1458,7 @@ function openSched(id, date, pre){
       toast(r.date?'메일 내용으로 채웠습니다. 확인 후 저장하세요.':'날짜를 찾지 못했습니다. 날짜를 직접 넣어 주세요.', 3600); return; }
     const all=scheds(); const i=cur?all.findIndex(y=>y.id===cur.id):-1; const v=k=>(body.querySelector(`[data-sk="${k}"]`)||{}).value||'';
     if(b.dataset.sk==='save'){
-      const n=normSched({id:cur?cur.id:uid(), date:v('date'), end:v('end'), time:v('time'), title:v('title'), memo:v('memo'), done:cur?cur.done:false});
+      const n=normSched({id:cur?cur.id:uid(), date:v('date'), end:v('end'), time:v('time'), title:v('title'), memo:v('memo'), done:cur?cur.done:false, uid:(cur||x).uid});
       if(!n){ toast(v('title').trim()?'날짜를 넣어 주세요.':'제목을 입력하세요.'); return; }
       if(v('end') && v('end')<v('date')){ toast('끝나는 날이 시작일보다 앞입니다.'); return; }
       if(i>=0) all[i]=n; else all.push(n);
@@ -1494,12 +1528,15 @@ function calIcs(){
     return ['BEGIN:VEVENT',`UID:${e.caseId}-${e.i}@secretary`,'DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z',
       'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${e.proc} — ${e.step.replace(/[.。]$/,'').slice(0,50)}`),'END:VEVENT'].join('\r\n'); });
   const stamp='DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z';
-  sc.forEach(x=>{ const d=x.date.replace(/-/g,''); const ev2=['BEGIN:VEVENT',`UID:sch-${x.id}@secretary`,stamp];
-    if(x.time && !x.end){ const hm=x.time.replace(':',''); const [h,mi]=x.time.split(':').map(Number); const eh=String(Math.min(23,h+1)).padStart(2,'0');
-      ev2.push(`DTSTART:${d}T${hm}00`,`DTEND:${d}T${eh}${String(mi).padStart(2,'0')}00`); }       // 시각만 있으면 1시간 일정(현지 시각)
+  let tz=false;
+  sc.forEach(x=>{ const d=x.date.replace(/-/g,''); const ev2=['BEGIN:VEVENT',`UID:${x.uid||`sch-${x.id}@secretary`}`,stamp];
+    if(x.time){ const hm=x.time.replace(':',''); const [h,mi]=x.time.split(':').map(Number); const eh=String(Math.min(23,h+1)).padStart(2,'0');
+      // 시각이 있으면 한국 시각으로(받는 캘린더의 시간대와 상관없이) 1시간 — 여러 날이면 끝나는 날 같은 시각까지
+      ev2.push(`DTSTART;TZID=Asia/Seoul:${d}T${hm}00`,`DTEND;TZID=Asia/Seoul:${(x.end||x.date).replace(/-/g,'')}T${eh}${String(mi).padStart(2,'0')}00`); tz=true; }
     else ev2.push('DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+addDays(x.end||x.date,1).replace(/-/g,''));
     ev2.push('SUMMARY:'+icsEsc(x.title)); if(x.memo) ev2.push('DESCRIPTION:'+icsEsc(x.memo)); ev2.push('END:VEVENT'); body.push(ev2.join('\r\n')); });
-  const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...body,'END:VCALENDAR'].map(icsFold).join('\r\n');
+  const vtz=tz?['BEGIN:VTIMEZONE','TZID:Asia/Seoul','BEGIN:STANDARD','DTSTART:19700101T000000','TZOFFSETFROM:+0900','TZOFFSETTO:+0900','TZNAME:KST','END:STANDARD','END:VTIMEZONE']:[];
+  const ics=['BEGIN:VCALENDAR','VERSION:2.0',`PRODID:-//${o.short||'ORG'}//Secretary//KO`,'CALSCALE:GREGORIAN',...vtz,...body,'END:VCALENDAR'].map(icsFold).join('\r\n');
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([ics],{type:'text/calendar;charset=utf-8'}));
   a.download=`서무비서_업무달력_${today()}.ics`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
   toast(`📅 기한 ${ev.length}건${sc.length?` · 일정 ${sc.length}건`:''}을 캘린더 파일로 받았습니다.`, 3600);
@@ -1874,7 +1911,7 @@ function insightHtml(p){
     (d.late||[]).forEach(x=>{ const s=(p.steps||[])[x.i]; if(s) rows.push(`<li><b>${x.i+1}단계</b>에서 <b>${Math.round(x.rate*100)}%</b>가 기한을 넘겼습니다 <span class="sec-sub">— ${esc(s.t.slice(0,40))}…</span></li>`); });
     (d.audit||[]).slice(0,2).forEach(x=>rows.push(`<li>사전 감사에서 자주 걸린 항목: <b>${esc(AU_KIND[x.k]||x.k)}</b> <span class="sec-sub">(${x.c}건)</span></li>`));
   }
-  const rs=(d.reasons||[]).slice(0,3);
+  const rs=(d.reasons||[]).filter(x=>x.c>=2).slice(0,3);   // 한 번만 들어온 사유는 보이지 않는다(장난·실수 글이 바로 모두에게 보이지 않게) — 관리 화면에서는 모두 보고 지울 수 있다
   if(!rows.length && !rs.length) return `<div class="sec-card sec-ins"><div class="sec-card-h">👥 우리 기관 데이터</div><div class="sec-hint">아직 데이터가 적습니다(${d.n}/${d.min_n}건). 완료 처리한 건이 ${d.min_n}건 이상 모이면 처리 기간·자주 넘기는 기한을 알려 드립니다.</div></div>`;
   return `<div class="sec-card sec-ins"><div class="sec-card-h">👥 우리 기관 데이터 <span class="sec-sub">${d.n}건 익명 통계</span></div>`+
     (rows.length?`<ul class="sec-tips">${rows.join('')}</ul>`:`<div class="sec-hint">처리 통계는 ${d.min_n}건 이상 모이면 보여 드립니다(지금 ${d.n}건).</div>`)+

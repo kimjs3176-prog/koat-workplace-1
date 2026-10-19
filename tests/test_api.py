@@ -95,3 +95,21 @@ def test_local_admin_not_behind_proxy(client):
     """토큰이 없는 서버: 같은 PC 프록시(X-Real-IP 등)를 거친 127.0.0.1 요청은 '이 컴퓨터'로 보지 않는다."""
     r = client.post("/api/secretary/config", json={"config": {"org": {"name": "x"}}}, headers={"X-Real-IP": "10.9.9.9"})
     assert r.status_code == 401
+
+
+def test_upload_delete_without_slug_is_json_400(client):
+    """slug 없는 폼 요청도 HTML 415 가 아니라 JSON 400 으로."""
+    r = client.post("/api/regs/upload/delete", data={"x": "1"})
+    assert r.status_code == 400 and r.is_json
+
+
+def test_upload_limit_matches_announced(client):
+    assert api_server.app.config["MAX_CONTENT_LENGTH"] >= api_server.REG_UPLOAD_MAX_MB * 1024 * 1024
+
+
+def test_save_conflict_409(client):
+    """화면이 불러온 판(base)과 저장된 판이 다르면 덮어쓰지 않는다(파일은 바뀌지 않음)."""
+    r = client.post("/api/secretary/config", json={"config": {"org": {"name": "x"}}, "base": "1999-01-01 00:00"})
+    assert r.status_code == 409 and r.get_json()["conflict"]
+    r = client.post("/api/secretary/org", json={"procedures": [], "base": "1999-01-01 00:00"})
+    assert r.status_code == 409
