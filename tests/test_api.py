@@ -113,3 +113,33 @@ def test_save_conflict_409(client):
     assert r.status_code == 409 and r.get_json()["conflict"]
     r = client.post("/api/secretary/org", json={"procedures": [], "base": "1999-01-01 00:00"})
     assert r.status_code == 409
+
+
+def test_ask_search_only_without_ai(client):
+    """AI 키가 없으면 관련 조문만(답은 내지 않음)."""
+    d = client.post("/api/secretary/ask", json={"q": "경조사 휴가 며칠"}).get_json()
+    assert d["success"] and d["mode"] == "search" and not d["found"] and d["candidates"]
+    assert any(c["reg"] == "복무규정" for c in d["candidates"])
+
+
+def test_ask_ai_answer_requires_verified_quote(client, monkeypatch):
+    """AI 답은 인용문이 실제 조문에 있을 때만 보여 준다(지어낸 인용이면 답을 감춘다)."""
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    q = "경조사 휴가 며칠"
+    items = api_server._sec_related_items(q, n=14, semantic=False)
+    real = next(x for x in items if x["reg"] == "복무규정" and x["art"] == "34")
+    sentence = real["text"][40:100].replace("하 고는", "하고는")   # 조문 안 문장(띄어쓰기 차이는 무시하고 확인)
+    calls = {}
+
+    def fake(system, text, schema, image=None, effort="low"):
+        ids = schema["properties"]["citations"]["items"]["properties"]["id"]["enum"]
+        aid = next(i for i in ids if f"[{i}] 「복무규정」 제34조" in text)
+        return {"found": True, "answer": "결혼 5일 등입니다.", "caution": "",
+                "citations": [{"id": aid, "quote": calls.get("quote", sentence)}]}
+    monkeypatch.setattr(api_server, "_sec_ai_json", fake)
+    d = client.post("/api/secretary/ask", json={"q": q}).get_json()
+    assert d["mode"] == "ai" and d["found"] and d["answer"]
+    assert d["citations"][0]["verified"] and d["citations"][0]["art"] == "34"
+    calls["quote"] = "본인 결혼 시 30일의 특별휴가를 준다"           # 조문에 없는 문장
+    d = client.post("/api/secretary/ask", json={"q": q}).get_json()
+    assert not d["found"] and not d["answer"] and d["candidates"]

@@ -361,7 +361,8 @@ async function start(opts){
 function ask(q){
   q=String(q||'').trim(); S.query=q;
   if(!q){ S.view='home'; render(); return; }
-  S.matches=match(q); S.related=null; S.basisOpen={}; S.aiRes=null;
+  S.matches=match(q); S.related=null; S.basisOpen={}; S.aiRes=null; S.regAns=null;
+  if(isRegQuestion(q) && aiOn()) setTimeout(()=>askRegs(q), 0);       // '며칠·얼마·되나요' 같은 물음이면 규정에서 답도 찾는다
   const lp=localPlan(q, S.matches);
   if(lp) S.aiRes={q, ids:lp, local:true, summary:'여러 업무가 함께 있는 상황으로 보고 필요한 절차를 순서대로 모았습니다.'};
   else setTimeout(()=>aiUnderstand(q), 0);
@@ -583,7 +584,7 @@ function procView(){
       (c&&c.status!=='done'?`<button class="sec-btn sm ghost" data-a="casedone">완료</button>`:'')+
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
-  return aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
+  return regAnsBox()+aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
     `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
@@ -677,7 +678,7 @@ function noMatchView(){
       `<span class="sec-rel-h"><b>${esc(it.reg)} 제${esc(it.art)}조</b>${it.art_title?` (${esc(it.art_title)})`:''}${it.src==='semantic'?'<span class="sec-layer org">의미</span>':''}</span>`+
       `<span class="sec-rel-p">${esc(String(it.preview||'').replace(/^.*?[)）]\s*/,'').slice(0,160))}…</span></button>`).join('')+`</div>`
       :`<div class="sec-empty">관련 조문을 찾지 못했습니다. 다른 표현으로 말해 보세요.</div>`);
-  return aiBox()+`<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
+  return regAnsBox()+aiBox()+`<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
     `<div class="sec-hint">대신 관련 있어 보이는 규정 조문을 찾았습니다. 자주 하는 일이라면 <b>규정·절차 관리</b>에서 절차로 등록해 두면 다음부터 단계별로 안내합니다.</div>${list}`+
     `<div class="sec-row"><button class="sec-btn" data-a="formsq" data-q="${esc(S.query)}">📎 서식·규정에서 찾기</button><button class="sec-btn ghost" data-a="newproc">＋ 이 상황을 절차로 등록</button><button class="sec-btn ghost" data-a="view" data-v="list">절차 목록 보기</button></div></div>`;
 }
@@ -1219,6 +1220,7 @@ function bind(panel){
       case 'calmove': { const n=Number(D.d); if(!n){ S.calYM=null; } else { let {y,m}=S.calYM; m+=n; if(m<1){m=12;y--;} if(m>12){m=1;y++;} S.calYM={y,m}; } render(); break; }
       case 'calics': calIcs(); break;
       case 'aiask': aiUnderstand(S.query, true); break;
+      case 'regask': askRegs(S.query, true); break;
       case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
@@ -1720,6 +1722,34 @@ function openAiKey(){
       if(!/^[\x21-\x7e]{20,300}$/.test(key)){ toast('키 형식이 올바르지 않습니다 — 공백·한글 없이 키 전체를 붙여 넣으세요.', 4200); return; }
       _lsPut(LS_AIKEY,{provider,key}); closeModal('secAiKeyModal'); toast('AI 분석을 켰습니다.'); if(S.query){ S.aiRes=null; aiUnderstand(S.query,true); } else render(); }
     else if(b.dataset.ak==='del'){ try{ localStorage.removeItem(LS_AIKEY); }catch(_){} closeModal('secAiKeyModal'); toast('키를 지웠습니다.'); render(); } });
+}
+// ── 규정 질의응답 — 찾은 조문 안에서만 답하고(서버가 인용문을 조문에서 확인), 근거가 확인되지 않으면 조문만 보여 준다
+const REG_Q=/[?？]\s*$|며칠|몇\s*(일|번|회|개|시간|명|박)|얼마|언제까지|되나요|되나\b|돼\s*\?|가능(한가|할까|해|하나)|인가요|있나요|없나요|해야\s*(하나|돼|되나)|맞나요|안\s*되|기준이?|한도|상한|며칠/;
+function isRegQuestion(q){ return REG_Q.test(String(q||'')); }
+async function askRegs(q, force){
+  if(!q) return; if(!force && S.regAns && S.regAns.q===q) return;
+  S.regAns={q, loading:true}; render();
+  let d=null;
+  try{ const r=await fetch('/api/secretary/ask',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({q})}); d=await r.json(); }
+  catch(e){ d={success:false, error:'서버에 연결하지 못했습니다.'}; }
+  if(S.query!==q) return;                          // 그사이 다른 물음으로 바뀌었으면 버린다
+  S.regAns=Object.assign({q}, d&&d.success?d:{error:(d&&d.error)||'답을 찾지 못했습니다.', candidates:(d&&d.candidates)||[]});
+  render();
+}
+function regAnsBox(){
+  const a=S.regAns;
+  // 물음 꼴이면 저절로 찾고, 아니면(AI 가 켜져 있을 때) 직접 누를 수 있게
+  if(!a || a.q!==S.query) return S.query&&aiOn()?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="regask">📖 규정에서 답 찾기</button></div>`:'';
+  if(a.loading) return `<div class="sec-notice reg"><div class="assist-loading sm"><div class="spinner"></div><span>📖 규정 조문에서 답을 찾는 중...</span></div></div>`;
+  const art=c=>`<button class="sec-mini" data-a="openreg" data-reg="${esc(c.reg)}" data-art="${esc(c.art)}">「${esc(c.reg)}」 제${esc(c.art)}조${c.art_title?'('+esc(c.art_title)+')':''}</button>`;
+  const cands=(a.candidates||[]).slice(0,4);
+  const candHtml=cands.length?`<div class="sec-reg-c"><span class="sec-sub">관련 조문</span>${cands.map(art).join('')}</div>`:'';
+  if(a.error) return `<div class="sec-notice reg">📖 ${esc(a.error)}${candHtml}</div>`;
+  if(!a.found) return `<div class="sec-notice reg"><div>📖 <b>규정에서 바로 답을 찾지 못했습니다.</b> ${esc(a.note||(a.mode==='search'?'AI를 켜면 조문을 읽고 답해 드립니다.':''))}</div>${candHtml}</div>`;
+  const cites=(a.citations||[]).map(c=>`<div class="sec-reg-q">${art(c)}${c.quote?`<q>${esc(c.quote)}</q>`:''}${c.revision?`<span class="sec-sub">${esc(c.revision)}</span>`:''}</div>`).join('');
+  return `<div class="sec-notice reg"><div>📖 <b>규정 답변</b> <span class="sec-sub">우리 기관 내규 조문 기준 · 최종 판단은 원문과 담당 부서 확인</span></div>`+
+    `<div class="sec-reg-a">${esc(a.answer).replace(/\n/g,'<br>')}</div>`+(a.caution?`<div class="sec-sub">⚠ ${esc(a.caution)}</div>`:'')+
+    `<div class="sec-reg-cites">${cites}</div></div>`;
 }
 function aiBox(){
   const a=S.aiRes; if(!a || a.q!==S.query) return aiOn()&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 분석하기</button></div>`:(S.query?aiKeyHint():'');
