@@ -65,7 +65,21 @@ function findings() {
   const order = { high: 0, mid: 1, info: 2, good: 3 };
   return out.sort((a, b) => order[a.sev] - order[b.sev]);
 }
+// ── ERP 규칙 제안: 기록에서 '제출 버튼 후보'와 '못 알아본 업무 화면'을 뽑아 기관 설정 칸 형식으로 ──
+const rxEsc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function suggestion() {
+  const L = curLog();
+  const submit = uniq(L.filter((e) => e.ev === "button" && e.d && !e.d.submit && !e.d.menu && e.d.tag !== "a"
+    && /상신|결재|제출|신청$|요청$|올림|Submit|Approv/i.test(e.d.label || "") && !MENU_LIKE.test(e.d.label || "")).map((e) => e.d.label)).slice(0, 15);
+  const none = {}; L.filter((e) => e.ev === "detect.none" && e.d && e.d.url).forEach((e) => { none[e.d.url] = (e.d.texts || []).filter((t) => t && t.length <= 20); });
+  const screens = Object.entries(none).slice(0, 15).map(([u, ts]) => `주소:${rxEsc(u)} => ? | ${ts[0] || ""}   # 화면 글: ${ts.slice(0, 4).join(" · ")}`);
+  const parts = [];
+  if (submit.length) parts.push("[제출 버튼 이름]\n" + submit.join("\n"));
+  if (screens.length) parts.push("[화면 규칙]\n" + screens.join("\n"));
+  return parts.join("\n\n") || "제안할 것이 없습니다. ERP에서 서무비서를 써 본 뒤(상신 버튼 누르기·업무 화면 열기) 다시 보세요.";
+}
 function renderFindings() {
+  if ($("suggest")) $("suggest").textContent = suggestion();
   const icon = { high: "⛔", mid: "⚠️", info: "ℹ️", good: "✅" };
   $("findings").innerHTML = findings().map((f) => `<li class="${f.sev}"><b>${icon[f.sev]} ${esc(f.title)}</b>${f.fix ? `<div class="fix">→ ${esc(f.fix)}</div>` : ""}</li>`).join("");
 }
@@ -130,6 +144,7 @@ function summary() {
     none.length ? "업무를 알아보지 못한 화면의 제목 문구:\n" + none.map((x) => "- " + x).join("\n") : "", btn.length ? "누른 결재 관련 버튼: " + btn.join(", ") : ""].filter(Boolean).join("\n\n");
 }
 
+$("sugCopy").addEventListener("click", () => navigator.clipboard.writeText($("suggest").textContent).then(() => toast("제안을 복사했습니다. 기관 설정 › ERP 화면 규칙에 붙여 넣으세요.")).catch(() => toast("복사하지 못했습니다.")));
 $("on").addEventListener("change", async (e) => { await chrome.runtime.sendMessage({ type: "diag.enable", on: e.target.checked }); toast(e.target.checked ? "진단 기록을 켰습니다." : "진단 기록을 껐습니다."); });
 $("snap").addEventListener("click", async () => {
   const id = Number($("tabs").value); if (!id) { toast("ERP 탭을 먼저 여세요."); return; }

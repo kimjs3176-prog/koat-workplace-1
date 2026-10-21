@@ -302,7 +302,7 @@ function normCase(c){
     query:str(c.query,200), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
     status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined,
     // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
-    sk:keys(c.sk), pk:keys(c.pk)};
+    sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{})};
 }
 function reusableCase(pid, ds){
   return cases().filter(x=>x.procId===pid && x.status!=='done').sort((a,b)=>(b.updated||0)-(a.updated||0))
@@ -361,7 +361,8 @@ async function start(opts){
 function ask(q){
   q=String(q||'').trim(); S.query=q;
   if(!q){ S.view='home'; render(); return; }
-  S.matches=match(q); S.related=null; S.basisOpen={}; S.aiRes=null;
+  S.matches=match(q); S.related=null; S.basisOpen={}; S.aiRes=null; S.regAns=null;
+  if(isRegQuestion(q) && aiOn()) setTimeout(()=>askRegs(q), 0);       // '며칠·얼마·되나요' 같은 물음이면 규정에서 답도 찾는다
   const lp=localPlan(q, S.matches);
   if(lp) S.aiRes={q, ids:lp, local:true, summary:'여러 업무가 함께 있는 상황으로 보고 필요한 절차를 순서대로 모았습니다.'};
   else setTimeout(()=>aiUnderstand(q), 0);
@@ -583,7 +584,7 @@ function procView(){
       (c&&c.status!=='done'?`<button class="sec-btn sm ghost" data-a="casedone">완료</button>`:'')+
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
-  return aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
+  return regAnsBox()+aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
     `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
@@ -677,7 +678,7 @@ function noMatchView(){
       `<span class="sec-rel-h"><b>${esc(it.reg)} 제${esc(it.art)}조</b>${it.art_title?` (${esc(it.art_title)})`:''}${it.src==='semantic'?'<span class="sec-layer org">의미</span>':''}</span>`+
       `<span class="sec-rel-p">${esc(String(it.preview||'').replace(/^.*?[)）]\s*/,'').slice(0,160))}…</span></button>`).join('')+`</div>`
       :`<div class="sec-empty">관련 조문을 찾지 못했습니다. 다른 표현으로 말해 보세요.</div>`);
-  return aiBox()+`<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
+  return regAnsBox()+aiBox()+`<div class="sec-card"><div class="sec-card-h">🔎 "${esc(S.query)}" — 등록된 절차가 없어요</div>`+
     `<div class="sec-hint">대신 관련 있어 보이는 규정 조문을 찾았습니다. 자주 하는 일이라면 <b>규정·절차 관리</b>에서 절차로 등록해 두면 다음부터 단계별로 안내합니다.</div>${list}`+
     `<div class="sec-row"><button class="sec-btn" data-a="formsq" data-q="${esc(S.query)}">📎 서식·규정에서 찾기</button><button class="sec-btn ghost" data-a="newproc">＋ 이 상황을 절차로 등록</button><button class="sec-btn ghost" data-a="view" data-v="list">절차 목록 보기</button></div></div>`;
 }
@@ -808,6 +809,54 @@ function packCard(){
     `<label class="sec-btn sm ghost">⬆ 가져오기<input type="file" accept=".json,application/json" data-a="packfile" hidden></label></div>`+prev+
     `<div class="sec-hint">팩에는 절차·초안 서식과, 절차가 참조하는 규정의 이름·개정 정보가 함께 들어갑니다. 받는 기관은 가져온 뒤 <b>규정명 매핑</b>으로 자기 규정에 연결합니다.</div></div>`;
 }
+// ── 관리: ERP 화면 규칙(다른 ERP 에서도) — 바탕 묶음 + 기관 맞춤. 저장하면 모든 사용자 확장에 반영 ─────────
+const ERP_RULE_KEYS=['submit','screens','skip','labels'];
+function erpRulesText(e, k){
+  if(S._erpRaw && S._erpRaw[k]!=null) return S._erpRaw[k];
+  if(k==='submit') return (e.submit_words||[]).join('\n');
+  if(k==='screens') return (e.screen_rules||[]).map(r=>`${r.by==='url'?'주소':'제목'}:${r.match} => ${r.proc}${r.q?' | '+r.q:''}`).join('\n');
+  if(k==='skip') return (e.skip_paths||[]).join('\n');
+  const lb=e.labels||{}; return [['시작','start'],['끝','end'],['제외','ignore']].filter(([,x])=>(lb[x]||[]).length).map(([n,x])=>`${n}: ${lb[x].join(', ')}`).join('\n');
+}
+// 칸 글 → 규칙(잘못된 줄은 problems 에 모은다)
+function erpRulesParse(k, txt){
+  const lines=String(txt||'').split('\n').map(x=>x.replace(/\s+#.*$/,'').trim()).filter(Boolean); const problems=[];
+  const rxOk=r=>{ try{ new RegExp(r); return r.length<=200; }catch(e){ return false; } };
+  if(k==='submit') return {val:{submit_words:[...new Set(lines.flatMap(l=>l.split(',')).map(x=>x.trim()).filter(Boolean))].slice(0,40)}, problems};
+  if(k==='skip'){ lines.forEach(l=>{ if(!rxOk(l)) problems.push(`제외 주소 '${l}' — 정규식이 올바르지 않습니다`); }); return {val:{skip_paths:lines.filter(rxOk)}, problems}; }
+  if(k==='labels'){ const o={start:[],end:[],ignore:[]}; const map={'시작':'start','끝':'end','종료':'end','제외':'ignore'};
+    lines.forEach(l=>{ const m=l.match(/^(시작|끝|종료|제외)\s*[:：]\s*(.*)$/); if(!m){ problems.push(`칸 이름 '${l}' — "시작: 출발일, 출장일자" 꼴로 적으세요`); return; }
+      o[map[m[1]]].push(...m[2].split(',').map(x=>x.trim()).filter(Boolean)); });
+    return {val:{labels:o}, problems}; }
+  const ids=new Set(allProcs().map(p=>p.id)); const rules=[];
+  lines.forEach(l=>{ const m=l.match(/^(주소|제목|url|title)\s*[:：]\s*(.+?)\s*=>\s*([^\s|]+)\s*(?:\|\s*(.*))?$/i);
+    if(!m){ problems.push(`화면 규칙 '${l.slice(0,40)}' — "주소:/경로/ => 절차id | 물을 말" 꼴로 적으세요`); return; }
+    if(!rxOk(m[2])){ problems.push(`화면 규칙 '${m[2]}' — 정규식이 올바르지 않습니다`); return; }
+    if(!ids.has(m[3])){ problems.push(`화면 규칙 '${m[2]}' — 절차 id '${m[3]}'가 없습니다(절차 목록의 id를 넣으세요)`); return; }
+    rules.push({by:/^(주소|url)$/i.test(m[1])?'url':'title', match:m[2], proc:m[3], q:(m[4]||'').trim()}); });
+  return {val:{screen_rules:rules}, problems};
+}
+function erpRulesBlock(c){
+  const e=c.erp||{}; const P=S.erpPresets;
+  if(!P && !S._erpPresetsLoading){ S._erpPresetsLoading=true;
+    fetch('/api/secretary/erp/presets').then(r=>r.json()).then(d=>{ S.erpPresets=d; S._erpPresetsLoading=false; if(S.view==='manage') render(); }).catch(()=>{ S._erpPresetsLoading=false; }); }
+  const ps=(P&&P.presets)||{}; const cur=e.preset||'generic'; const pr=ps[cur]||{}; const prof=(P&&P.profile)||null;
+  const ta=(k,rows,ph,l,sub)=>`<label class="sec-f"><span>${l} <span class="sec-sub">${sub}</span></span><textarea data-a="cfgerprule" data-k="${k}" rows="${rows}" placeholder="${esc(ph)}">${esc(erpRulesText(e,k))}</textarea></label>`;
+  const procIds=allProcs().filter(p=>!p.hidden).map(p=>`${p.id}(${shortTitle(p.title)})`).join(', ');
+  return `<details class="sec-erp"${S._erpOpen?' open':''}><summary><b>🧩 ERP 화면 규칙</b> <span class="sec-sub">다른 ERP·그룹웨어에서도 — 화면 감지·결재 전 점검·입력값 점검이 쓰는 규칙(코드 수정 없이)</span></summary>`+
+    `<label class="sec-f"><span>바탕 규칙 묶음</span><select data-a="cfgerprule" data-k="preset">`+
+      (Object.keys(ps).length?Object.entries(ps).sort(([a],[b])=>(a==='generic'?-1:b==='generic'?1:0)).map(([k,v])=>`<option value="${esc(k)}"${k===cur?' selected':''}>${esc(v.name||k)}${v.verified===false?' — 검증 전':''}</option>`).join(''):`<option>${esc(cur)}</option>`)+`</select></label>`+
+    (pr.note?`<div class="sec-hint">${pr.verified===false?'⚠ ':''}${esc(pr.note)} <span class="sec-sub">묶음: 제출 버튼 ${(pr.submit_words||[]).length} · 화면 규칙 ${(pr.screen_rules||[]).length} · 제외 주소 ${(pr.skip_paths||[]).length}</span></div>`:'')+
+    `<div class="sec-hint">아래는 묶음 위에 <b>더하는 기관 맞춤 규칙</b>입니다. ERP에서 확장 진단 센터의 <b>🧩 ERP 규칙 제안</b>을 복사해 붙여 넣으면 됩니다.</div>`+
+    ta('submit',3,'결재상신\n여비정산신청','제출 버튼 이름(줄마다)','이름 전체가 같을 때만 결재 전 점검 — 메뉴 안 링크는 제외')+
+    ta('screens',4,'주소:/hr/trip/apply => domestic-trip | 출장 가요\n제목:여비\\s*청구 => domestic-trip','화면 규칙(줄마다)','"주소:정규식" 또는 "제목:정규식" => 절차 id | 물을 말')+
+    `<div class="sec-sub" style="margin:-4px 0 8px">절차 id: ${esc(procIds)}</div>`+
+    ta('skip',2,'/mail/\n/approval/list','업무 화면이 아닌 주소(줄마다 정규식)','메일·게시판·결재함 목록 등')+
+    ta('labels',3,'시작: 출장일자, 여행시작\n끝: 귀임일\n제외: 처리일자','입력값 점검 칸 이름','날짜 칸을 알아보는 이름 — 시작·끝·제외')+
+    (S._erpProblems&&S._erpProblems.length?`<div class="sec-notice warn">${S._erpProblems.map(esc).join('<br>')}</div>`:'')+
+    (prof?`<div class="sec-sub">지금 확장에 가는 규칙(저장된 것): 제출 버튼 ${prof.submit_words.length} · 화면 규칙 ${prof.screen_rules.length} · 제외 주소 ${prof.skip_paths.length} — 확장은 30분 안에 새 규칙을 받습니다.</div>`:'')+
+    `</details>`;
+}
 // ── 관리: 기관 설정 ─────────────────────────────────────────────────────
 function configCard(){
   const c=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); S._cfgDraft=c;
@@ -822,6 +871,7 @@ function configCard(){
     `<div class="sec-card-h" style="margin-top:6px;">명칭 <span class="sec-sub">절차 문장의 [[erp]] 등이 이 이름으로 바뀝니다</span></div>`+
     `<div class="sec-eg">${f('terms.erp','업무 시스템',t.erp,'ERP')}${f('terms.portal','내부 포털',t.portal,'그룹웨어')}${f('terms.accounting','회계 담당 부서',t.accounting,'회계부서')}${f('terms.approval','결재 시스템',t.approval,'전자결재')}</div>`+
     `<label class="sec-f"><span>ERP·그룹웨어 주소(줄마다 하나) <span class="sec-sub">🧩 ERP 확장 배포본에 들어갑니다. 예) https://kerp.koat.or.kr</span></span><textarea data-a="cfgerp" rows="2" placeholder="https://kerp.koat.or.kr">${esc(((c.erp||{}).hosts||[]).map(h=>h.replace(/\/\*$/,'')).join('\n'))}</textarea></label>`+
+    erpRulesBlock(c)+
     `<label class="sec-f"><span>기관 휴일(줄마다 "YYYY-MM-DD 이름") <span class="sec-sub">법정 공휴일은 기본 탑재 — 창립기념일·근로자의 날 등만 적으세요</span></span><textarea data-a="cfghol" rows="3" placeholder="2026-05-01 근로자의 날">${esc(hol)}</textarea></label>`+
     `<div class="sec-row"><button class="sec-btn primary sm" data-a="cfgsave">기관 설정 저장</button><span class="sec-sub">${S.cfg.updated?'최종 저장 '+esc(S.cfg.updated):''}</span></div></details>`;
 }
@@ -1188,7 +1238,7 @@ function bind(panel){
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -1210,7 +1260,10 @@ function bind(panel){
       case 'draft': openDraft(D.d); break;
       case 'aliassave': { const c=JSON.parse(JSON.stringify(S.cfg)); c.reg_aliases=Object.fromEntries(Object.entries(S._aliasDraft||{}).filter(([k,v])=>v));
         saveConfig(c, '규정명 매핑을 저장했습니다. 절차의 근거·서식이 새 연결로 열립니다.'); break; }
-      case 'cfgsave': { const c=S._cfgDraft||S.cfg; if(!String((c.org||{}).name||'').trim()){ toast('기관명을 입력하세요.'); break; } S._cfgOpen=true; saveConfig(c, '기관 설정을 저장했습니다.'); break; }
+      case 'cfgsave': { const c=S._cfgDraft||S.cfg; if(!String((c.org||{}).name||'').trim()){ toast('기관명을 입력하세요.'); break; } S._cfgOpen=true;
+        S._erpProblems=Object.entries(S._erpRaw||{}).flatMap(([k,v])=>erpRulesParse(k,v).problems);
+        if(S._erpProblems.length){ S._erpOpen=true; render(); toast('ERP 화면 규칙에 고칠 줄이 있습니다.', 4200); break; }
+        saveConfig(c, '기관 설정을 저장했습니다.').then(ok=>{ if(ok){ S._erpRaw=null; S.erpPresets=null; } }); break; }
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
@@ -1219,6 +1272,7 @@ function bind(panel){
       case 'calmove': { const n=Number(D.d); if(!n){ S.calYM=null; } else { let {y,m}=S.calYM; m+=n; if(m<1){m=12;y--;} if(m>12){m=1;y++;} S.calYM={y,m}; } render(); break; }
       case 'calics': calIcs(); break;
       case 'aiask': aiUnderstand(S.query, true); break;
+      case 'regask': askRegs(S.query, true); break;
       case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
@@ -1286,6 +1340,9 @@ function bind(panel){
     if(a==='formsin'){ S.formsQ=el.value; renderFormsList(); return; }
     if(a==='tokg'){ S._tok=el.value.trim(); return; }
     if(a==='cfg'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); const [g,k]=el.dataset.p.split('.'); c[g]=c[g]||{}; c[g][k]=el.value; return; }
+    if(a==='cfgerprule'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}); S._erpOpen=true;
+      const k=el.dataset.k; if(k==='preset'){ c.erp.preset=el.value; render(); return; }
+      S._erpRaw=S._erpRaw||{}; S._erpRaw[k]=el.value; Object.assign(c.erp, erpRulesParse(k, el.value).val); return; }
     if(a==='cfgerp'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}, {hosts:el.value.split('\n').map(x=>x.trim()).filter(Boolean)}); return; }
     if(a==='cfghol'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.holidays=c.holidays||{};
       c.holidays.extra=el.value.split('\n').map(l=>l.trim().match(/^(\d{4}-\d{2}-\d{2})\s*(.*)$/)).filter(Boolean).map(m=>({date:m[1], name:m[2]||'기관 휴일'})); return; }
@@ -1305,7 +1362,8 @@ function normSched(x){
   if(!x||typeof x!=='object'||!_D.test(x.date||'')||typeof x.title!=='string'||!x.title.trim()) return null;
   return {id:String(x.id||uid()).slice(0,40), date:x.date, end:_D.test(x.end||'')&&x.end>x.date?x.end:'', time:_T.test(x.time||'')?x.time:'',
     title:x.title.trim().slice(0,80), memo:typeof x.memo==='string'?x.memo.slice(0,500):'', done:!!x.done,
-    ...(typeof x.uid==='string'&&x.uid?{uid:x.uid.slice(0,200)}:{})};          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
+    ...(typeof x.uid==='string'&&x.uid?{uid:x.uid.slice(0,200)}:{}),
+    ...(typeof x.caseId==='string'&&x.caseId?{caseId:x.caseId.slice(0,40)}:{})};            // caseId: 이 일정으로 만든 처리 건(일정 → 업무 연결)          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
 }
 function scheds(){ const a=_ls(LS_SCHED,[]); return Array.isArray(a)?a.map(normSched).filter(Boolean):[]; }
 function saveScheds(a){ const ok=_lsPut(LS_SCHED, a.slice(0,1000)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
@@ -1434,6 +1492,34 @@ async function schedFromDrop(dt, day){
   if(/BEGIN:VEVENT/.test(txt)){ const evs=parseIcs(txt); if(evs.length){ openSched(null, day, evs[0]); return; } }
   openSched(null, day, parseSchedText(txt));
 }
+// ── 일정 → 업무 연결: 출장·교육·행사 같은 일정이면 그 절차의 처리 건을 만들어 기한(사전 신청·사후 정산)을 달력·알림에 올린다
+function linkableProcs(){ return allProcs().filter(p=>!p.hidden && (p.dates||[]).length && (p.steps||[]).some(s=>s.deadline)); }
+function schedProcGuess(t){
+  const ok=new Set(linkableProcs().map(p=>p.id));
+  const m=match(t).filter(x=>ok.has(x.p.id) && x.hit.length);       // 트리거 낱말이 실제로 들어 있을 때만(제목 한 낱말 겹침은 약함)
+  return m.length?m[0].p:null;
+}
+function schedDates(p, n){ const o={}; (p.dates||[]).forEach(d=>{ if(d.k==='start') o.start=n.date; else if(d.k==='end') o.end=n.end||n.date; }); return o; }
+function linkSchedCase(n, pid){
+  const p=getProc(pid); if(!p) return null;
+  const all=cases(); let c=n.caseId?all.find(x=>x.id===n.caseId):null;
+  if(c && c.procId!==pid) c=null;                                     // 다른 업무로 바꿨으면 새 건
+  const ds=schedDates(p, n);
+  if(c){ c.dates=Object.assign({}, c.dates||{}, ds); c.updated=Date.now(); }
+  else { c=Object.assign({id:uid(), procId:p.id, title:`${shortTitle(p.title)} · ${n.title}`.slice(0,120), created:today(), updated:Date.now(), query:n.title,
+      dates:ds, checks:{}, note:'', drafts:{}, status:'open', schedId:n.id}, procKeys(p)); all.unshift(c); }
+  if(!saveCases(all)) return null;
+  n.caseId=c.id;
+  return {c, p, due:(p.steps||[]).filter(s=>stepDue(s, c.dates)).length};
+}
+function schedLinkRow(x){
+  const ps=linkableProcs(); if(!ps.length) return '';
+  const linkedCase=x.caseId?cases().find(c=>c.id===x.caseId):null;
+  const sel=linkedCase?getProc(linkedCase.procId):(x.id?null:schedProcGuess((x.title||'')+' '+(x.memo||'')));
+  return `<div class="sec-link"><label><input type="checkbox" data-sk="link"${sel?' checked':''}> 🔗 업무로 연결</label>`+
+    `<select data-sk="proc" aria-label="연결할 업무"><option value="">— 업무 고르기 —</option>`+ps.map(p=>`<option value="${esc(p.id)}"${sel&&sel.id===p.id?' selected':''}>${esc(p.icon||'')} ${esc(shortTitle(p.title))}</option>`).join('')+`</select>`+
+    `<span class="sec-sub">${linkedCase?'연결된 처리 건의 기준일을 이 일정 날짜로 맞춥니다.':'처리 건을 만들어 사전 신청·사후 정산 같은 기한을 달력·알림에 올립니다.'}</span></div>`;
+}
 function openSched(id, date, pre){
   const cur=id?scheds().find(x=>x.id===id):null;
   const x=cur||Object.assign({id:'', date:'', end:'', time:'', title:'', memo:'', done:false}, pre||{});
@@ -1447,10 +1533,17 @@ function openSched(id, date, pre){
     `<label class="sec-f"><span>끝나는 날(여러 날)</span><input type="date" data-sk="end" value="${esc(x.end)}"></label>`+
     `<label class="sec-f"><span>시각(선택)</span><input type="time" data-sk="time" value="${esc(x.time)}"></label></div>`+
     `<label class="sec-f"><span>메모</span><textarea data-sk="memo" rows="2" maxlength="500" placeholder="장소·준비물·담당자 등">${esc(x.memo)}</textarea></label>`+
+    schedLinkRow(x)+
     `<div class="sec-hint">내 일정은 <b>이 브라우저에만</b> 저장됩니다. 업무 달력·이번 주 할 일·캘린더 파일(.ics)·확장 알림에 함께 나옵니다.</div>`+
     `<div class="sec-row"><button class="sec-btn primary" data-sk="save">저장</button>`+
+    (cur&&cur.caseId&&cases().some(c=>c.id===cur.caseId)?`<button class="sec-btn" data-sk="opencase">🔗 처리 건 열기</button>`:'')+
     (cur?`<button class="sec-btn" data-sk="done">${cur.done?'↩ 완료 취소':'✓ 완료'}</button><button class="sec-btn ghost" data-sk="del">삭제</button>`:'')+`</div>`;
   setTimeout(()=>{ const t=body.querySelector('[data-sk="title"]'); t&&t.focus(); },0);
+  // 제목·메모를 고치면 연결할 업무 추측도 다시(사용자가 직접 고른 뒤에는 그대로)
+  body.oninput=e=>{ if(!/^(title|memo)$/.test(e.target.dataset.sk||'')) return; const sel=body.querySelector('[data-sk="proc"]'); if(!sel || sel.dataset.touched) return;
+    const g=schedProcGuess((body.querySelector('[data-sk="title"]').value||'')+' '+(body.querySelector('[data-sk="memo"]').value||''));
+    sel.value=g?g.id:''; const cb=body.querySelector('[data-sk="link"]'); if(cb) cb.checked=!!g; };
+  body.onchange=e=>{ if(e.target.dataset.sk==='proc'){ e.target.dataset.touched='1'; const cb=body.querySelector('[data-sk="link"]'); if(cb) cb.checked=!!e.target.value; } };
   body.onclick=e=>{ const b=e.target.closest('button[data-sk]'); if(!b) return;
     if(b.dataset.sk==='parse'){ const txt=(body.querySelector('[data-sk="paste"]')||{}).value||''; if(!txt.trim()){ toast('메일 내용을 붙여 넣으세요.'); return; }
       const r=parseSchedText(txt); const set=(k,v)=>{ const el=body.querySelector(`[data-sk="${k}"]`); if(el&&v) el.value=v; };
@@ -1461,11 +1554,19 @@ function openSched(id, date, pre){
       const n=normSched({id:cur?cur.id:uid(), date:v('date'), end:v('end'), time:v('time'), title:v('title'), memo:v('memo'), done:cur?cur.done:false, uid:(cur||x).uid});
       if(!n){ toast(v('title').trim()?'날짜를 넣어 주세요.':'제목을 입력하세요.'); return; }
       if(v('end') && v('end')<v('date')){ toast('끝나는 날이 시작일보다 앞입니다.'); return; }
+      if(cur && cur.caseId) n.caseId=cur.caseId;
+      const lk=body.querySelector('[data-sk="link"]'), pid=(body.querySelector('[data-sk="proc"]')||{}).value||'';
+      let linked=null;
+      if(lk && lk.checked && pid){ linked=linkSchedCase(n, pid); if(!linked) return; }
+      else if(lk && !lk.checked) delete n.caseId;                      // 연결을 끊어도 처리 건은 남긴다(이력)
       if(i>=0) all[i]=n; else all.push(n);
       if(!saveScheds(all)) return;
-      closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm}; toast(cur?'일정을 고쳤습니다.':'일정을 추가했습니다.'); render(); }
+      closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm};
+      toast(linked?`🔗 '${shortTitle(linked.p.title)}' 처리 건${cur&&cur.caseId===linked.c.id?'의 기준일을 고쳤':'을 만들었'}습니다 — 기한 ${linked.due}개를 달력·알림에 올렸습니다.`:(cur?'일정을 고쳤습니다.':'일정을 추가했습니다.'), linked?5200:2600);
+      if(typeof syncDeadlines==='function') syncDeadlines(); render(); }
+    else if(b.dataset.sk==='opencase' && cur){ const c=cases().find(y=>y.id===cur.caseId); closeModal('secSchedModal'); if(c){ S.query=''; S.matches=[]; selectProc(c.procId,{caseId:c.id}); } }
     else if(b.dataset.sk==='done' && i>=0){ all[i].done=!all[i].done; saveScheds(all); closeModal('secSchedModal'); render(); }
-    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
+    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?${all[i].caseId?' (연결된 처리 건은 처리 이력에 남습니다)':''}`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
   };
   body.onkeydown=e=>{ if(e.key==='Enter' && e.target.tagName==='INPUT' && e.target.dataset.sk!=='paste'){ e.preventDefault(); const b=body.querySelector('[data-sk="save"]'); b&&b.click(); } };
 }
@@ -1489,7 +1590,7 @@ function calView(){
   for(let d=1; d<=days; d++){ const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const w=(startW+d-1)%7; const hol=S.holidays[ds]; const list=by[ds]||[]; const sl=sby[ds]||[];
     const cls=['sec-cal-c', ds===t?'today':'', w===0||hol?'sun':'', w===6&&!hol?'sat':'', ds<t&&list.length?'past':''].filter(Boolean).join(' ');
-    const chips=[...sl.map(x=>`<button class="sec-cal-e sch${x.done?' done':''}" data-a="sched" data-id="${esc(x.id)}" title="${esc(schedLabel(x)+(x.memo?' — '+x.memo:''))}">🗓 ${esc(schedLabel(x))}</button>`),
+    const chips=[...sl.map(x=>`<button class="sec-cal-e sch${x.done?' done':''}" data-a="sched" data-id="${esc(x.id)}" title="${esc(schedLabel(x)+(x.memo?' — '+x.memo:'')+(x.caseId?' · 업무 연결됨':''))}">${x.caseId?'🔗':'🗓'} ${esc(schedLabel(x))}</button>`),
       ...list.map(e=>`<button class="sec-cal-e${e.date<t?' over':''}${e.optional?' opt':''}" data-a="case" data-id="${esc(e.caseId)}" title="${esc(e.proc+' — '+e.step)}">${esc(e.icon)} ${esc(e.proc)}</button>`)];
     cells.push(`<div class="${cls}" data-day="${ds}"><div class="sec-cal-d"><b>${d}</b>${hol?`<span class="sec-cal-h">${esc(hol)}</span>`:''}`+
       `<button class="sec-cal-add" data-a="schedadd" data-d="${ds}" title="${m}월 ${d}일 일정 추가" aria-label="${m}월 ${d}일 일정 추가">＋</button></div>`+
@@ -1720,6 +1821,34 @@ function openAiKey(){
       if(!/^[\x21-\x7e]{20,300}$/.test(key)){ toast('키 형식이 올바르지 않습니다 — 공백·한글 없이 키 전체를 붙여 넣으세요.', 4200); return; }
       _lsPut(LS_AIKEY,{provider,key}); closeModal('secAiKeyModal'); toast('AI 분석을 켰습니다.'); if(S.query){ S.aiRes=null; aiUnderstand(S.query,true); } else render(); }
     else if(b.dataset.ak==='del'){ try{ localStorage.removeItem(LS_AIKEY); }catch(_){} closeModal('secAiKeyModal'); toast('키를 지웠습니다.'); render(); } });
+}
+// ── 규정 질의응답 — 찾은 조문 안에서만 답하고(서버가 인용문을 조문에서 확인), 근거가 확인되지 않으면 조문만 보여 준다
+const REG_Q=/[?？]\s*$|며칠|몇\s*(일|번|회|개|시간|명|박)|얼마|언제까지|되나요|되나\b|돼\s*\?|가능(한가|할까|해|하나)|인가요|있나요|없나요|해야\s*(하나|돼|되나)|맞나요|안\s*되|기준이?|한도|상한|며칠/;
+function isRegQuestion(q){ return REG_Q.test(String(q||'')); }
+async function askRegs(q, force){
+  if(!q) return; if(!force && S.regAns && S.regAns.q===q) return;
+  S.regAns={q, loading:true}; render();
+  let d=null;
+  try{ const r=await fetch('/api/secretary/ask',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({q})}); d=await r.json(); }
+  catch(e){ d={success:false, error:'서버에 연결하지 못했습니다.'}; }
+  if(S.query!==q) return;                          // 그사이 다른 물음으로 바뀌었으면 버린다
+  S.regAns=Object.assign({q}, d&&d.success?d:{error:(d&&d.error)||'답을 찾지 못했습니다.', candidates:(d&&d.candidates)||[]});
+  render();
+}
+function regAnsBox(){
+  const a=S.regAns;
+  // 물음 꼴이면 저절로 찾고, 아니면(AI 가 켜져 있을 때) 직접 누를 수 있게
+  if(!a || a.q!==S.query) return S.query&&aiOn()?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="regask">📖 규정에서 답 찾기</button></div>`:'';
+  if(a.loading) return `<div class="sec-notice reg"><div class="assist-loading sm"><div class="spinner"></div><span>📖 규정 조문에서 답을 찾는 중...</span></div></div>`;
+  const art=c=>`<button class="sec-mini" data-a="openreg" data-reg="${esc(c.reg)}" data-art="${esc(c.art)}">「${esc(c.reg)}」 제${esc(c.art)}조${c.art_title?'('+esc(c.art_title)+')':''}</button>`;
+  const cands=(a.candidates||[]).slice(0,4);
+  const candHtml=cands.length?`<div class="sec-reg-c"><span class="sec-sub">관련 조문</span>${cands.map(art).join('')}</div>`:'';
+  if(a.error) return `<div class="sec-notice reg">📖 ${esc(a.error)}${candHtml}</div>`;
+  if(!a.found) return `<div class="sec-notice reg"><div>📖 <b>규정에서 바로 답을 찾지 못했습니다.</b> ${esc(a.note||(a.mode==='search'?'AI를 켜면 조문을 읽고 답해 드립니다.':''))}</div>${candHtml}</div>`;
+  const cites=(a.citations||[]).map(c=>`<div class="sec-reg-q">${art(c)}${c.quote?`<q>${esc(c.quote)}</q>`:''}${c.revision?`<span class="sec-sub">${esc(c.revision)}</span>`:''}</div>`).join('');
+  return `<div class="sec-notice reg"><div>📖 <b>규정 답변</b> <span class="sec-sub">우리 기관 내규 조문 기준 · 최종 판단은 원문과 담당 부서 확인</span></div>`+
+    `<div class="sec-reg-a">${esc(a.answer).replace(/\n/g,'<br>')}</div>`+(a.caution?`<div class="sec-sub">⚠ ${esc(a.caution)}</div>`:'')+
+    `<div class="sec-reg-cites">${cites}</div></div>`;
 }
 function aiBox(){
   const a=S.aiRes; if(!a || a.q!==S.query) return aiOn()&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 분석하기</button></div>`:(S.query?aiKeyHint():'');

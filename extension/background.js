@@ -78,7 +78,7 @@ async function registerExtraHosts() {
     }
   }
   if (extra.length) {
-    await chrome.scripting.registerContentScripts([{ id: "sec-erp-extra", matches: extra, js: ["config.js", "content.js", "guard.js"],
+    await chrome.scripting.registerContentScripts([{ id: "sec-erp-extra", matches: extra, js: ["config.js", "content.js", "checks.js", "guard.js"],
       allFrames: true, matchOriginAsFallback: true, runAt: "document_idle", persistAcrossSessions: true }]).catch((e) => console.warn(e));
   }
 }
@@ -161,10 +161,14 @@ async function getMeta(force) {
   if (!force && meta && Date.now() - meta.ts < 30 * 60 * 1000) return meta.data;
   try {
     const data = await (await fetch(server + "/api/secretary/erp/meta", { cache: "no-store" })).json();
-    if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); diag("bg", "meta.fetch", { ok: true, procedures: (data.procedures || []).length }); return data; }
+    if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); if (data.erp) SEC_PROFILE = secCompileProfile(data.erp); diag("bg", "meta.fetch", { ok: true, procedures: (data.procedures || []).length }); return data; }
   } catch (e) { diag("bg", "meta.fetch", { ok: false, err: e.message }); }
   return meta ? meta.data : null;
 }
+// 기관 ERP 규칙 — 서버 메타의 erp(없으면 배포본에 들어 있는 값). 내용 스크립트는 'profile' 메시지로 받는다
+async function erpProfile() { const m = await getMeta(); return (m && m.erp) || SEC_PROFILE_DEFAULT || null; }
+let _profileP = null;
+function profileReady() { return (_profileP = _profileP || erpProfile().then((p) => { SEC_PROFILE = secCompileProfile(p); }).catch(() => {})); }
 async function guardFor(ctx) {
   const s = await settings();
   if (!ctx || !ctx.proc) return null;
@@ -387,6 +391,8 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       reply({ ok: true });
     });
     return true;
+  } else if (m.type === "profile") {                     // 내용 스크립트: 기관 ERP 규칙
+    erpProfile().then((profile) => reply({ profile })).catch(() => reply({ profile: null })); return true;
   } else if (m.type === "settings") {
     settings().then(reply); return true;
   } else if (m.type === "hostsChanged") {
@@ -445,7 +451,9 @@ async function urlContext(tabId) {
   const listed = !!u && (erpHosts || []).some((h) => hostMatch(h, tab.url));
   if (!listed) return;                               // 권한 밖 주소는 탭 주소도 읽을 수 없다
   const path = u.pathname;
-  if (globalThis.SEC_SKIP_URL && SEC_SKIP_URL.test(path)) return;
+  await profileReady();
+  const R = secRules();
+  if (R.skip(path)) return;
   // 정말 화면 안에 들어갈 수 없는지 직접 확인(쉬고 깨어난 서비스 워커는 '붙어 있음' 기억이 없을 수 있다)
   let blocked = "";
   try {
@@ -456,8 +464,8 @@ async function urlContext(tabId) {
   if (!/not ready|Cannot access|cannot be scripted|No frame/i.test(blocked)) return;
   const title = String(tab.title || "").replace(/\s*[-–]\s*(Microsoft Edge|Chrome).*$/i, "").trim();
   let ctx = null;
-  for (const [i, [rx, q, proc]] of (SEC_RULES || []).entries()) { if (title && rx.test(title)) { ctx = { q, title: title.slice(0, 40), proc: proc || "", rank: i }; break; } }
-  if (!ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) { if (rx.test(path)) { ctx = { q, title: title || q, proc: proc || "", rank: (SEC_RULES || []).length + i }; break; } }
+  for (const [i, [rx, q, proc]] of R.title.entries()) { if (title && rx.test(title)) { ctx = { q, title: title.slice(0, 40), proc: proc || "", rank: i }; break; } }
+  if (!ctx) for (const [i, [rx, q, proc]] of R.url.entries()) { if (rx.test(path)) { ctx = { q, title: title || q, proc: proc || "", rank: R.title.length + i }; break; } }
   diag("bg", ctx ? "detect.tab" : "detect.tab.none", { url: path, title: title.slice(0, 60), err: blocked.slice(0, 80), note: "확장이 화면 안에 들어가지 못한 탭(IE 모드 등) — 주소·제목으로만 판단" }, { tab });
   if (ctx) { ctx.tabOnly = true; applyContext(tab, 0, ctx, { tab }); }
 }

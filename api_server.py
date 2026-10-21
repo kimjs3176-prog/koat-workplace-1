@@ -1811,6 +1811,31 @@ def _sec_ref_list(arr, n=6):
     return out
 
 
+_SEC_CHECK_KINDS = {"deadline", "lead", "nextmonth", "attach", "hours", "span"}
+
+
+def _sec_clean_check(c) -> dict | None:
+    """반려 점검 항목의 입력값 점검 규칙(확장이 ERP 화면 값으로 판정) — 정해진 꼴만 받는다."""
+    if not isinstance(c, dict) or c.get("kind") not in _SEC_CHECK_KINDS:
+        return None
+    out = {"kind": c["kind"]}
+    if c["kind"] in ("deadline", "lead", "nextmonth"):
+        if c.get("ref") not in ("start", "end"):
+            return None
+        out["ref"] = c["ref"]
+        key = "day" if c["kind"] == "nextmonth" else "days"
+        out[key] = _sec_int(c.get(key), 0, 0, 366)
+    elif c["kind"] == "hours":
+        out["max"] = _sec_int(c.get("max"), 4, 1, 24)
+    elif c["kind"] == "span":
+        for k in ("from", "to"):
+            v = str(c.get(k) or "")
+            if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", v):
+                return None
+            out[k] = v
+    return out
+
+
 def _sec_clean_proc(p: dict) -> dict | None:
     """관리자가 보낸 절차 1건 정규화. 허용된 필드·길이만 남긴다(화면에서 실행되는 값은 화이트리스트)."""
     if not isinstance(p, dict):
@@ -1871,6 +1896,9 @@ def _sec_clean_proc(p: dict) -> dict | None:
             x = {"t": _sec_clean_str(pf.get("t"), 300)}
             if pf.get("basis"):
                 x["basis"] = _sec_ref_list(pf.get("basis"), 3)
+            ck = _sec_clean_check(pf.get("check"))
+            if ck:
+                x["check"] = ck
             pitfalls.append(x)
     return {
         "id": pid, "title": title,
@@ -2182,14 +2210,26 @@ def secretary_related():
     q = (request.args.get("q") or "").strip()
     if len(q) < 2:
         return jsonify({"success": True, "items": []})
-    words = [w for w in re.split(r"[\s,.!?~·]+", q) if len(w) >= 2]
+    return jsonify({"success": True, "items": [{k: v for k, v in it.items() if k != "text"} for it in _sec_related_items(q)]})
+
+
+# 질문에 흔히 붙는 말 — 조문 찾기 점수에서 뺀다(모든 조문에 다 걸려 순위를 흐린다)
+_SEC_Q_STOP = {"어떻게", "얼마", "얼마나", "언제", "언제까지", "무엇", "뭔가요", "뭐야", "되나요", "되나", "가능", "가능한가요",
+               "있나요", "있어요", "하나요", "해야", "하면", "경우", "관련", "알려줘", "알려", "주세요", "궁금", "궁금해요", "어디",
+               "누가", "몇", "인가요", "건가요", "맞나요", "되는", "하는", "있는", "없는", "우리", "기관", "규정", "내규"}
+
+
+def _sec_related_items(q: str, n: int = 12, semantic: bool = True) -> list:
+    """상황·질문 문장 → 관련 조문 [{reg, art, art_title, preview, text, score, src}] (키워드 + 의미 검색)."""
+    words = [w for w in re.split(r"[\s,.!?？~·]+", q) if len(w) >= 2]
     # 조사·어미를 대충 떼어 낸 어간도 함께 본다("정산해야" → "정산")
     stems = set()
     for w in words:
         stems.add(w)
-        s = re.sub(r"(해야|하려면|하고|해서|했는데|하는|할|해요|합니다|에서|으로|에게|까지|부터|이랑|를|을|이|가|은|는|에|로|와|과|도|만)$", "", w)
+        s = re.sub(r"(해야|하려면|하고|해서|했는데|하는|할|해요|합니다|하나요|되나요|돼요|되면|하면|에서|으로|에게|까지|부터|이랑|를|을|이|가|은|는|에|로|와|과|도|만|면|요)$", "", w)
         if len(s) >= 2:
             stems.add(s)
+    stems -= _SEC_Q_STOP
     scored = []
     for t, no, at, text in _sec_chunks():
         head = (t + " " + (at or ""))
@@ -2209,17 +2249,18 @@ def secretary_related():
         if k in seen:
             continue
         seen.add(k)
-        items.append({"reg": t, "art": no, "art_title": at, "preview": text[:220], "score": sc, "src": "keyword"})
+        items.append({"reg": t, "art": no, "art_title": at, "preview": text[:220], "text": text, "score": sc, "src": "keyword"})
         if len(items) >= 8:
             break
-    for h in _semantic_for_search(q, top_k=6):
+    for h in (_semantic_for_search(q, top_k=6) if semantic else []):
         k = (h["title"], h["no"])
         if k in seen:
             continue
         seen.add(k)
+        hit = _sec_art(h["title"], h["no"])
         items.append({"reg": h["title"], "art": h["no"], "art_title": h["art_title"],
-                      "preview": h["preview"][:220], "score": h["score"], "src": "semantic"})
-    return jsonify({"success": True, "items": items[:12]})
+                      "preview": h["preview"][:220], "text": hit[3] if hit else h["preview"], "score": h["score"], "src": "semantic"})
+    return items[:n]
 
 
 def _sec_save_repo_file(repo_path: str, local_path: str, payload: str, message: str) -> str:
@@ -2338,7 +2379,7 @@ def secretary_config_save():
     import extension_build
     erp_in = body.get("erp") if isinstance(body.get("erp"), dict) else {}
     hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (erp_in.get("hosts") or [])[:20]) if h]
-    cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40)}
+    cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40), **_sec_clean_erp_rules(erp_in)}
     # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다.
     # 저장소를 잠깐 못 읽었을 때 배포본의 옛 설정으로 덮어쓰지 않게, 읽기 실패(404 외)면 저장을 멈춘다.
     if _gh_enabled():
@@ -2701,6 +2742,99 @@ def secretary_ai_understand():
                     "questions": [_sec_clean_str(x, 120) for x in (data.get("questions") or []) if isinstance(x, str)][:4],
                     "cautions": cautions[:4],
                     "provider": _sec_ai_provider()})
+
+
+# ── 규정 질의응답 — 찾은 조문 안에서만 답하고, 인용이 실제 조문에 있는지 서버가 확인한다 ────────────
+_SEC_ASK_SYSTEM = (
+    "당신은 한국 공공기관 직원의 내규 질문에 답하는 서무 비서입니다. 아래에 [A1]·[A2]… 번호를 붙인 우리 기관 내규 조문만 근거로 씁니다. "
+    "조문에 없는 내용은 추측하거나 일반 상식·법령으로 채우지 마세요. 조문으로 답할 수 없으면 found 를 false 로 두고 "
+    "answer 에 '제시된 조문에서 답을 찾지 못했다'는 취지와 확인할 곳(담당 부서)을 짧게 씁니다. "
+    "답할 수 있으면 answer 에 결론을 먼저 2~5문장으로 쓰고, 숫자(일수·금액·횟수·기한)는 조문 그대로 옮깁니다. "
+    "citations 에는 답의 근거가 된 조문 번호(id)와, 그 조문에서 그대로 복사한 핵심 문장(quote, 120자 이내)을 넣습니다. "
+    "quote 는 조문 원문과 글자가 같아야 하며 고쳐 쓰지 마세요. 해석이 갈리거나 예외가 있으면 caution 에 한 문장으로 적습니다."
+)
+
+
+def _sec_ask_norm(t: str) -> str:
+    return re.sub(r"[\s·ㆍ\u00b7「」『』\"'“”‘’]", "", str(t or ""))
+
+
+@app.route("/api/secretary/ask", methods=["POST"])
+def secretary_ask():
+    """규정 질문 → 관련 조문 + (AI 가 있으면) 조문을 인용한 답. 근거 인용이 확인되지 않으면 답을 내지 않는다."""
+    body = request.get_json(silent=True) or {}
+    q = _sec_clean_str(body.get("q"), 300)
+    if len(q) < 2:
+        return jsonify({"success": False, "error": "질문을 입력하세요."}), 400
+    items = _sec_related_items(q, n=14)
+    kw = [x for x in items if x["src"] == "keyword"]
+    sem = [x for x in items if x["src"] == "semantic"]
+    picks, seen = [], set()
+    for x in kw[:5] + sem[:4] + kw[5:] + sem[4:]:          # 키워드·의미 검색을 섞어 상위 8개
+        if (x["reg"], x["art"]) not in seen:
+            seen.add((x["reg"], x["art"])); picks.append(x)
+        if len(picks) >= 8:
+            break
+    rev = {}
+    for x in picks:
+        m, _ = _sec_resolve_reg(x["reg"])
+        rev[x["reg"]] = (m or {}).get("revision", "")
+    cands = [{"reg": x["reg"], "art": x["art"], "art_title": x["art_title"], "preview": x["preview"],
+              "src": x["src"], "revision": rev.get(x["reg"], "")} for x in picks]
+    if not picks:
+        return jsonify({"success": True, "mode": "search", "found": False, "answer": "", "citations": [], "candidates": []})
+    if not _sec_ai_provider() or body.get("search_only"):
+        return jsonify({"success": True, "mode": "search", "found": False, "answer": "", "citations": [], "candidates": cands})
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요.", "candidates": cands}), 429
+    ids = [f"A{i + 1}" for i in range(len(picks))]
+    ctx, budget = [], 16000
+    for i, x in zip(ids, picks):
+        t = str(x.get("text") or x["preview"])[:3000]
+        budget -= len(t)
+        if budget < 0:
+            break
+        ctx.append(f"[{i}] 「{x['reg']}」 제{x['art']}조{('(' + x['art_title'] + ')') if x['art_title'] else ''}\n{t}")
+    ids = ids[:len(ctx)]
+    schema = {
+        "type": "object",
+        "properties": {
+            "found": {"type": "boolean"},
+            "answer": {"type": "string"},
+            "citations": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string", "enum": ids}, "quote": {"type": "string"}},
+                "required": ["id", "quote"], "additionalProperties": False}},
+            "caution": {"type": "string"},
+        },
+        "required": ["found", "answer", "citations", "caution"],
+        "additionalProperties": False,
+    }
+    try:
+        data = _sec_ai_json(_SEC_ASK_SYSTEM, "조문:\n" + "\n\n".join(ctx) + "\n\n질문: " + q, schema, effort="medium")
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e), "candidates": cands}), 502
+    cites, used = [], set()
+    for c in data.get("citations") or []:
+        if not isinstance(c, dict) or c.get("id") not in ids:
+            continue
+        x = picks[ids.index(c["id"])]
+        quote_ = _sec_clean_str(c.get("quote"), 200)
+        # 인용문이 실제 조문에 있는지 확인 — 없으면(지어낸 문장) 인용문은 버리고 조문만 근거로 남긴다
+        ok = bool(quote_) and _sec_ask_norm(quote_) in _sec_ask_norm(x.get("text") or "")
+        key = (x["reg"], x["art"])
+        if key in used and not ok:
+            continue
+        used.add(key)
+        cites.append({"reg": x["reg"], "art": x["art"], "art_title": x["art_title"], "revision": rev.get(x["reg"], ""),
+                      "quote": quote_ if ok else "", "verified": ok})
+    verified = any(c["verified"] for c in cites)
+    found = bool(data.get("found")) and verified            # 확인된 인용이 하나도 없으면 답으로 내지 않는다
+    return jsonify({"success": True, "mode": "ai", "found": found,
+                    "answer": _sec_clean_str(data.get("answer"), 1200) if found else "",
+                    "note": "" if found else _sec_clean_str(data.get("answer"), 400) if not data.get("found") else
+                    "AI 답의 근거 문장을 조문에서 확인하지 못해 답을 보여 드리지 않습니다. 아래 조문을 직접 확인하세요.",
+                    "caution": _sec_clean_str(data.get("caution"), 300) if found else "",
+                    "citations": cites[:4] if found else [], "candidates": cands, "provider": _sec_ai_provider()})
 
 
 # ── 문서 초안 → 한글(.hwpx) ────────────────────────────────────────────────
@@ -3585,6 +3719,86 @@ def _sec_public_origin() -> str:
     return f"{proto}://{host}" if host else ""
 
 
+# ── ERP 화면 규칙(다른 기관·다른 ERP 에서도 코드 수정 없이) ─────────────────────
+#   바탕 규칙 묶음(secretary/erp_presets.json: 일반·KOAT·더존·온나라·SAP) + 기관 맞춤 규칙(기관 설정 › ERP)
+#   → 확장이 화면 감지·결재 전 점검(제출 버튼 이름)·입력값 점검(칸 이름)에 쓴다.
+SEC_ERP_PRESETS_PATH = os.path.join(SEC_DIR, "erp_presets.json")
+
+
+def _sec_erp_presets() -> dict:
+    return (_sec_read_json(SEC_ERP_PRESETS_PATH, {}) or {}).get("presets") or {}
+
+
+def _sec_rx_ok(rx: str) -> bool:
+    """확장(JS)에서 쓸 정규식 — 파이썬으로도 컴파일되고 지나치게 길지 않은 것만."""
+    if not rx or len(rx) > 200:
+        return False
+    try:
+        re.compile(rx)
+        return True
+    except re.error:
+        return False
+
+
+def _sec_clean_erp_rules(e: dict) -> dict:
+    """기관 맞춤 ERP 규칙 정규화 — 바탕 묶음 이름, 제출 버튼 이름, 화면 규칙, 제외 경로, 칸 이름."""
+    e = e if isinstance(e, dict) else {}
+    out = {}
+    if e.get("preset") in _sec_erp_presets():
+        out["preset"] = e["preset"]
+    words = [_sec_clean_str(w, 30) for w in (e.get("submit_words") or [])[:40] if isinstance(w, str)]
+    if any(words):
+        out["submit_words"] = list(dict.fromkeys(w for w in words if w))
+    rules = []
+    for r in (e.get("screen_rules") or [])[:60]:
+        if not isinstance(r, dict):
+            continue
+        m, proc = str(r.get("match") or "").strip(), _sec_clean_str(r.get("proc"), 48).lower()
+        if _sec_rx_ok(m) and _SEC_ID_RE.match(proc):
+            rules.append({"by": "url" if r.get("by") == "url" else "title", "match": m, "proc": proc,
+                          "q": _sec_clean_str(r.get("q"), 80)})
+    if rules:
+        out["screen_rules"] = rules
+    skips = [str(x).strip() for x in (e.get("skip_paths") or [])[:40] if isinstance(x, str) and _sec_rx_ok(str(x).strip())]
+    if skips:
+        out["skip_paths"] = skips
+    labels = {}
+    for k in ("start", "end", "ignore"):
+        ws = [_sec_clean_str(w, 30) for w in ((e.get("labels") or {}).get(k) or [])[:20] if isinstance(w, str)]
+        if any(ws):
+            labels[k] = [w for w in ws if w]
+    if labels:
+        out["labels"] = labels
+    return out
+
+
+def _sec_erp_profile(cfg: dict | None = None) -> dict:
+    """확장에 줄 ERP 규칙 = 일반 묶음 + 고른 묶음 + 기관 맞춤(맞춤 화면 규칙이 앞 — 먼저 맞는 것을 쓴다)."""
+    cfg = cfg or _sec_config()
+    erp = cfg.get("erp") or {}
+    presets = _sec_erp_presets()
+    layers = [presets.get("generic") or {}]
+    if erp.get("preset") and erp["preset"] != "generic":
+        layers.append(presets.get(erp["preset"]) or {})
+    custom = _sec_clean_erp_rules(erp)
+    out = {"preset": erp.get("preset") or "generic", "submit_words": [], "screen_rules": list(custom.get("screen_rules") or []),
+           "skip_paths": [], "labels": {"start": [], "end": [], "ignore": []}}
+    for lay in layers + [custom]:
+        out["submit_words"] += [w for w in lay.get("submit_words") or [] if w not in out["submit_words"]]
+        out["skip_paths"] += [x for x in lay.get("skip_paths") or [] if x not in out["skip_paths"]]
+        for k in out["labels"]:
+            out["labels"][k] += [w for w in (lay.get("labels") or {}).get(k) or [] if w not in out["labels"][k]]
+        if lay is not custom:
+            out["screen_rules"] += list(lay.get("screen_rules") or [])
+    return out
+
+
+@app.route("/api/secretary/erp/presets")
+def secretary_erp_presets():
+    """관리 화면: 바탕 규칙 묶음 목록과 지금 확장에 가는 규칙(합친 결과)."""
+    return jsonify({"success": True, "presets": _sec_erp_presets(), "profile": _sec_erp_profile()})
+
+
 def _sec_ext_hosts() -> list:
     import extension_build
     hosts = (_sec_config().get("erp") or {}).get("hosts") or []
@@ -3611,7 +3825,7 @@ def secretary_extension_zip():
     svc = (_sec_config().get("service") or {})
     name = f"{org.get('abbr') or org.get('short') or ''} {svc.get('title') or '서무비서'}".strip()
     try:
-        data, man = extension_build.build_zip(server, _sec_ext_hosts(), name)
+        data, man = extension_build.build_zip(server, _sec_ext_hosts(), name, profile=_sec_erp_profile())
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
     resp = app.response_class(data, mimetype="application/zip")
@@ -3694,11 +3908,13 @@ def secretary_erp_meta():
                                     "q": (p.get("triggers") or [p.get("title", "")])[0],
                                     # 결재 전 점검(ERP 상신 버튼)용 반려 점검 항목과 근거
                                     "pitfalls": [{"t": _sec_tx(x.get("t", ""), cfg),
-                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2]}
+                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2],
+                                                  **({"check": x["check"]} if isinstance(x.get("check"), dict) else {})}
                                                  for x in (p.get("pitfalls") or [])][:12],
                                     "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
                                    for p in procs.values() if not p.get("hidden")],
-                    "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", "")})
+                    "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", ""),
+                    "erp": _sec_erp_profile(cfg)})
 
 
 # ══════════════════════════════════════════════════════════════════════════

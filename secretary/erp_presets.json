@@ -1,0 +1,68 @@
+{
+ "_comment": "ERP·그룹웨어 화면 규칙 묶음. 기관 설정 › ERP 의 '바탕 규칙'으로 고르고, 기관 맞춤 규칙을 그 위에 더한다. screen_rules 의 match 는 정규식(by=url 이면 주소 경로, title 이면 화면 제목·머리 글), proc 은 절차 id, q 는 서무비서에 물을 문장. submit_words 는 '이름 전체가 같을 때만' 결재 전 점검을 띄우는 제출 버튼 이름(메뉴 안 링크는 제외). labels 는 입력값 점검이 날짜 칸을 알아보는 칸 이름(낱말 — 시작·끝·빼는 칸). verified 가 false 인 묶음은 실제 화면으로 확인하지 않은 출발점이다 — 진단 센터의 '설정 제안'으로 맞춘다.",
+ "presets": {
+  "generic": {
+   "name": "일반(모든 ERP 공통)",
+   "verified": true,
+   "note": "상신·결재요청·기안·제출 같은 흔한 버튼 이름과 제목 문구만 씁니다. 다른 묶음에도 늘 함께 들어갑니다.",
+   "submit_words": [],
+   "screen_rules": [],
+   "skip_paths": ["/mail2?/", "/schedule/", "/board/", "/portlet/", "[Ll]ogin", "/uat/uia/"],
+   "labels": {"start": [], "end": [], "ignore": []}
+  },
+  "koat": {
+   "name": "한국농업기술진흥원 ERP·온나라",
+   "verified": true,
+   "note": "KOAT ERP(kerp)·온나라 실제 시험 기록(2026-10)으로 맞춘 규칙입니다.",
+   "submit_words": ["출장신청", "여비정산신청", "여비 정산 신청", "근태신청", "휴가신청", "시간외근무신청", "시간외신청", "서무확정요청", "정산요청", "확정요청"],
+   "screen_rules": [
+    {"by": "url", "match": "/koat/bt/btExp", "q": "출장 다녀와서 정산해야 해요", "proc": "domestic-trip"},
+    {"by": "url", "match": "/koat/bt/", "q": "출장 가요", "proc": "domestic-trip"},
+    {"by": "url", "match": "/koat/vac/", "q": "휴가 신청", "proc": "leave"},
+    {"by": "url", "match": "/koat/rb/", "q": "시간외 근무", "proc": "overtime"},
+    {"by": "url", "match": "/koat/outLecture/", "q": "외부강의 나가요", "proc": "outside-lecture"},
+    {"by": "url", "match": "cashDisbursementVoucher", "q": "지출결의", "proc": "doc-approval"},
+    {"by": "url", "match": "/eapproval/docCommonDrafWrite", "q": "기안 결재", "proc": "doc-approval"},
+    {"by": "url", "match": "/bms/dct/|/bms/.*(draft|Draft|write|Write|regist|Regist)", "q": "기안 결재", "proc": "doc-approval"}
+   ],
+   "skip_paths": ["bizboxMail", "/gw/html/", "SynapDocView"],
+   "labels": {"start": [], "end": [], "ignore": []}
+  },
+  "douzone": {
+   "name": "더존 Bizbox Alpha·iCUBE(그룹웨어)",
+   "verified": false,
+   "note": "더존 그룹웨어의 흔한 버튼·메뉴 이름으로 만든 출발점입니다. 실제 화면에서 진단 센터 '설정 제안'으로 맞추세요.",
+   "submit_words": ["결재상신", "상신하기", "기안상신", "결재올리기"],
+   "screen_rules": [
+    {"by": "title", "match": "출장\\s*(신청|품의)", "q": "출장 가요", "proc": "domestic-trip"},
+    {"by": "title", "match": "(여비|출장비)\\s*(정산|청구)", "q": "출장 다녀와서 정산해야 해요", "proc": "domestic-trip"},
+    {"by": "title", "match": "(휴가|근태)\\s*(신청|신청서)", "q": "휴가 신청", "proc": "leave"}
+   ],
+   "skip_paths": ["bizboxMail", "/mail/", "/note/", "/schedule/"],
+   "labels": {"start": ["출장일자", "시작일자"], "end": ["종료일자"], "ignore": ["기안일자", "상신일"]}
+  },
+  "onnara": {
+   "name": "온나라 문서관리(공문·기안)",
+   "verified": false,
+   "note": "온나라 2.0 문서관리 화면의 흔한 경로·버튼으로 만든 출발점입니다.",
+   "submit_words": ["결재올림", "결재 올림", "기안완료", "발송의뢰"],
+   "screen_rules": [
+    {"by": "url", "match": "/bms/dct/|/bms/.*(draft|Draft|write|Write|regist|Regist)", "q": "기안 결재", "proc": "doc-approval"}
+   ],
+   "skip_paths": ["/bms/dct/.*[Vv]iew", "SynapDocView"],
+   "labels": {"start": [], "end": [], "ignore": ["시행일자", "접수일자"]}
+  },
+  "sap": {
+   "name": "SAP(Fiori·GUI for HTML)",
+   "verified": false,
+   "note": "영문 버튼 이름을 함께 씁니다. 출장·경비 앱 화면 제목은 기관마다 달라 진단 센터 제안으로 채우세요.",
+   "submit_words": ["Submit", "Send for Approval", "Submit for Approval", "제출하기"],
+   "screen_rules": [
+    {"by": "title", "match": "Travel\\s*(Request|Expense)|출장\\s*경비", "q": "출장 다녀와서 정산해야 해요", "proc": "domestic-trip"},
+    {"by": "title", "match": "Leave\\s*Request|휴가\\s*요청", "q": "휴가 신청", "proc": "leave"}
+   ],
+   "skip_paths": ["/sap/bc/ui2/flp.*Inbox"],
+   "labels": {"start": ["Start Date", "From"], "end": ["End Date", "To"], "ignore": ["Created On", "Posting Date"]}
+  }
+ }
+}

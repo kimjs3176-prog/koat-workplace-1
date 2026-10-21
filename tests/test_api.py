@@ -113,3 +113,61 @@ def test_save_conflict_409(client):
     assert r.status_code == 409 and r.get_json()["conflict"]
     r = client.post("/api/secretary/org", json={"procedures": [], "base": "1999-01-01 00:00"})
     assert r.status_code == 409
+
+
+def test_ask_search_only_without_ai(client):
+    """AI 키가 없으면 관련 조문만(답은 내지 않음)."""
+    d = client.post("/api/secretary/ask", json={"q": "경조사 휴가 며칠"}).get_json()
+    assert d["success"] and d["mode"] == "search" and not d["found"] and d["candidates"]
+    assert any(c["reg"] == "복무규정" for c in d["candidates"])
+
+
+def test_ask_ai_answer_requires_verified_quote(client, monkeypatch):
+    """AI 답은 인용문이 실제 조문에 있을 때만 보여 준다(지어낸 인용이면 답을 감춘다)."""
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    q = "경조사 휴가 며칠"
+    items = api_server._sec_related_items(q, n=14, semantic=False)
+    real = next(x for x in items if x["reg"] == "복무규정" and x["art"] == "34")
+    sentence = real["text"][40:100].replace("하 고는", "하고는")   # 조문 안 문장(띄어쓰기 차이는 무시하고 확인)
+    calls = {}
+
+    def fake(system, text, schema, image=None, effort="low"):
+        ids = schema["properties"]["citations"]["items"]["properties"]["id"]["enum"]
+        aid = next(i for i in ids if f"[{i}] 「복무규정」 제34조" in text)
+        return {"found": True, "answer": "결혼 5일 등입니다.", "caution": "",
+                "citations": [{"id": aid, "quote": calls.get("quote", sentence)}]}
+    monkeypatch.setattr(api_server, "_sec_ai_json", fake)
+    d = client.post("/api/secretary/ask", json={"q": q}).get_json()
+    assert d["mode"] == "ai" and d["found"] and d["answer"]
+    assert d["citations"][0]["verified"] and d["citations"][0]["art"] == "34"
+    calls["quote"] = "본인 결혼 시 30일의 특별휴가를 준다"           # 조문에 없는 문장
+    d = client.post("/api/secretary/ask", json={"q": q}).get_json()
+    assert not d["found"] and not d["answer"] and d["candidates"]
+
+
+def test_erp_profile_preset_and_custom():
+    """ERP 규칙 = 일반 + 고른 묶음 + 기관 맞춤(맞춤 화면 규칙이 앞). 잘못된 규칙은 저장 전에 걸러진다."""
+    clean = api_server._sec_clean_erp_rules({
+        "preset": "douzone", "submit_words": ["결재상신", "", "  "],
+        "screen_rules": [{"by": "url", "match": "/hr/trip/", "proc": "domestic-trip", "q": "출장 가요"},
+                         {"by": "title", "match": "([", "proc": "domestic-trip"},          # 정규식 오류 → 버림
+                         {"by": "title", "match": "휴가", "proc": "No Such!"}],              # 절차 id 꼴 아님 → 버림
+        "skip_paths": ["/mail/", "(("], "labels": {"start": ["출장일자"], "bogus": ["x"]}})
+    assert clean["preset"] == "douzone" and clean["submit_words"] == ["결재상신"]
+    assert [r["match"] for r in clean["screen_rules"]] == ["/hr/trip/"] and clean["skip_paths"] == ["/mail/"]
+    assert clean["labels"] == {"start": ["출장일자"]}
+    prof = api_server._sec_erp_profile({"erp": clean})
+    assert prof["screen_rules"][0]["match"] == "/hr/trip/"                     # 기관 맞춤이 먼저
+    assert "결재상신" in prof["submit_words"] and "/mail2?/" in prof["skip_paths"]   # 일반 묶음도 함께
+    assert not any("koat" in r["match"] for r in prof["screen_rules"])        # 다른 기관에는 KOAT 주소 규칙이 없다
+    assert "출장일자" in prof["labels"]["start"]
+
+
+def test_erp_meta_and_zip_carry_profile(client):
+    import io, zipfile
+    d = client.get("/api/secretary/erp/meta").get_json()
+    assert d["erp"]["preset"] == "koat" and any("/koat/bt/" in r["match"] for r in d["erp"]["screen_rules"])
+    z = zipfile.ZipFile(io.BytesIO(client.get("/api/secretary/extension.zip").data))
+    cfg = z.read("secretary-extension/config.js").decode()
+    assert "SEC_PROFILE_DEFAULT = {" in cfg and "/koat/bt/" in cfg
+    assert client.get("/api/secretary/erp/presets").get_json()["presets"]["sap"]["verified"] is False
