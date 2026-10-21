@@ -302,7 +302,7 @@ function normCase(c){
     query:str(c.query,200), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
     status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined,
     // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
-    sk:keys(c.sk), pk:keys(c.pk)};
+    sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{})};
 }
 function reusableCase(pid, ds){
   return cases().filter(x=>x.procId===pid && x.status!=='done').sort((a,b)=>(b.updated||0)-(a.updated||0))
@@ -1307,7 +1307,8 @@ function normSched(x){
   if(!x||typeof x!=='object'||!_D.test(x.date||'')||typeof x.title!=='string'||!x.title.trim()) return null;
   return {id:String(x.id||uid()).slice(0,40), date:x.date, end:_D.test(x.end||'')&&x.end>x.date?x.end:'', time:_T.test(x.time||'')?x.time:'',
     title:x.title.trim().slice(0,80), memo:typeof x.memo==='string'?x.memo.slice(0,500):'', done:!!x.done,
-    ...(typeof x.uid==='string'&&x.uid?{uid:x.uid.slice(0,200)}:{})};          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
+    ...(typeof x.uid==='string'&&x.uid?{uid:x.uid.slice(0,200)}:{}),
+    ...(typeof x.caseId==='string'&&x.caseId?{caseId:x.caseId.slice(0,40)}:{})};            // caseId: 이 일정으로 만든 처리 건(일정 → 업무 연결)          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
 }
 function scheds(){ const a=_ls(LS_SCHED,[]); return Array.isArray(a)?a.map(normSched).filter(Boolean):[]; }
 function saveScheds(a){ const ok=_lsPut(LS_SCHED, a.slice(0,1000)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
@@ -1436,6 +1437,34 @@ async function schedFromDrop(dt, day){
   if(/BEGIN:VEVENT/.test(txt)){ const evs=parseIcs(txt); if(evs.length){ openSched(null, day, evs[0]); return; } }
   openSched(null, day, parseSchedText(txt));
 }
+// ── 일정 → 업무 연결: 출장·교육·행사 같은 일정이면 그 절차의 처리 건을 만들어 기한(사전 신청·사후 정산)을 달력·알림에 올린다
+function linkableProcs(){ return allProcs().filter(p=>!p.hidden && (p.dates||[]).length && (p.steps||[]).some(s=>s.deadline)); }
+function schedProcGuess(t){
+  const ok=new Set(linkableProcs().map(p=>p.id));
+  const m=match(t).filter(x=>ok.has(x.p.id) && x.hit.length);       // 트리거 낱말이 실제로 들어 있을 때만(제목 한 낱말 겹침은 약함)
+  return m.length?m[0].p:null;
+}
+function schedDates(p, n){ const o={}; (p.dates||[]).forEach(d=>{ if(d.k==='start') o.start=n.date; else if(d.k==='end') o.end=n.end||n.date; }); return o; }
+function linkSchedCase(n, pid){
+  const p=getProc(pid); if(!p) return null;
+  const all=cases(); let c=n.caseId?all.find(x=>x.id===n.caseId):null;
+  if(c && c.procId!==pid) c=null;                                     // 다른 업무로 바꿨으면 새 건
+  const ds=schedDates(p, n);
+  if(c){ c.dates=Object.assign({}, c.dates||{}, ds); c.updated=Date.now(); }
+  else { c=Object.assign({id:uid(), procId:p.id, title:`${shortTitle(p.title)} · ${n.title}`.slice(0,120), created:today(), updated:Date.now(), query:n.title,
+      dates:ds, checks:{}, note:'', drafts:{}, status:'open', schedId:n.id}, procKeys(p)); all.unshift(c); }
+  if(!saveCases(all)) return null;
+  n.caseId=c.id;
+  return {c, p, due:(p.steps||[]).filter(s=>stepDue(s, c.dates)).length};
+}
+function schedLinkRow(x){
+  const ps=linkableProcs(); if(!ps.length) return '';
+  const linkedCase=x.caseId?cases().find(c=>c.id===x.caseId):null;
+  const sel=linkedCase?getProc(linkedCase.procId):(x.id?null:schedProcGuess((x.title||'')+' '+(x.memo||'')));
+  return `<div class="sec-link"><label><input type="checkbox" data-sk="link"${sel?' checked':''}> 🔗 업무로 연결</label>`+
+    `<select data-sk="proc" aria-label="연결할 업무"><option value="">— 업무 고르기 —</option>`+ps.map(p=>`<option value="${esc(p.id)}"${sel&&sel.id===p.id?' selected':''}>${esc(p.icon||'')} ${esc(shortTitle(p.title))}</option>`).join('')+`</select>`+
+    `<span class="sec-sub">${linkedCase?'연결된 처리 건의 기준일을 이 일정 날짜로 맞춥니다.':'처리 건을 만들어 사전 신청·사후 정산 같은 기한을 달력·알림에 올립니다.'}</span></div>`;
+}
 function openSched(id, date, pre){
   const cur=id?scheds().find(x=>x.id===id):null;
   const x=cur||Object.assign({id:'', date:'', end:'', time:'', title:'', memo:'', done:false}, pre||{});
@@ -1449,10 +1478,17 @@ function openSched(id, date, pre){
     `<label class="sec-f"><span>끝나는 날(여러 날)</span><input type="date" data-sk="end" value="${esc(x.end)}"></label>`+
     `<label class="sec-f"><span>시각(선택)</span><input type="time" data-sk="time" value="${esc(x.time)}"></label></div>`+
     `<label class="sec-f"><span>메모</span><textarea data-sk="memo" rows="2" maxlength="500" placeholder="장소·준비물·담당자 등">${esc(x.memo)}</textarea></label>`+
+    schedLinkRow(x)+
     `<div class="sec-hint">내 일정은 <b>이 브라우저에만</b> 저장됩니다. 업무 달력·이번 주 할 일·캘린더 파일(.ics)·확장 알림에 함께 나옵니다.</div>`+
     `<div class="sec-row"><button class="sec-btn primary" data-sk="save">저장</button>`+
+    (cur&&cur.caseId&&cases().some(c=>c.id===cur.caseId)?`<button class="sec-btn" data-sk="opencase">🔗 처리 건 열기</button>`:'')+
     (cur?`<button class="sec-btn" data-sk="done">${cur.done?'↩ 완료 취소':'✓ 완료'}</button><button class="sec-btn ghost" data-sk="del">삭제</button>`:'')+`</div>`;
   setTimeout(()=>{ const t=body.querySelector('[data-sk="title"]'); t&&t.focus(); },0);
+  // 제목·메모를 고치면 연결할 업무 추측도 다시(사용자가 직접 고른 뒤에는 그대로)
+  body.oninput=e=>{ if(!/^(title|memo)$/.test(e.target.dataset.sk||'')) return; const sel=body.querySelector('[data-sk="proc"]'); if(!sel || sel.dataset.touched) return;
+    const g=schedProcGuess((body.querySelector('[data-sk="title"]').value||'')+' '+(body.querySelector('[data-sk="memo"]').value||''));
+    sel.value=g?g.id:''; const cb=body.querySelector('[data-sk="link"]'); if(cb) cb.checked=!!g; };
+  body.onchange=e=>{ if(e.target.dataset.sk==='proc'){ e.target.dataset.touched='1'; const cb=body.querySelector('[data-sk="link"]'); if(cb) cb.checked=!!e.target.value; } };
   body.onclick=e=>{ const b=e.target.closest('button[data-sk]'); if(!b) return;
     if(b.dataset.sk==='parse'){ const txt=(body.querySelector('[data-sk="paste"]')||{}).value||''; if(!txt.trim()){ toast('메일 내용을 붙여 넣으세요.'); return; }
       const r=parseSchedText(txt); const set=(k,v)=>{ const el=body.querySelector(`[data-sk="${k}"]`); if(el&&v) el.value=v; };
@@ -1463,11 +1499,19 @@ function openSched(id, date, pre){
       const n=normSched({id:cur?cur.id:uid(), date:v('date'), end:v('end'), time:v('time'), title:v('title'), memo:v('memo'), done:cur?cur.done:false, uid:(cur||x).uid});
       if(!n){ toast(v('title').trim()?'날짜를 넣어 주세요.':'제목을 입력하세요.'); return; }
       if(v('end') && v('end')<v('date')){ toast('끝나는 날이 시작일보다 앞입니다.'); return; }
+      if(cur && cur.caseId) n.caseId=cur.caseId;
+      const lk=body.querySelector('[data-sk="link"]'), pid=(body.querySelector('[data-sk="proc"]')||{}).value||'';
+      let linked=null;
+      if(lk && lk.checked && pid){ linked=linkSchedCase(n, pid); if(!linked) return; }
+      else if(lk && !lk.checked) delete n.caseId;                      // 연결을 끊어도 처리 건은 남긴다(이력)
       if(i>=0) all[i]=n; else all.push(n);
       if(!saveScheds(all)) return;
-      closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm}; toast(cur?'일정을 고쳤습니다.':'일정을 추가했습니다.'); render(); }
+      closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm};
+      toast(linked?`🔗 '${shortTitle(linked.p.title)}' 처리 건${cur&&cur.caseId===linked.c.id?'의 기준일을 고쳤':'을 만들었'}습니다 — 기한 ${linked.due}개를 달력·알림에 올렸습니다.`:(cur?'일정을 고쳤습니다.':'일정을 추가했습니다.'), linked?5200:2600);
+      if(typeof syncDeadlines==='function') syncDeadlines(); render(); }
+    else if(b.dataset.sk==='opencase' && cur){ const c=cases().find(y=>y.id===cur.caseId); closeModal('secSchedModal'); if(c){ S.query=''; S.matches=[]; selectProc(c.procId,{caseId:c.id}); } }
     else if(b.dataset.sk==='done' && i>=0){ all[i].done=!all[i].done; saveScheds(all); closeModal('secSchedModal'); render(); }
-    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
+    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?${all[i].caseId?' (연결된 처리 건은 처리 이력에 남습니다)':''}`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
   };
   body.onkeydown=e=>{ if(e.key==='Enter' && e.target.tagName==='INPUT' && e.target.dataset.sk!=='paste'){ e.preventDefault(); const b=body.querySelector('[data-sk="save"]'); b&&b.click(); } };
 }
@@ -1491,7 +1535,7 @@ function calView(){
   for(let d=1; d<=days; d++){ const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const w=(startW+d-1)%7; const hol=S.holidays[ds]; const list=by[ds]||[]; const sl=sby[ds]||[];
     const cls=['sec-cal-c', ds===t?'today':'', w===0||hol?'sun':'', w===6&&!hol?'sat':'', ds<t&&list.length?'past':''].filter(Boolean).join(' ');
-    const chips=[...sl.map(x=>`<button class="sec-cal-e sch${x.done?' done':''}" data-a="sched" data-id="${esc(x.id)}" title="${esc(schedLabel(x)+(x.memo?' — '+x.memo:''))}">🗓 ${esc(schedLabel(x))}</button>`),
+    const chips=[...sl.map(x=>`<button class="sec-cal-e sch${x.done?' done':''}" data-a="sched" data-id="${esc(x.id)}" title="${esc(schedLabel(x)+(x.memo?' — '+x.memo:'')+(x.caseId?' · 업무 연결됨':''))}">${x.caseId?'🔗':'🗓'} ${esc(schedLabel(x))}</button>`),
       ...list.map(e=>`<button class="sec-cal-e${e.date<t?' over':''}${e.optional?' opt':''}" data-a="case" data-id="${esc(e.caseId)}" title="${esc(e.proc+' — '+e.step)}">${esc(e.icon)} ${esc(e.proc)}</button>`)];
     cells.push(`<div class="${cls}" data-day="${ds}"><div class="sec-cal-d"><b>${d}</b>${hol?`<span class="sec-cal-h">${esc(hol)}</span>`:''}`+
       `<button class="sec-cal-add" data-a="schedadd" data-d="${ds}" title="${m}월 ${d}일 일정 추가" aria-label="${m}월 ${d}일 일정 추가">＋</button></div>`+
