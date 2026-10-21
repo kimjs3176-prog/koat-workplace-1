@@ -50,6 +50,7 @@
       "js": [
         "config.js",
         "content.js",
+        "checks.js",
         "guard.js"
       ],
       "all_frames": true,

@@ -1811,6 +1811,31 @@ def _sec_ref_list(arr, n=6):
     return out
 
 
+_SEC_CHECK_KINDS = {"deadline", "lead", "nextmonth", "attach", "hours", "span"}
+
+
+def _sec_clean_check(c) -> dict | None:
+    """반려 점검 항목의 입력값 점검 규칙(확장이 ERP 화면 값으로 판정) — 정해진 꼴만 받는다."""
+    if not isinstance(c, dict) or c.get("kind") not in _SEC_CHECK_KINDS:
+        return None
+    out = {"kind": c["kind"]}
+    if c["kind"] in ("deadline", "lead", "nextmonth"):
+        if c.get("ref") not in ("start", "end"):
+            return None
+        out["ref"] = c["ref"]
+        key = "day" if c["kind"] == "nextmonth" else "days"
+        out[key] = _sec_int(c.get(key), 0, 0, 366)
+    elif c["kind"] == "hours":
+        out["max"] = _sec_int(c.get("max"), 4, 1, 24)
+    elif c["kind"] == "span":
+        for k in ("from", "to"):
+            v = str(c.get(k) or "")
+            if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", v):
+                return None
+            out[k] = v
+    return out
+
+
 def _sec_clean_proc(p: dict) -> dict | None:
     """관리자가 보낸 절차 1건 정규화. 허용된 필드·길이만 남긴다(화면에서 실행되는 값은 화이트리스트)."""
     if not isinstance(p, dict):
@@ -1871,6 +1896,9 @@ def _sec_clean_proc(p: dict) -> dict | None:
             x = {"t": _sec_clean_str(pf.get("t"), 300)}
             if pf.get("basis"):
                 x["basis"] = _sec_ref_list(pf.get("basis"), 3)
+            ck = _sec_clean_check(pf.get("check"))
+            if ck:
+                x["check"] = ck
             pitfalls.append(x)
     return {
         "id": pid, "title": title,
@@ -3800,7 +3828,8 @@ def secretary_erp_meta():
                                     "q": (p.get("triggers") or [p.get("title", "")])[0],
                                     # 결재 전 점검(ERP 상신 버튼)용 반려 점검 항목과 근거
                                     "pitfalls": [{"t": _sec_tx(x.get("t", ""), cfg),
-                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2]}
+                                                  "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2],
+                                                  **({"check": x["check"]} if isinstance(x.get("check"), dict) else {})}
                                                  for x in (p.get("pitfalls") or [])][:12],
                                     "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
                                    for p in procs.values() if not p.get("hidden")],

@@ -78,7 +78,7 @@ async function registerExtraHosts() {
     }
   }
   if (extra.length) {
-    await chrome.scripting.registerContentScripts([{ id: "sec-erp-extra", matches: extra, js: ["config.js", "content.js", "guard.js"],
+    await chrome.scripting.registerContentScripts([{ id: "sec-erp-extra", matches: extra, js: ["config.js", "content.js", "checks.js", "guard.js"],
       allFrames: true, matchOriginAsFallback: true, runAt: "document_idle", persistAcrossSessions: true }]).catch((e) => console.warn(e));
   }
 }

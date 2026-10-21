@@ -55,6 +55,35 @@
     show(el, t);
   }, true);
 
+  // ── 화면 입력값 읽기(결재 전 입력값 점검용) — 값은 판정에만 쓰고 기록·전송하지 않는다 ──
+  function fieldLabel(el) {
+    const own = (el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute("aria-label") || el.title || el.placeholder || "";
+    if (own.trim()) return own.trim().slice(0, 40);
+    const cell = el.closest("td,dd,li,div"); let row = el.closest("tr");
+    // 표: 같은 줄의 앞 칸(th·td) 글 / 정의 목록: 앞 dt / 그 밖: 바로 앞 형제 글
+    let prev = cell && cell.previousElementSibling;
+    while (prev && !(prev.innerText || "").trim()) prev = prev.previousElementSibling;
+    const t = (prev && prev.innerText) || (row && row.querySelector("th") && row.querySelector("th").innerText) || el.name || el.id || "";
+    return String(t).replace(/\s+/g, " ").trim().slice(0, 40);
+  }
+  function screenOf(doc) {
+    const docs = [doc];
+    try { for (const f of (window.top.document || doc).querySelectorAll("iframe,frame")) { try { if (f.contentDocument && !docs.includes(f.contentDocument)) docs.push(f.contentDocument); } catch (e) {} } } catch (e) {}
+    const fields = [], files = []; let text = "", row = 0;
+    for (const d of docs) {
+      const rows = new Map();
+      for (const el of d.querySelectorAll('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]),select,textarea')) {
+        if (el.type === "file") { files.push(el); continue; }
+        const v = el.tagName === "SELECT" ? (el.selectedOptions[0] && el.selectedOptions[0].text) || "" : el.value;
+        if (!v) continue;
+        const r = el.closest("tr,dd,li,.row,p") || el.parentElement; if (!rows.has(r)) rows.set(r, row++);
+        fields.push({ label: fieldLabel(el), value: String(v).slice(0, 40), row: rows.get(r) });
+      }
+      try { text += " " + (d.body ? d.body.innerText : "").slice(0, 20000); } catch (e) {}
+    }
+    return { fields, attach: globalThis.SEC_CHECK ? SEC_CHECK.countAttach(text, files) : undefined };
+  }
+
   function show(btn, label) {
     // 같은 출처면 맨 위 창에 띄운다(안쪽 프레임이 작아도 카드가 잘리지 않게)
     let doc = document;
@@ -63,6 +92,12 @@
     host.id = "koat-sec-guard";
     const sh = host.attachShadow({ mode: "open" });
     const ps = guard.pitfalls.slice(0, 12);
+    // 화면 값으로 판정할 수 있는 항목은 결과를 붙이고, 걸린 항목을 맨 위로
+    let ev = [];
+    try { if (globalThis.SEC_CHECK && ps.some((p) => p.check)) ev = SEC_CHECK.evaluate(ps, screenOf(btn.ownerDocument || document), new Date(Date.now() - new Date().getTimezoneOffset() * 6e4).toISOString().slice(0, 10)); } catch (e) { ev = []; }
+    const order = ps.map((p, i) => i).sort((a, b) => ((ev[a] && !ev[a].ok) ? 0 : 1) - ((ev[b] && !ev[b].ok) ? 0 : 1));
+    const nFail = ev.filter((x) => x && !x.ok).length + (ev.extra ? 1 : 0), nOk = ev.filter((x) => x && x.ok).length;
+    if (nFail || nOk) dlog("guard.values", { fail: nFail, ok: nOk, total: ps.length });     // 값은 남기지 않고 개수만
     sh.innerHTML = `<style>
       :host{all:initial}
       .dim{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:"Pretendard","Malgun Gothic",system-ui,sans-serif}
@@ -71,6 +106,9 @@
       .sub{color:#5f6b7a;font-size:12.5px;margin:0 0 12px;line-height:1.5}
       label{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border:1px solid #e3e7ee;border-radius:9px;margin-bottom:6px;font-size:13.5px;line-height:1.5;cursor:pointer}
       label.on{background:#ecfdf5;border-color:#10b981}
+      label.fail{border-color:#dc2626;background:#fef2f2}
+      .v{display:block;font-size:12px;margin-top:2px;font-weight:600}.v.ok{color:#047857}.v.no{color:#b91c1c}
+      .extra{border:1px solid #dc2626;background:#fef2f2;color:#b91c1c;border-radius:9px;padding:8px 10px;font-size:13px;margin-bottom:6px;font-weight:600}
       input{margin-top:3px;width:16px;height:16px;flex-shrink:0}
       .b{display:block;color:#6b7280;font-size:11.5px}
       .row{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:12px}
@@ -81,7 +119,10 @@
     </style><div class="dim" role="dialog" aria-modal="true" aria-label="결재 전 점검"><div class="card">
       <h2>🚫 결재 올리기 전 점검</h2>
       <p class="sub">${esc(guard.title || "")} — '${esc(label)}' 전에 자주 반려되는 항목입니다. 확인한 항목에 체크하세요.</p>
-      <div class="list">${ps.map((p, i) => `<label><input type="checkbox" data-i="${i}"><span>${esc(p.t)}${(p.basis || []).length ? `<span class="b">근거: ${p.basis.map((b) => esc(b.reg + (b.art ? ` 제${b.art}조` : ""))).join(", ")}</span>` : ""}</span></label>`).join("")}</div>
+      ${nFail || nOk ? `<p class="sub">🔎 화면에 입력된 값으로 ${nOk + nFail}개 항목을 확인했습니다${nFail ? ` — <b style="color:#b91c1c">${nFail}개 확인 필요</b>` : ""}. 값은 저장하지 않습니다.</p>` : ""}
+      ${ev.extra ? `<div class="extra">⚠ ${esc(ev.extra.note)}</div>` : ""}
+      <div class="list">${order.map((i) => { const p = ps[i], v = ev[i];
+        return `<label class="${v && !v.ok ? "fail" : ""}"><input type="checkbox" data-i="${i}"><span>${esc(p.t)}${v ? `<span class="v ${v.ok ? "ok" : "no"}">${v.ok ? "✓" : "⚠"} ${esc(v.note)}</span>` : ""}${(p.basis || []).length ? `<span class="b">근거: ${p.basis.map((b) => esc(b.reg + (b.art ? ` 제${b.art}조` : ""))).join(", ")}</span>` : ""}</span></label>`; }).join("")}</div>
       <div class="row"><button class="ghost" data-a="more" type="button">서무비서에서 자세히</button><button class="ghost" data-a="no" type="button">취소</button><button class="go part" data-a="go" type="button">${ps.length}개 남음 — 그래도 계속</button></div>
     </div></div>`;
     const go = sh.querySelector('[data-a="go"]');
