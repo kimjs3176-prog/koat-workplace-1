@@ -24,14 +24,14 @@ def manifest() -> dict:
         return json.load(f)
 
 
-def build_zip(server: str = "", erps=None, name: str = "", version: str = "") -> tuple[bytes, dict]:
+def build_zip(server: str = "", erps=None, name: str = "", version: str = "", profile=None) -> tuple[bytes, dict]:
     server = (server or "").strip().rstrip("/")
     if server and not re.match(r"^https://", server) and not re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", server):
         raise ValueError("서무비서 주소는 https 여야 합니다.")
     man = manifest()
     pats = [p for p in (origin_pattern(x) for x in (erps or [])) if p]
-    # 기관 ERP 주소를 기본 주소(kerp·온나라)에 더한다 — 바꿔 치우면 온나라 같은 기본 화면이 빠진다
-    pats = list(dict.fromkeys(man["content_scripts"][0]["matches"] + pats))
+    # 기관이 ERP 주소를 정했으면 그 주소만(다른 기관 배포본에 KOAT 주소 권한이 남지 않게), 없으면 기본 주소
+    pats = list(dict.fromkeys(pats)) or man["content_scripts"][0]["matches"]
     man["host_permissions"] = pats
     man["content_scripts"][0]["matches"] = pats
     if server:
@@ -48,6 +48,9 @@ def build_zip(server: str = "", erps=None, name: str = "", version: str = "") ->
         cfg = f.read()
     cfg = re.sub(r'server: "[^"]*"', "server: " + json.dumps(server), cfg, count=1)
     cfg = re.sub(r"erpHosts: \[[^\]]*\]", "erpHosts: " + json.dumps(pats), cfg, count=1)
+    if profile:   # 기관 ERP 규칙 — 서버에 닿지 않을 때도 화면 감지·결재 전 점검이 기관 규칙으로 동작하게
+        cfg = cfg.replace("globalThis.SEC_PROFILE_DEFAULT = null;",
+                          "globalThis.SEC_PROFILE_DEFAULT = " + json.dumps(profile, ensure_ascii=False) + ";", 1)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for base, _, files in os.walk(SRC):

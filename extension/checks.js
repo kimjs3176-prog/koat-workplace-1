@@ -26,15 +26,21 @@
   const END = /종료|도착|복귀|귀국|귀임|마친|끝|까지|만료/;
   const START = /시작|출발|출국|개시|부터|사용일|사용\s*예정|출장일|휴가일|근무일|일자|기간|일시|날짜/;
   // fields: [{label, value, row}] (row: 같은 줄·묶음 번호 — '기간 [시작] ~ [끝]' 처럼 이름 없는 둘째 칸을 잇는다)
-  function readDates(fields) {
+  // 기관 ERP 의 칸 이름(기관 설정 › ERP › 칸 이름)을 기본 낱말에 더한다
+  const esc = (w) => String(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const plus = (rx, words) => (words && words.length ? new RegExp(rx.source + "|" + words.map(esc).join("|")) : rx);
+  function readDates(fields, labels) {
+    labels = labels || {};
+    const NOT_WORK2 = plus(NOT_WORK, labels.ignore), END2 = plus(END, labels.end), START2 = plus(START, labels.start);
+    const isEnd = (l) => (labels.end || []).some((w) => l.includes(w)) || (!(labels.start || []).some((w) => l.includes(w)) && END2.test(l));
     const out = {};
-    const ds = fields.map((f) => ({ ...f, d: parseDate(f.value) })).filter((f) => f.d && !NOT_WORK.test(f.label || ""));
+    const ds = fields.map((f) => ({ ...f, d: parseDate(f.value) })).filter((f) => f.d && !NOT_WORK2.test(f.label || ""));
     for (const f of ds) {
       const l = f.label || "";
-      if (END.test(l) && !out.end) out.end = f.d;
-      else if (START.test(l) && !out.start) {
+      if (isEnd(l) && !out.end) out.end = f.d;
+      else if (START2.test(l) && !out.start) {
         out.start = f.d;
-        const mate = ds.find((g) => g !== f && g.row === f.row && g.d >= f.d && !END.test(g.label || "") && (g.label === f.label || !START.test(g.label || "")));
+        const mate = ds.find((g) => g !== f && g.row === f.row && g.d >= f.d && !isEnd(g.label || "") && (g.label === f.label || !START2.test(g.label || "")));
         if (mate && !out.end) out.end = mate.d;              // 같은 줄의 이름 없는 둘째 날짜 = 끝
       }
     }
@@ -47,8 +53,8 @@
       .flatMap((f) => parseTimes(f.value));
     return ts.length >= 2 ? { from: ts[0], to: ts[1] } : null;
   }
-  function evaluate(pitfalls, screen, today) {
-    const dates = readDates(screen.fields || []), times = readTimes(screen.fields || []);
+  function evaluate(pitfalls, screen, today, labels) {
+    const dates = readDates(screen.fields || [], labels), times = readTimes(screen.fields || []);
     const res = (pitfalls || []).map((p) => {
       const c = p && p.check; if (!c || !c.kind) return null;
       const ref = c.ref && dates[c.ref];
@@ -73,7 +79,7 @@
   function countAttach(text, fileInputs) {
     const t = String(text || "");
     if (/첨부(된)?\s*파일(이)?\s*없/.test(t)) return 0;
-    const m = t.match(/첨부\s*(?:파일|문서)?\s*[(\[:]?\s*(\d{1,3})\s*(?:건|개|\)|\])/);
+    const m = t.match(/(?:첨부|파일\s*첨부|Attachments?)\s*(?:파일|문서)?\s*[(\[:]?\s*(\d{1,3})\s*(?:건|개|\)|\])/i);
     if (m) return +m[1];
     const filled = (fileInputs || []).reduce((n, f) => n + ((f.files && f.files.length) || 0), 0);
     return filled || undefined;

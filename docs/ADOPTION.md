@@ -8,6 +8,7 @@
 | 기관 이름·서비스 이름·색·명칭·기관 휴일 | `secretary/config.json` | 화면 **⚙ 규정·절차 관리 › 🏢 기관 설정**, 또는 파일 직접 수정 |
 | 우리 기관 내규(원문·서식) | `regulations/`, `regulations_manifest.json` | `scripts/import_regs.py`로 일괄 등록, 이후 개정은 `/upload` |
 | 절차가 가리키는 규정명 ↔ 우리 규정 | `config.json`의 `reg_aliases` | 화면 **🔗 규정명 매핑** |
+| ERP·그룹웨어 화면 규칙(제출 버튼·화면 감지·칸 이름) | `config.json`의 `erp`(+ `secretary/erp_presets.json` 바탕 묶음) | 화면 **🏢 기관 설정 › 🧩 ERP 화면 규칙** |
 | 우리 기관 고유 절차 | `secretary/org.json` | 화면에서 '기관'으로 저장, 또는 **📦 절차 팩** 가져오기 |
 
 ---
@@ -160,10 +161,10 @@ python scripts/import_regs.py ./우리기관_내규 --reset     # 기존(KOAT) �
 python scripts/build_extension.py --server https://<우리 서무비서 주소> --erp https://<우리 그룹웨어 주소> --name "○○공단 서무비서"
 ```
 - 만들어진 `dist/*.zip`을 Chrome 웹 스토어나 Edge 추가 기능에 조직 한정으로 올리거나, 그룹 정책으로 일괄 설치합니다.
-- ERP 화면 제목으로 업무를 알아보는 규칙은 `extension/config.js`의 `SEC_RULES`에서 우리 기관 메뉴 이름에 맞춥니다.
+- ERP 화면 규칙은 화면 **🏢 기관 설정 › 🧩 ERP 화면 규칙**에서 맞춥니다(코드 수정 없음): 바탕 묶음(일반·KOAT·더존·온나라·SAP) 선택 + 제출 버튼 이름·화면 규칙(`주소:정규식 => 절차id | 물을 말`)·업무 화면이 아닌 주소·입력값 점검 칸 이름. 저장하면 모든 사용자의 확장에 반영되고 기관 맞춤 확장에도 들어갑니다.
 - 서무비서 서버 앞단에서 `X-Frame-Options`를 붙이고 있으면, 패널이 열리지 않습니다. `Content-Security-Policy: frame-ancestors 'self' chrome-extension: extension:`으로 바꿉니다.
 - **가장 쉬운 배포**: 기관 설정의 **ERP·그룹웨어 주소**를 적어 두면 직원은 서무비서 **🧩 ERP 확장** 탭에서 우리 서버·ERP 주소가 들어간 확장을 받아 설치합니다.
-- **화면 감지 보강**: 업무 화면인데 안내가 뜨지 않으면 패널 🩺 진단에서 📸 기록·메모 후 보고서를 보내 주세요. `extension/config.js`의 `SEC_RULES`(제목)·`SEC_URL_RULES`(주소)에 규칙을 추가합니다.
+- **화면 감지 보강**: 업무 화면인데 안내가 뜨지 않으면 패널 🩺 진단에서 📸 기록·메모 후 보고서를 보내 주세요. 확장 진단 센터의 **🧩 ERP 규칙 제안**을 복사해 기관 설정 › ERP 화면 규칙에 붙여 넣고 `?` 자리에 절차 id를 넣어 저장합니다. 자주 쓰는 ERP 묶음을 새로 만들려면 `secretary/erp_presets.json`에 추가합니다.
 - 자세한 내용은 [extension/README.md](../extension/README.md)를 보세요.
 
 ## 8. 개인정보·저장 위치

@@ -40,3 +40,20 @@ test("countAttach: 첨부 목록 글에서 첨부 수", () => {
   assert.equal(C.countAttach("첨부된 파일이 없습니다"), 0);
   assert.equal(C.countAttach("결재 의견"), undefined);
 });
+
+test("readDates: 기관 칸 이름(설정 › ERP › 칸 이름) — 시작·끝·제외", () => {
+  const f = [{ label: "처리일자", value: "2026-10-20", row: 0 }, { label: "여행 개시", value: "2026-10-05", row: 1 }, { label: "귀임", value: "2026-10-07", row: 2 }];
+  assert.deepEqual(plain(C.readDates(f, { start: ["여행 개시"], end: ["귀임"], ignore: ["처리일자"] })), { start: "2026-10-05", end: "2026-10-07" });
+});
+
+test("config.js: 기관 ERP 규칙이 기본 규칙보다 먼저, 제외 주소·제출 버튼 이름", () => {
+  const g = vm.createContext({});
+  vm.runInContext(fs.readFileSync(new URL("../../extension/config.js", import.meta.url), "utf8"), g);
+  g.SEC_PROFILE = g.secCompileProfile({ screen_rules: [{ by: "url", match: "/hr/trip/", q: "출장 가요", proc: "domestic-trip" }, { by: "title", match: "여비\\s*청구", q: "정산", proc: "domestic-trip" }],
+    skip_paths: ["/approval/list"], submit_words: ["결재 상신"] });
+  const R = g.secRules();
+  assert.equal(R.url[0][2], "domestic-trip"); assert.ok(R.title[0][0].test("여비 청구서")); assert.ok(R.title.length > 1);
+  assert.ok(R.skip("/approval/list.do") && R.skip("/mail/inbox") && !R.skip("/hr/trip/apply"));
+  assert.ok(g.SEC_PROFILE.submit.has("결재상신"));
+  assert.equal(g.secCompileProfile({ screen_rules: [{ by: "url", match: "([" }] }).url.length, 0);   // 잘못된 정규식은 버림
+});

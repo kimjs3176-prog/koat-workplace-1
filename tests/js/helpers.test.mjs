@@ -167,8 +167,10 @@ test("guard: 상신 버튼 이름 — 메뉴(결재요청함)·취소는 제외,
   const fs = await import("node:fs");
   const src = fs.readFileSync(new URL("../../extension/guard.js", import.meta.url), "utf8");
   const rx = (name) => eval(src.match(new RegExp(`const ${name} = (/.*/[a-z]*);`))[1]);
-  const S = rx("SUBMIT"), E = rx("SUBMIT_ERP");
-  const hit = (t) => S.test(t) || E.test(t);
+  const S = rx("SUBMIT");
+  // 기관 ERP 제출 버튼 이름은 ERP 규칙 묶음(secretary/erp_presets.json)에서 — KOAT 묶음 기준
+  const koat = JSON.parse(fs.readFileSync(new URL("../../secretary/erp_presets.json", import.meta.url), "utf8")).presets.koat.submit_words.map((w) => w.replace(/\s+/g, ""));
+  const hit = (t) => S.test(t) || koat.includes(t.replace(/\s+/g, ""));
   for (const t of ["상신", "결재요청", "결재 상신하기", "제출", "서무확정요청", "여비정산신청", "출장신청"]) assert.ok(hit(t), t);
   for (const t of ["결재요청함", "결재상신함", "결재 요청 취소", "결재요청 현황", "보내기", "신청 내역"]) assert.ok(!hit(t), t);
 });

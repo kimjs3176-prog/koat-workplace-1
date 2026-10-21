@@ -2379,7 +2379,7 @@ def secretary_config_save():
     import extension_build
     erp_in = body.get("erp") if isinstance(body.get("erp"), dict) else {}
     hosts = [h for h in (extension_build.origin_pattern(str(x)) for x in (erp_in.get("hosts") or [])[:20]) if h]
-    cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40)}
+    cfg["erp"] = {"hosts": list(dict.fromkeys(hosts)), "name": _sec_clean_str(erp_in.get("name"), 40), **_sec_clean_erp_rules(erp_in)}
     # 화면에서 고치지 않는 고급 설정(감사 기준·집단 지식)은 받은 값, 없으면 기존 값을 그대로 둔다.
     # 저장소를 잠깐 못 읽었을 때 배포본의 옛 설정으로 덮어쓰지 않게, 읽기 실패(404 외)면 저장을 멈춘다.
     if _gh_enabled():
@@ -3719,6 +3719,86 @@ def _sec_public_origin() -> str:
     return f"{proto}://{host}" if host else ""
 
 
+# ── ERP 화면 규칙(다른 기관·다른 ERP 에서도 코드 수정 없이) ─────────────────────
+#   바탕 규칙 묶음(secretary/erp_presets.json: 일반·KOAT·더존·온나라·SAP) + 기관 맞춤 규칙(기관 설정 › ERP)
+#   → 확장이 화면 감지·결재 전 점검(제출 버튼 이름)·입력값 점검(칸 이름)에 쓴다.
+SEC_ERP_PRESETS_PATH = os.path.join(SEC_DIR, "erp_presets.json")
+
+
+def _sec_erp_presets() -> dict:
+    return (_sec_read_json(SEC_ERP_PRESETS_PATH, {}) or {}).get("presets") or {}
+
+
+def _sec_rx_ok(rx: str) -> bool:
+    """확장(JS)에서 쓸 정규식 — 파이썬으로도 컴파일되고 지나치게 길지 않은 것만."""
+    if not rx or len(rx) > 200:
+        return False
+    try:
+        re.compile(rx)
+        return True
+    except re.error:
+        return False
+
+
+def _sec_clean_erp_rules(e: dict) -> dict:
+    """기관 맞춤 ERP 규칙 정규화 — 바탕 묶음 이름, 제출 버튼 이름, 화면 규칙, 제외 경로, 칸 이름."""
+    e = e if isinstance(e, dict) else {}
+    out = {}
+    if e.get("preset") in _sec_erp_presets():
+        out["preset"] = e["preset"]
+    words = [_sec_clean_str(w, 30) for w in (e.get("submit_words") or [])[:40] if isinstance(w, str)]
+    if any(words):
+        out["submit_words"] = list(dict.fromkeys(w for w in words if w))
+    rules = []
+    for r in (e.get("screen_rules") or [])[:60]:
+        if not isinstance(r, dict):
+            continue
+        m, proc = str(r.get("match") or "").strip(), _sec_clean_str(r.get("proc"), 48).lower()
+        if _sec_rx_ok(m) and _SEC_ID_RE.match(proc):
+            rules.append({"by": "url" if r.get("by") == "url" else "title", "match": m, "proc": proc,
+                          "q": _sec_clean_str(r.get("q"), 80)})
+    if rules:
+        out["screen_rules"] = rules
+    skips = [str(x).strip() for x in (e.get("skip_paths") or [])[:40] if isinstance(x, str) and _sec_rx_ok(str(x).strip())]
+    if skips:
+        out["skip_paths"] = skips
+    labels = {}
+    for k in ("start", "end", "ignore"):
+        ws = [_sec_clean_str(w, 30) for w in ((e.get("labels") or {}).get(k) or [])[:20] if isinstance(w, str)]
+        if any(ws):
+            labels[k] = [w for w in ws if w]
+    if labels:
+        out["labels"] = labels
+    return out
+
+
+def _sec_erp_profile(cfg: dict | None = None) -> dict:
+    """확장에 줄 ERP 규칙 = 일반 묶음 + 고른 묶음 + 기관 맞춤(맞춤 화면 규칙이 앞 — 먼저 맞는 것을 쓴다)."""
+    cfg = cfg or _sec_config()
+    erp = cfg.get("erp") or {}
+    presets = _sec_erp_presets()
+    layers = [presets.get("generic") or {}]
+    if erp.get("preset") and erp["preset"] != "generic":
+        layers.append(presets.get(erp["preset"]) or {})
+    custom = _sec_clean_erp_rules(erp)
+    out = {"preset": erp.get("preset") or "generic", "submit_words": [], "screen_rules": list(custom.get("screen_rules") or []),
+           "skip_paths": [], "labels": {"start": [], "end": [], "ignore": []}}
+    for lay in layers + [custom]:
+        out["submit_words"] += [w for w in lay.get("submit_words") or [] if w not in out["submit_words"]]
+        out["skip_paths"] += [x for x in lay.get("skip_paths") or [] if x not in out["skip_paths"]]
+        for k in out["labels"]:
+            out["labels"][k] += [w for w in (lay.get("labels") or {}).get(k) or [] if w not in out["labels"][k]]
+        if lay is not custom:
+            out["screen_rules"] += list(lay.get("screen_rules") or [])
+    return out
+
+
+@app.route("/api/secretary/erp/presets")
+def secretary_erp_presets():
+    """관리 화면: 바탕 규칙 묶음 목록과 지금 확장에 가는 규칙(합친 결과)."""
+    return jsonify({"success": True, "presets": _sec_erp_presets(), "profile": _sec_erp_profile()})
+
+
 def _sec_ext_hosts() -> list:
     import extension_build
     hosts = (_sec_config().get("erp") or {}).get("hosts") or []
@@ -3745,7 +3825,7 @@ def secretary_extension_zip():
     svc = (_sec_config().get("service") or {})
     name = f"{org.get('abbr') or org.get('short') or ''} {svc.get('title') or '서무비서'}".strip()
     try:
-        data, man = extension_build.build_zip(server, _sec_ext_hosts(), name)
+        data, man = extension_build.build_zip(server, _sec_ext_hosts(), name, profile=_sec_erp_profile())
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
     resp = app.response_class(data, mimetype="application/zip")
@@ -3833,7 +3913,8 @@ def secretary_erp_meta():
                                                  for x in (p.get("pitfalls") or [])][:12],
                                     "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
                                    for p in procs.values() if not p.get("hidden")],
-                    "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", "")})
+                    "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", ""),
+                    "erp": _sec_erp_profile(cfg)})
 
 
 # ══════════════════════════════════════════════════════════════════════════

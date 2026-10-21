@@ -28,19 +28,30 @@ globalThis.SEC_RULES = [
   [/지출\s*결의/, "지출결의", "doc-approval"],
   [/기안|품의|전자\s*결재|결재\s*상신|공문|시행문|문서\s*작성|문서\s*관리\s*카드/, "기안 결재", "doc-approval"]
 ];
-// 제목 문구가 없는 화면(제목을 그림·스크립트로 그리는 ERP)은 주소 경로로 — 위 규칙이 하나도 안 맞을 때만 쓴다.
-// 아래는 KOAT ERP(kerp.koat.or.kr) 실제 시험 기록에서 뽑은 경로.
-globalThis.SEC_URL_RULES = [
-  [/\/koat\/bt\/btExp/i, "출장 다녀와서 정산해야 해요", "domestic-trip"],
-  [/\/koat\/bt\//i, "출장 가요", "domestic-trip"],
-  [/\/koat\/vac\//i, "휴가 신청", "leave"],
-  [/\/koat\/rb\//i, "시간외 근무", "overtime"],
-  [/\/koat\/outLecture\//i, "외부강의 나가요", "outside-lecture"],
-  [/cashDisbursementVoucher/i, "지출결의", "doc-approval"],
-  [/\/eapproval\/docCommonDrafWrite/i, "기안 결재", "doc-approval"],
-  // 온나라(onnara.koat.or.kr) 문서관리 — 기안·공문 작성 화면
-  [/\/bms\/dct\/|\/bms\/.*(draft|Draft|write|Write|regist|Regist)/, "기안 결재", "doc-approval"]   // 문서관리카드(기안 작성 창)
-];
-// 업무를 알아보지 않을 화면(주소 경로) — 메일·일정·자원예약·게시판은 제목에 '세미나실' 같은 말이 있어도 업무 화면이 아니다
-// 진단 기록(2026-10-16): 배너 프레임·포털 포틀릿(결재현황 등)·문서뷰어·로그인 화면도 업무 화면이 아니다
-globalThis.SEC_SKIP_URL = /\/mail2?\/|bizboxMail|\/schedule\/|\/board\/|\/gw\/html\/|\/portlet\/|SynapDocView|\/uat\/uia\/|[Ll]ogin/i;
+// 제목 문구가 없는 화면(제목을 그림·스크립트로 그리는 ERP)은 주소 경로로 — 기관 ERP 의 주소 규칙은 아래 'ERP 규칙'에서 온다.
+globalThis.SEC_URL_RULES = [];
+// 업무를 알아보지 않을 화면(주소 경로) — 메일·일정·게시판·포털 포틀릿·로그인은 제목에 '세미나실' 같은 말이 있어도 업무 화면이 아니다
+globalThis.SEC_SKIP_URL = /\/mail2?\/|\/schedule\/|\/board\/|\/portlet\/|\/uat\/uia\/|[Ll]ogin/i;
+
+// ── ERP 규칙(기관·ERP 마다 다른 것) ─────────────────────────────────────────
+// 서무비서 기관 설정 › ERP 에서 고른 바탕 묶음(일반·KOAT·더존·온나라·SAP)과 기관 맞춤 규칙을 합친 것.
+// 서버(/api/secretary/erp/meta)에서 받아 쓰고, 기관 배포본에는 받을 수 없을 때를 대비해 아래 값이 미리 들어간다.
+//   submit_words: 이름 전체가 같을 때만 결재 전 점검을 띄우는 제출 버튼 이름(메뉴 안 링크 제외)
+//   screen_rules: [{by:'url'|'title', match:정규식, q:물을 말, proc:절차 id}] — 기본 규칙보다 먼저 본다
+//   skip_paths:   업무 화면이 아닌 주소(정규식)   labels: 입력값 점검이 날짜 칸을 알아볼 칸 이름 {start, end, ignore}
+globalThis.SEC_PROFILE_DEFAULT = null;
+globalThis.secCompileProfile = (p) => {
+  const rx = (s) => { try { return new RegExp(s, "i"); } catch (e) { return null; } };
+  p = p || {};
+  const rules = (by) => (p.screen_rules || []).filter((r) => (r.by || "title") === by).map((r) => [rx(r.match), r.q || "", r.proc || ""]).filter((r) => r[0]);
+  const norm = (s) => String(s || "").replace(/\s+/g, "");
+  return { title: rules("title"), url: rules("url"), skip: (p.skip_paths || []).map(rx).filter(Boolean),
+    submit: new Set((p.submit_words || []).map(norm).filter(Boolean)), labels: p.labels || {}, preset: p.preset || "" };
+};
+globalThis.SEC_PROFILE = globalThis.secCompileProfile(globalThis.SEC_PROFILE_DEFAULT);
+// 기관 규칙을 앞에 둔 전체 규칙 — 내용 스크립트·서비스 워커 공통
+globalThis.secRules = () => {
+  const P = globalThis.SEC_PROFILE || globalThis.secCompileProfile(null);
+  return { title: [...P.title, ...(globalThis.SEC_RULES || [])], url: [...P.url, ...(globalThis.SEC_URL_RULES || [])],
+    skip: (path) => (globalThis.SEC_SKIP_URL && SEC_SKIP_URL.test(path)) || P.skip.some((r) => r.test(path)) };
+};

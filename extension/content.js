@@ -249,17 +249,18 @@
   // 이 프레임이 알려 둔 업무가 더는 화면에 없으면 지우게 한다
   function forget() { if (lastSent) { lastSent = ""; chrome.runtime.sendMessage({ type: "frameNav" }).catch(() => {}); } }
   function detect() {
-    if (globalThis.SEC_SKIP_URL && globalThis.SEC_SKIP_URL.test(location.pathname)) { forget(); return; }
+    const R = globalThis.secRules();                   // 기관 ERP 규칙(설정 › ERP) + 기본 규칙
+    if (R.skip(location.pathname)) { forget(); return; }
     const texts = candidates();
     let ctx = null;
     // rank: 규칙 순서 — 여러 프레임이 서로 다른 업무를 알아보면 더 구체적인(앞쪽) 규칙을 쓴다
     {                                                   // 기관 ERP 의 주소가 정확한 화면(신청서 팝업 등)은 주소가 먼저
-      const base = (globalThis.SEC_RULES || []).length;
-      for (const [i, [rx, q, proc]] of (globalThis.SEC_URL_RULES || []).entries()) {
+      const base = R.title.length;
+      for (const [i, [rx, q, proc]] of R.url.entries()) {
         if (rx.test(location.pathname)) { ctx = { q, title: q, proc: proc || "", rank: base + i, byUrl: true }; break; }
       }
     }
-    if (!ctx) for (const [i, [rx, q, proc]] of (globalThis.SEC_RULES || []).entries()) {
+    if (!ctx) for (const [i, [rx, q, proc]] of R.title.entries()) {
       const hit = texts.find((t) => rx.test(t));
       // '잔여연차 : 9.29' 처럼 숫자 섞인 긴 문구는 화면 이름으로 쓰지 않는다(개인 정보·매번 바뀜)
       if (hit) { ctx = { q, title: (/\d/.test(hit) && hit.length > 10 ? q : hit).slice(0, 40), proc: proc || "", rank: i }; break; }
@@ -272,13 +273,15 @@
     }
     const key = JSON.stringify(ctx);
     // 어느 프레임에서 찾았든 서비스 워커가 맨 위 프레임의 🗂 버튼에 다시 알려 준다
-    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: ctx.byUrl ? "주소 규칙" : "기본 규칙", hit: ctx.byUrl ? location.pathname : (texts.find((t) => (globalThis.SEC_RULES || [])[ctx.rank] && globalThis.SEC_RULES[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
+    if (key !== lastSent) { lastSent = key; dlog("detect", { ctx, by: ctx.byUrl ? "주소 규칙" : ctx.rank < (globalThis.SEC_PROFILE || { title: [] }).title.length ? "기관 규칙" : "기본 규칙", hit: ctx.byUrl ? location.pathname : (texts.find((t) => R.title[ctx.rank] && R.title[ctx.rank][0].test(t)) || "") }); chrome.runtime.sendMessage({ type: "context", context: ctx }).catch(() => {}); }
   }
   let timer = null;
   const schedule = () => { clearTimeout(timer); timer = setTimeout(detect, 600); };
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("hashchange", schedule);
   chrome.runtime.sendMessage({ type: "hello" }).catch(() => {});   // 이 탭에 확장이 붙었음을 알림(IE 모드 등 판별용)
+  // 기관 ERP 규칙(서무비서 기관 설정 › ERP)을 받아 화면 감지·결재 전 점검에 쓴다 — 받으면 다시 감지
+  chrome.runtime.sendMessage({ type: "profile" }).then((p) => { if (p && p.profile) { globalThis.SEC_PROFILE = globalThis.secCompileProfile(p.profile); schedule(); } }).catch(() => {});
   schedule();
   setTimeout(() => { if (uiFrame()) setChip("", ""); }, TOP ? 0 : 800);   // 감지 전에도 🗂 버튼은 보이게(frameset 은 프레임이 다 뜬 뒤 판단)
 

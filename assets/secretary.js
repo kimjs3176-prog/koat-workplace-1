@@ -809,6 +809,54 @@ function packCard(){
     `<label class="sec-btn sm ghost">⬆ 가져오기<input type="file" accept=".json,application/json" data-a="packfile" hidden></label></div>`+prev+
     `<div class="sec-hint">팩에는 절차·초안 서식과, 절차가 참조하는 규정의 이름·개정 정보가 함께 들어갑니다. 받는 기관은 가져온 뒤 <b>규정명 매핑</b>으로 자기 규정에 연결합니다.</div></div>`;
 }
+// ── 관리: ERP 화면 규칙(다른 ERP 에서도) — 바탕 묶음 + 기관 맞춤. 저장하면 모든 사용자 확장에 반영 ─────────
+const ERP_RULE_KEYS=['submit','screens','skip','labels'];
+function erpRulesText(e, k){
+  if(S._erpRaw && S._erpRaw[k]!=null) return S._erpRaw[k];
+  if(k==='submit') return (e.submit_words||[]).join('\n');
+  if(k==='screens') return (e.screen_rules||[]).map(r=>`${r.by==='url'?'주소':'제목'}:${r.match} => ${r.proc}${r.q?' | '+r.q:''}`).join('\n');
+  if(k==='skip') return (e.skip_paths||[]).join('\n');
+  const lb=e.labels||{}; return [['시작','start'],['끝','end'],['제외','ignore']].filter(([,x])=>(lb[x]||[]).length).map(([n,x])=>`${n}: ${lb[x].join(', ')}`).join('\n');
+}
+// 칸 글 → 규칙(잘못된 줄은 problems 에 모은다)
+function erpRulesParse(k, txt){
+  const lines=String(txt||'').split('\n').map(x=>x.replace(/\s+#.*$/,'').trim()).filter(Boolean); const problems=[];
+  const rxOk=r=>{ try{ new RegExp(r); return r.length<=200; }catch(e){ return false; } };
+  if(k==='submit') return {val:{submit_words:[...new Set(lines.flatMap(l=>l.split(',')).map(x=>x.trim()).filter(Boolean))].slice(0,40)}, problems};
+  if(k==='skip'){ lines.forEach(l=>{ if(!rxOk(l)) problems.push(`제외 주소 '${l}' — 정규식이 올바르지 않습니다`); }); return {val:{skip_paths:lines.filter(rxOk)}, problems}; }
+  if(k==='labels'){ const o={start:[],end:[],ignore:[]}; const map={'시작':'start','끝':'end','종료':'end','제외':'ignore'};
+    lines.forEach(l=>{ const m=l.match(/^(시작|끝|종료|제외)\s*[:：]\s*(.*)$/); if(!m){ problems.push(`칸 이름 '${l}' — "시작: 출발일, 출장일자" 꼴로 적으세요`); return; }
+      o[map[m[1]]].push(...m[2].split(',').map(x=>x.trim()).filter(Boolean)); });
+    return {val:{labels:o}, problems}; }
+  const ids=new Set(allProcs().map(p=>p.id)); const rules=[];
+  lines.forEach(l=>{ const m=l.match(/^(주소|제목|url|title)\s*[:：]\s*(.+?)\s*=>\s*([^\s|]+)\s*(?:\|\s*(.*))?$/i);
+    if(!m){ problems.push(`화면 규칙 '${l.slice(0,40)}' — "주소:/경로/ => 절차id | 물을 말" 꼴로 적으세요`); return; }
+    if(!rxOk(m[2])){ problems.push(`화면 규칙 '${m[2]}' — 정규식이 올바르지 않습니다`); return; }
+    if(!ids.has(m[3])){ problems.push(`화면 규칙 '${m[2]}' — 절차 id '${m[3]}'가 없습니다(절차 목록의 id를 넣으세요)`); return; }
+    rules.push({by:/^(주소|url)$/i.test(m[1])?'url':'title', match:m[2], proc:m[3], q:(m[4]||'').trim()}); });
+  return {val:{screen_rules:rules}, problems};
+}
+function erpRulesBlock(c){
+  const e=c.erp||{}; const P=S.erpPresets;
+  if(!P && !S._erpPresetsLoading){ S._erpPresetsLoading=true;
+    fetch('/api/secretary/erp/presets').then(r=>r.json()).then(d=>{ S.erpPresets=d; S._erpPresetsLoading=false; if(S.view==='manage') render(); }).catch(()=>{ S._erpPresetsLoading=false; }); }
+  const ps=(P&&P.presets)||{}; const cur=e.preset||'generic'; const pr=ps[cur]||{}; const prof=(P&&P.profile)||null;
+  const ta=(k,rows,ph,l,sub)=>`<label class="sec-f"><span>${l} <span class="sec-sub">${sub}</span></span><textarea data-a="cfgerprule" data-k="${k}" rows="${rows}" placeholder="${esc(ph)}">${esc(erpRulesText(e,k))}</textarea></label>`;
+  const procIds=allProcs().filter(p=>!p.hidden).map(p=>`${p.id}(${shortTitle(p.title)})`).join(', ');
+  return `<details class="sec-erp"${S._erpOpen?' open':''}><summary><b>🧩 ERP 화면 규칙</b> <span class="sec-sub">다른 ERP·그룹웨어에서도 — 화면 감지·결재 전 점검·입력값 점검이 쓰는 규칙(코드 수정 없이)</span></summary>`+
+    `<label class="sec-f"><span>바탕 규칙 묶음</span><select data-a="cfgerprule" data-k="preset">`+
+      (Object.keys(ps).length?Object.entries(ps).sort(([a],[b])=>(a==='generic'?-1:b==='generic'?1:0)).map(([k,v])=>`<option value="${esc(k)}"${k===cur?' selected':''}>${esc(v.name||k)}${v.verified===false?' — 검증 전':''}</option>`).join(''):`<option>${esc(cur)}</option>`)+`</select></label>`+
+    (pr.note?`<div class="sec-hint">${pr.verified===false?'⚠ ':''}${esc(pr.note)} <span class="sec-sub">묶음: 제출 버튼 ${(pr.submit_words||[]).length} · 화면 규칙 ${(pr.screen_rules||[]).length} · 제외 주소 ${(pr.skip_paths||[]).length}</span></div>`:'')+
+    `<div class="sec-hint">아래는 묶음 위에 <b>더하는 기관 맞춤 규칙</b>입니다. ERP에서 확장 진단 센터의 <b>🧩 ERP 규칙 제안</b>을 복사해 붙여 넣으면 됩니다.</div>`+
+    ta('submit',3,'결재상신\n여비정산신청','제출 버튼 이름(줄마다)','이름 전체가 같을 때만 결재 전 점검 — 메뉴 안 링크는 제외')+
+    ta('screens',4,'주소:/hr/trip/apply => domestic-trip | 출장 가요\n제목:여비\\s*청구 => domestic-trip','화면 규칙(줄마다)','"주소:정규식" 또는 "제목:정규식" => 절차 id | 물을 말')+
+    `<div class="sec-sub" style="margin:-4px 0 8px">절차 id: ${esc(procIds)}</div>`+
+    ta('skip',2,'/mail/\n/approval/list','업무 화면이 아닌 주소(줄마다 정규식)','메일·게시판·결재함 목록 등')+
+    ta('labels',3,'시작: 출장일자, 여행시작\n끝: 귀임일\n제외: 처리일자','입력값 점검 칸 이름','날짜 칸을 알아보는 이름 — 시작·끝·제외')+
+    (S._erpProblems&&S._erpProblems.length?`<div class="sec-notice warn">${S._erpProblems.map(esc).join('<br>')}</div>`:'')+
+    (prof?`<div class="sec-sub">지금 확장에 가는 규칙(저장된 것): 제출 버튼 ${prof.submit_words.length} · 화면 규칙 ${prof.screen_rules.length} · 제외 주소 ${prof.skip_paths.length} — 확장은 30분 안에 새 규칙을 받습니다.</div>`:'')+
+    `</details>`;
+}
 // ── 관리: 기관 설정 ─────────────────────────────────────────────────────
 function configCard(){
   const c=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); S._cfgDraft=c;
@@ -823,6 +871,7 @@ function configCard(){
     `<div class="sec-card-h" style="margin-top:6px;">명칭 <span class="sec-sub">절차 문장의 [[erp]] 등이 이 이름으로 바뀝니다</span></div>`+
     `<div class="sec-eg">${f('terms.erp','업무 시스템',t.erp,'ERP')}${f('terms.portal','내부 포털',t.portal,'그룹웨어')}${f('terms.accounting','회계 담당 부서',t.accounting,'회계부서')}${f('terms.approval','결재 시스템',t.approval,'전자결재')}</div>`+
     `<label class="sec-f"><span>ERP·그룹웨어 주소(줄마다 하나) <span class="sec-sub">🧩 ERP 확장 배포본에 들어갑니다. 예) https://kerp.koat.or.kr</span></span><textarea data-a="cfgerp" rows="2" placeholder="https://kerp.koat.or.kr">${esc(((c.erp||{}).hosts||[]).map(h=>h.replace(/\/\*$/,'')).join('\n'))}</textarea></label>`+
+    erpRulesBlock(c)+
     `<label class="sec-f"><span>기관 휴일(줄마다 "YYYY-MM-DD 이름") <span class="sec-sub">법정 공휴일은 기본 탑재 — 창립기념일·근로자의 날 등만 적으세요</span></span><textarea data-a="cfghol" rows="3" placeholder="2026-05-01 근로자의 날">${esc(hol)}</textarea></label>`+
     `<div class="sec-row"><button class="sec-btn primary sm" data-a="cfgsave">기관 설정 저장</button><span class="sec-sub">${S.cfg.updated?'최종 저장 '+esc(S.cfg.updated):''}</span></div></details>`;
 }
@@ -1189,7 +1238,7 @@ function bind(panel){
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -1211,7 +1260,10 @@ function bind(panel){
       case 'draft': openDraft(D.d); break;
       case 'aliassave': { const c=JSON.parse(JSON.stringify(S.cfg)); c.reg_aliases=Object.fromEntries(Object.entries(S._aliasDraft||{}).filter(([k,v])=>v));
         saveConfig(c, '규정명 매핑을 저장했습니다. 절차의 근거·서식이 새 연결로 열립니다.'); break; }
-      case 'cfgsave': { const c=S._cfgDraft||S.cfg; if(!String((c.org||{}).name||'').trim()){ toast('기관명을 입력하세요.'); break; } S._cfgOpen=true; saveConfig(c, '기관 설정을 저장했습니다.'); break; }
+      case 'cfgsave': { const c=S._cfgDraft||S.cfg; if(!String((c.org||{}).name||'').trim()){ toast('기관명을 입력하세요.'); break; } S._cfgOpen=true;
+        S._erpProblems=Object.entries(S._erpRaw||{}).flatMap(([k,v])=>erpRulesParse(k,v).problems);
+        if(S._erpProblems.length){ S._erpOpen=true; render(); toast('ERP 화면 규칙에 고칠 줄이 있습니다.', 4200); break; }
+        saveConfig(c, '기관 설정을 저장했습니다.').then(ok=>{ if(ok){ S._erpRaw=null; S.erpPresets=null; } }); break; }
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
@@ -1288,6 +1340,9 @@ function bind(panel){
     if(a==='formsin'){ S.formsQ=el.value; renderFormsList(); return; }
     if(a==='tokg'){ S._tok=el.value.trim(); return; }
     if(a==='cfg'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); const [g,k]=el.dataset.p.split('.'); c[g]=c[g]||{}; c[g][k]=el.value; return; }
+    if(a==='cfgerprule'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}); S._erpOpen=true;
+      const k=el.dataset.k; if(k==='preset'){ c.erp.preset=el.value; render(); return; }
+      S._erpRaw=S._erpRaw||{}; S._erpRaw[k]=el.value; Object.assign(c.erp, erpRulesParse(k, el.value).val); return; }
     if(a==='cfgerp'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}, {hosts:el.value.split('\n').map(x=>x.trim()).filter(Boolean)}); return; }
     if(a==='cfghol'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.holidays=c.holidays||{};
       c.holidays.extra=el.value.split('\n').map(l=>l.trim().match(/^(\d{4}-\d{2}-\d{2})\s*(.*)$/)).filter(Boolean).map(m=>({date:m[1], name:m[2]||'기관 휴일'})); return; }

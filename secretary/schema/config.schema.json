@@ -70,6 +70,21 @@
     }
    }
   },
+  "erp": {
+   "type": "object",
+   "description": "ERP·그룹웨어 — 확장 배포 주소와 화면 규칙. preset 은 secretary/erp_presets.json 의 바탕 묶음, 나머지는 그 위에 더하는 기관 맞춤 규칙",
+   "properties": {
+    "hosts": {"type": "array", "items": {"type": "string"}},
+    "name": {"type": "string"},
+    "preset": {"type": "string"},
+    "submit_words": {"type": "array", "items": {"type": "string"}, "description": "이름 전체가 같을 때만 결재 전 점검을 띄우는 제출 버튼 이름"},
+    "screen_rules": {"type": "array", "items": {"type": "object", "required": ["match", "proc"],
+                     "properties": {"by": {"enum": ["url", "title"]}, "match": {"type": "string"}, "proc": {"type": "string"}, "q": {"type": "string"}}}},
+    "skip_paths": {"type": "array", "items": {"type": "string"}},
+    "labels": {"type": "object", "properties": {"start": {"type": "array", "items": {"type": "string"}},
+               "end": {"type": "array", "items": {"type": "string"}}, "ignore": {"type": "array", "items": {"type": "string"}}}}
+   }
+  },
   "reg_aliases": {
    "type": "object",
    "description": "절차가 참조하는 규정명 → 우리 기관 규정명",
