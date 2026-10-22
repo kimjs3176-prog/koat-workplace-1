@@ -184,3 +184,13 @@ test("parseSchedText: 회신·제출 기한과 'N일 전까지'는 일정 날짜
   assert.deepEqual([c.date, c.end], ["2026-10-27", "2026-10-29"]);
   assert.equal(T.schedTime("2:30 ~ 4:00"), "14:30");
 });
+
+test("parseSchedText: 공문식 날짜 '11. 3.(화) ~ 5.(목)'·'2026.11.3.~11.5.'·제목 앞 날짜 떼기", () => {
+  const P = (t) => plain(T.parseSchedText(t, "2026-10-22"));
+  assert.deepEqual([P("일시 : 12. 30.(수) 오후 2시").date, P("일시 : 12. 30.(수) 오후 2시").time], ["2026-12-30", "14:00"]);
+  assert.deepEqual(((r) => [r.title, r.date, r.end])(P("11. 3.(화) ~ 11. 5.(목) 세종 출장")), ["세종 출장", "2026-11-03", "2026-11-05"]);
+  assert.deepEqual(((r) => [r.date, r.end])(P("2026.11.3.~11.5. 워크숍")), ["2026-11-03", "2026-11-05"]);
+  assert.deepEqual(((r) => [r.title, r.end])(P("2026. 11. 3.(화) ~ 4.(수) 교육")), ["교육", "2026-11-04"]);
+  assert.equal(P("11월 3일부터 5일까지 세종 출장").title, "세종 출장");
+  assert.equal(P("확장 1.4.6 배포").date, "");                          // 판 번호는 날짜가 아님
+});

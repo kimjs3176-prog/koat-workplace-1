@@ -187,7 +187,10 @@ async function deadlineItems() {
   // 패널·웹 탭은 저장소가 따로라 각자 보낸다. 다른 쪽이 더 최근에 보냈고 이쪽이 2주 넘게 소식이 없으면
   // (예: 다시 열지 않는 웹 탭) 이미 끝낸 건이 배지에 남지 않게 뺀다.
   const srcs = Object.values(deadlines || {}); const newest = Math.max(0, ...srcs.map((s) => s.ts || 0));
+  const today = ymd(new Date());
   for (const src of srcs) if ((src.ts || 0) >= newest - 14 * 864e5) for (const it of src.items || []) {
+    // 내 일정(회의·교육)은 기한이 아니다 — 끝난 일정은 '기한 지남'으로 세지 않고 뺀다(웹을 다시 열 때까지 남지 않게)
+    if (it.kind === "sched" && (it.last || it.date) < today) continue;
     const k = it.caseId + "|" + it.i;
     if (!seen.has(k)) { seen.add(k); out.push(it); }
   }
