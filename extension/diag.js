@@ -69,9 +69,11 @@ function findings() {
 const rxEsc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function suggestion() {
   const L = curLog();
-  const submit = uniq(L.filter((e) => e.ev === "button" && e.d && !e.d.submit && !e.d.menu && e.d.tag !== "a"
-    && /상신|결재|제출|신청$|요청$|올림|Submit|Approv/i.test(e.d.label || "") && !MENU_LIKE.test(e.d.label || "")).map((e) => e.d.label)).slice(0, 15);
-  const none = {}; L.filter((e) => e.ev === "detect.none" && e.d && e.d.url).forEach((e) => { none[e.d.url] = (e.d.texts || []).filter((t) => t && t.length <= 20); });
+  // 링크 모양 버튼(<a href="javascript:…">)도 후보 — 메뉴 안 링크만 뺀다. 취소·결재선·의견·이력 같은 말은 제출이 아니다
+  const submit = uniq(L.filter((e) => e.ev === "button" && e.d && !e.d.submit && !e.d.menu
+    && /상신|결재|제출|신청$|요청$|올림|Submit|Approv/i.test(e.d.label || "") && !/취소|결재선|의견|이력|조회|현황|목록/.test(e.d.label || "")
+    && !MENU_LIKE.test(e.d.label || "")).map((e) => e.d.label)).slice(0, 15);
+  const none = {}; L.filter((e) => e.ev === "detect.none" && e.d && e.d.url).forEach((e) => { none[String(e.d.url).replace(/;jsessionid=[^/?#]*/i, "")] = (e.d.texts || []).filter((t) => t && t.length <= 20); });
   const screens = Object.entries(none).slice(0, 15).map(([u, ts]) => `주소:${rxEsc(u)} => ? | ${ts[0] || ""}   # 화면 글: ${ts.slice(0, 4).join(" · ")}`);
   const parts = [];
   if (submit.length) parts.push("[제출 버튼 이름]\n" + submit.join("\n"));

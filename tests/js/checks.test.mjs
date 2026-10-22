@@ -57,3 +57,18 @@ test("config.js: 기관 ERP 규칙이 기본 규칙보다 먼저, 제외 주소�
   assert.ok(g.SEC_PROFILE.submit.has("결재상신"));
   assert.equal(g.secCompileProfile({ screen_rules: [{ by: "url", match: "([" }] }).url.length, 0);   // 잘못된 정규식은 버림
 });
+
+test("점검 보강: 영문 칸 이름 경계·작성 시각 제외·안내문 첨부·자릿수 넘친 날짜", () => {
+  const d = plain(C.readDates([{ label: "From", value: "2026-10-01", row: 0 }, { label: "Total", value: "2026-10-22", row: 1 }, { label: "To", value: "2026-10-05", row: 2 }], { start: ["From"], end: ["To"] }));
+  assert.deepEqual(d, { start: "2026-10-01", end: "2026-10-05" });
+  const t = C.readTimes([{ label: "작성시간", value: "14:35", row: 0 }, { label: "정규근무시간", value: "09:00", row: 1 }, { label: "정규근무시간", value: "18:00", row: 1 },
+    { label: "시간외근무", value: "18:00", row: 2 }, { label: "시간외근무", value: "21:00", row: 2 }]);
+  assert.deepEqual(plain(t), { from: 18 * 60, to: 21 * 60 });
+  assert.equal(C.countAttach("※ 증빙 첨부파일이 없는 경우 반려됩니다\n첨부파일 (2)"), 2);
+  assert.equal(C.countAttach("※ 증빙 첨부파일이 없는 경우 반려됩니다"), undefined);
+  assert.equal(C.parseDate("2026-10-123"), "");
+});
+
+test("readDates: 이름으로 못 가린 같은 줄 두 날짜 → 시작·끝", () => {
+  assert.deepEqual(plain(C.readDates([{ label: "출장", value: "2026-10-01", row: 3 }, { label: "출장", value: "2026-10-09", row: 3 }])), { start: "2026-10-01", end: "2026-10-09" });
+});
