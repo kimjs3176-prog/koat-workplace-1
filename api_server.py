@@ -2219,6 +2219,11 @@ _SEC_Q_STOP = {"어떻게", "얼마", "얼마나", "언제", "언제까지", "�
                "누가", "몇", "인가요", "건가요", "맞나요", "되는", "하는", "있는", "없는", "우리", "기관", "규정", "내규"}
 
 
+_SEC_DF_CACHE: dict = {}                 # (조문 색인, 낱말) → 그 낱말이 든 조문 수
+_SEC_Q_SYN = {"나눠": "분할", "나누어": "분할", "쪼개": "분할", "반차": "반일", "월급": "보수", "야근": "시간외", "선물": "금품",
+              "출장비": "여비", "경조사": "경조", "재택": "재택근무", "카드": "법인카드", "사례금": "사례금"}
+
+
 def _sec_related_items(q: str, n: int = 12, semantic: bool = True) -> list:
     """상황·질문 문장 → 관련 조문 [{reg, art, art_title, preview, text, score, src}] (키워드 + 의미 검색)."""
     words = [w for w in re.split(r"[\s,.!?？~·]+", q) if len(w) >= 2]
@@ -2230,18 +2235,37 @@ def _sec_related_items(q: str, n: int = 12, semantic: bool = True) -> list:
         if len(s) >= 2:
             stems.add(s)
     stems -= _SEC_Q_STOP
+    for w in list(stems):                                 # 말하는 말 → 규정에 쓰는 말("나눠 쓰다" → "분할")
+        for k, v in _SEC_Q_SYN.items():
+            if w.startswith(k):
+                stems.add(v)
+    chunks = _sec_chunks()
+    # 드문 낱말일수록 무겁게(IDF) — '있어'·'기준'처럼 어디에나 있는 말이 순위를 흐리지 않게
+    import math
+    n_all = max(1, len(chunks))
+    idf = {}
+    for s_ in stems:
+        key = (id(chunks), s_)
+        if key not in _SEC_DF_CACHE:
+            if len(_SEC_DF_CACHE) > 5000:
+                _SEC_DF_CACHE.clear()
+            _SEC_DF_CACHE[key] = sum(1 for t, no, at, text in chunks if s_ in text or s_ in (at or ""))
+        df = _SEC_DF_CACHE[key]
+        idf[s_] = math.log((n_all + 1) / (df + 1)) if df else 0.0
     scored = []
-    for t, no, at, text in _sec_chunks():
+    for t, no, at, text in chunks:
         head = (t + " " + (at or ""))
-        sc = 0
-        for s in stems:
-            if s in head:
-                sc += 3
-            c = text.count(s)
-            if c:
-                sc += min(c, 4)
+        sc, hit = 0.0, 0
+        for s_ in stems:
+            w_ = idf.get(s_, 0.0)
+            if not w_:
+                continue
+            got = (3 if s_ in head else 0) + min(text.count(s_), 4)
+            if got:
+                sc += w_ * got
+                hit += 1
         if sc:
-            scored.append((sc, t, no, at, text))
+            scored.append((round(sc * (1 + 0.5 * (hit - 1)), 2), t, no, at, text))   # 여러 낱말이 함께 맞을수록 위로
     scored.sort(key=lambda x: -x[0])
     items, seen = [], set()
     for sc, t, no, at, text in scored[:40]:

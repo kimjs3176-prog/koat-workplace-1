@@ -171,3 +171,14 @@ def test_erp_meta_and_zip_carry_profile(client):
     cfg = z.read("secretary-extension/config.js").decode()
     assert "SEC_PROFILE_DEFAULT = {" in cfg and "/koat/bt/" in cfg
     assert client.get("/api/secretary/erp/presets").get_json()["presets"]["sap"]["verified"] is False
+
+
+def test_related_items_find_the_right_article():
+    """규정 질의응답의 조문 찾기(키워드) — 흔한 물음에서 답이 든 조문이 위 5개 안에."""
+    cases = {"반차 쓰면 연차 몇 개 차감돼?": ("복무규정", "31"), "경조사 휴가 며칠": ("복무규정", "34"),
+             "병가 며칠 넘으면 진단서 필요해?": ("복무규정", "33"), "숙박비 상한 얼마야": ("여비규정", "15"),
+             "육아휴직 몇 번 나눠 쓸 수 있어?": ("인사규정", "55"), "선물 받으면 신고해야 하나요": ("임직원 행동강령", "20"),
+             "연차 저축 가능해?": ("복무규정", "29"), "출장 다녀오면 정산은 언제까지 해야 하나요": ("여비규정", "8")}
+    for q, want in cases.items():
+        top = [(x["reg"], x["art"]) for x in api_server._sec_related_items(q, n=8, semantic=False)[:5]]
+        assert want in top, (q, top)
