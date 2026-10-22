@@ -154,16 +154,27 @@ async function inFrames(tabId, fn, arg) {
 }
 
 // ── 서무비서 메타(절차·반려 점검 항목) — 결재 전 점검에 쓴다 ─────────────────
+// 여러 프레임·점검이 한꺼번에 불러도 한 번만 받는다(진행 중인 요청을 함께 씀). 응답 없는 사내 주소는 5초에서 끊고,
+// 실패는 1분간 다시 시도하지 않는다(그동안은 저장해 둔 값으로).
+let _metaP = null, _metaFailAt = 0;
 async function getMeta(force) {
   const { server } = await settings();
   const { meta } = await chrome.storage.local.get("meta");
   if (!server) return meta ? meta.data : null;
   if (!force && meta && Date.now() - meta.ts < 30 * 60 * 1000) return meta.data;
-  try {
-    const data = await (await fetch(server + "/api/secretary/erp/meta", { cache: "no-store" })).json();
-    if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); if (data.erp) SEC_PROFILE = secCompileProfile(data.erp); diag("bg", "meta.fetch", { ok: true, procedures: (data.procedures || []).length }); return data; }
-  } catch (e) { diag("bg", "meta.fetch", { ok: false, err: e.message }); }
-  return meta ? meta.data : null;
+  if (!force && Date.now() - _metaFailAt < 60 * 1000) return meta ? meta.data : null;
+  if (_metaP) return _metaP;
+  _metaP = (async () => {
+    const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), 5000);
+    try {
+      const data = await (await fetch(server + "/api/secretary/erp/meta", { cache: "no-store", signal: ac.signal })).json();
+      if (data && data.success) { await chrome.storage.local.set({ meta: { ts: Date.now(), data } }); if (data.erp) SEC_PROFILE = secCompileProfile(data.erp); diag("bg", "meta.fetch", { ok: true, procedures: (data.procedures || []).length }); return data; }
+      _metaFailAt = Date.now();
+    } catch (e) { _metaFailAt = Date.now(); diag("bg", "meta.fetch", { ok: false, err: e.name === "AbortError" ? "5초 안에 응답 없음" : e.message }); }
+    finally { clearTimeout(tm); _metaP = null; }
+    return meta ? meta.data : null;
+  })();
+  return _metaP;
 }
 // 기관 ERP 규칙 — 서버 메타의 erp(없으면 배포본에 들어 있는 값). 내용 스크립트는 'profile' 메시지로 받는다
 async function erpProfile() { const m = await getMeta(); return (m && m.erp) || SEC_PROFILE_DEFAULT || null; }
@@ -187,7 +198,10 @@ async function deadlineItems() {
   // 패널·웹 탭은 저장소가 따로라 각자 보낸다. 다른 쪽이 더 최근에 보냈고 이쪽이 2주 넘게 소식이 없으면
   // (예: 다시 열지 않는 웹 탭) 이미 끝낸 건이 배지에 남지 않게 뺀다.
   const srcs = Object.values(deadlines || {}); const newest = Math.max(0, ...srcs.map((s) => s.ts || 0));
+  const today = ymd(new Date());
   for (const src of srcs) if ((src.ts || 0) >= newest - 14 * 864e5) for (const it of src.items || []) {
+    // 내 일정(회의·교육)은 기한이 아니다 — 끝난 일정은 '기한 지남'으로 세지 않고 뺀다(웹을 다시 열 때까지 남지 않게)
+    if (it.kind === "sched" && (it.last || it.date) < today) continue;
     const k = it.caseId + "|" + it.i;
     if (!seen.has(k)) { seen.add(k); out.push(it); }
   }

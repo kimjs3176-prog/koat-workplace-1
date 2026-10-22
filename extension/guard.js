@@ -13,7 +13,9 @@
   const inMenu = (el) => !!el.closest('nav,[role="menu"],[role="menubar"],[role="tree"],[role="tablist"],[class*="menu" i],[id*="menu" i],[class*="lnb" i],[class*="gnb" i],[class*="snb" i],[class*="tree" i]');   // (class 'tab' 은 table 과 겹쳐 쓰지 않는다)
   // 메뉴 안 링크·메뉴 항목은 화면을 여는 것 — 'menu' 가 이름에 든 도구 막대의 진짜 버튼은 그대로 점검한다
   const menuLink = (el) => inMenu(el) && (el.tagName === "A" || /^(menuitem|treeitem|tab|link)$/.test(el.getAttribute("role") || ""));
-  const isSubmitLabel = (el, t) => !!t && t.length <= 14 && ((SUBMIT.test(t) && !menuLink(el)) || (erpSubmit(t) && el.tagName !== "A" && !inMenu(el)));
+  // <a href="javascript:fnSubmit()">결재상신</a> 처럼 링크 모양 버튼(더존·JSP 류) — 화면을 여는 링크가 아니라 동작
+  const jsLink = (el) => { const h = (el.getAttribute("href") || "").trim(); return /^(javascript:|#)/i.test(h) || !h || el.hasAttribute("onclick"); };
+  const isSubmitLabel = (el, t) => !!t && t.length <= 14 && ((SUBMIT.test(t) && !menuLink(el)) || (erpSubmit(t) && !inMenu(el) && (el.tagName !== "A" || jsLink(el))));
   const ackKey = () => "secGuardAck:" + (guard && guard.proc);
   const acked = () => { try { return Date.now() - Number(sessionStorage.getItem(ackKey()) || 0) < 10 * 60 * 1000; } catch (e) { return false; } };
 
@@ -57,60 +59,75 @@
 
   // ── 화면 입력값 읽기(결재 전 입력값 점검용) — 값은 판정에만 쓰고 기록·전송하지 않는다 ──
   const clip = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 40);
+  const CTRL = "input,select,textarea,button";
+  // 칸 묶음의 글 — 안에 든 입력칸·선택칸(옵션 글)은 빼고
+  const textOf = (n) => { if (!n) return ""; if (n.matches && n.matches(CTRL)) return ""; const c = n.cloneNode(true); c.querySelectorAll && c.querySelectorAll(CTRL).forEach((x) => x.remove()); return c.textContent || ""; };
+  const hint = (t) => { t = clip(t); return /[가-힣]/.test(t) && !/\d{2,4}\s*[-./]|YYYY|MM|DD/i.test(t) ? t : ""; };   // 'YYYY-MM-DD' 같은 형식 안내는 이름이 아니다
   function fieldLabel(el) {
+    const doc = el.ownerDocument;
     const by = el.getAttribute("aria-labelledby");
-    const byText = by ? by.split(/\s+/).map((id) => { const x = el.ownerDocument.getElementById(id); return x ? x.innerText : ""; }).join(" ") : "";
+    const byText = by ? by.split(/\s+/).map((id) => textOf(doc.getElementById(id))).join(" ") : "";
     const wrap = el.closest("label");
-    const own = (el.labels && el.labels[0] && el.labels[0].innerText) || byText || el.getAttribute("aria-label") || el.title || el.placeholder ||
-      (wrap ? wrap.innerText.replace(el.value || "", "") : "");
+    const own = (el.labels && el.labels[0] && textOf(el.labels[0])) || byText || el.getAttribute("aria-label") || (wrap ? textOf(wrap) : "");
     if (clip(own)) return clip(own);
-    // 표: 같은 줄 앞 칸(th·td)·줄 머리칸 / 정의 목록: 앞 dt / 칸 묶음(div 격자): 조상 3단계 안의 바로 앞 형제 글
-    const row = el.closest("tr");
-    let node = el;
-    for (let up = 0; up < 4 && node && node !== el.ownerDocument.body; up++, node = node.parentElement) {
-      let prev = node.previousElementSibling;
-      while (prev && !clip(prev.innerText)) prev = prev.previousElementSibling;
-      if (prev && clip(prev.innerText).length <= 30 && !prev.querySelector("input,select,textarea")) return clip(prev.innerText);
+    // 표: 같은 줄에서 이 칸 앞의 가장 가까운 머리칸(th) / 칸 묶음(div 격자·정의 목록): 조상 3단계 안의 바로 앞 형제 글(입력칸·선택칸은 건너뜀)
+    const cell = el.closest("td,th");
+    if (cell && cell.parentElement) {
+      let p = cell.previousElementSibling;
+      while (p && !(p.tagName === "TH" || (p.tagName === "TD" && clip(textOf(p)) && clip(textOf(p)).length <= 20 && !p.querySelector(CTRL)))) p = p.previousElementSibling;
+      if (p) return clip(textOf(p));
     }
-    return clip((row && row.querySelector("th") && row.querySelector("th").innerText) || el.name || el.id || "");
+    let node = el;
+    for (let up = 0; up < 4 && node && node !== doc.body; up++, node = node.parentElement) {
+      let prev = node.previousElementSibling;
+      while (prev && (prev.matches(CTRL) || !clip(textOf(prev)))) prev = prev.previousElementSibling;
+      if (prev && clip(textOf(prev)).length <= 30) return clip(textOf(prev));
+    }
+    const row = el.closest("tr");
+    // 형식 안내(placeholder·title)는 구조로 이름을 못 찾았을 때만
+    return clip((row && row.querySelector("th") && textOf(row.querySelector("th"))) || hint(el.title) || hint(el.placeholder) || el.name || el.id || "");
   }
-  const DATE_G = /((?:19|20)\d{2})\s*[.\-\/년]\s*(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})/g;
+  const DATE_G = /((?:19|20)\d{2})\s*[.\-\/년]\s*(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})(?!\d)/g;
+  const shown = (el) => { try { return el.getClientRects().length > 0; } catch (e) { return true; } };   // 숨긴 옛 신청서·다른 탭의 칸은 읽지 않는다
   function screenOf(doc) {
     const docs = [doc];
-    try { for (const f of (window.top.document || doc).querySelectorAll("iframe,frame")) { try { if (f.contentDocument && !docs.includes(f.contentDocument)) docs.push(f.contentDocument); } catch (e) {} } } catch (e) {}
+    try { for (const f of (window.top.document || doc).querySelectorAll("iframe,frame")) { try { if (f.contentDocument && !docs.includes(f.contentDocument) && shown(f)) docs.push(f.contentDocument); } catch (e) {} } } catch (e) {}
     const fields = [], files = []; let text = "", row = 0;
-    const push = (label, v, r) => {
+    const push = (label, v, r) => {                                    // 값은 날짜를 먼저 찾은 뒤에 자른다(긴 보기 글의 둘째 날짜를 잃지 않게)
       const ds = [...String(v).matchAll(DATE_G)].map((m) => m[0]);
       if (ds.length >= 2) ds.slice(0, 2).forEach((d) => fields.push({ label, value: d, row: r }));   // '2026-10-01 ~ 2026-10-03' 한 칸
-      else fields.push({ label, value: String(v).slice(0, 40), row: r });
+      else fields.push({ label, value: ds[0] || String(v).slice(0, 40), row: r });
     };
     for (const d of docs) {
       const rows = new Map(); const rowOf = (el) => { const r = el.closest("tr,dd,li,.row,p") || el.parentElement; if (!rows.has(r)) rows.set(r, row++); return rows.get(r); };
-      const ymdSel = new Map();                                            // 연·월·일을 따로 고르는 칸(같은 줄 select 3개)
+      const ymdSel = new Map();                                            // 연·월·일을 따로 고르는 칸(같은 줄)
       for (const el of d.querySelectorAll('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]),select,textarea')) {
         if (el.type === "file") { files.push(el); continue; }
+        if (!shown(el)) continue;
         const v = el.tagName === "SELECT" ? (el.selectedOptions[0] && el.selectedOptions[0].text) || "" : el.value;
         if (!v) continue;
         const r = rowOf(el);
-        if (/^\s*\d{1,4}\s*(년|월|일)?\s*$/.test(v) && (el.tagName === "SELECT" || String(v).trim().length <= 4)) {
+        if (/^\s*\d{1,4}\s*(년|월|일|시|분)?\s*$/.test(v) && (el.tagName === "SELECT" || String(v).trim().length <= 4)) {
           const g = ymdSel.get(r) || { label: fieldLabel(el), parts: [] }; g.parts.push(String(v).replace(/\D/g, "")); ymdSel.set(r, g);
         }
         push(fieldLabel(el), v, r);
       }
-      for (const [r, g] of ymdSel) for (let i = 0; i + 2 < g.parts.length; i += 3) {
-        const [y, m, dd] = g.parts.slice(i, i + 3);
+      // 연(4자리)을 기준으로 뒤의 두 칸을 월·일로 — 시·분 칸이 끼어 있어도 둘째 날짜를 잃지 않게
+      for (const [r, g] of ymdSel) g.parts.forEach((y, i) => {
+        const [m, dd] = [g.parts[i + 1], g.parts[i + 2]];
         if (/^(19|20)\d{2}$/.test(y) && +m >= 1 && +m <= 12 && +dd >= 1 && +dd <= 31) fields.push({ label: g.label, value: `${y}-${m}-${dd}`, row: r });
-      }
-      // 보기 화면(입력란 없이 글로만 보이는 값): 표 머리칸·정의 목록의 날짜
+      });
+      // 보기 화면(입력란 없이 글로만 보이는 값): 표의 모든 머리칸(th) 바로 뒤 칸, 정의 목록
       for (const tr of d.querySelectorAll("tr")) {
-        const th = tr.querySelector("th"); const td = th && th.nextElementSibling;
-        if (td && !td.querySelector("input,select,textarea") && DATE_G.test(td.innerText || "")) { DATE_G.lastIndex = 0; push(clip(th.innerText), clip(td.innerText), row++); }
-        DATE_G.lastIndex = 0;
+        if (!shown(tr)) continue;
+        for (const th of tr.querySelectorAll("th")) {
+          const td = th.nextElementSibling;
+          if (td && td.tagName === "TD" && !td.querySelector(CTRL)) { const t = td.innerText || ""; DATE_G.lastIndex = 0; if (DATE_G.test(t)) push(clip(textOf(th)), t, row++); DATE_G.lastIndex = 0; }
+        }
       }
       for (const dt of d.querySelectorAll("dt")) {
         const dd = dt.nextElementSibling;
-        if (dd && dd.tagName === "DD" && !dd.querySelector("input,select,textarea") && DATE_G.test(dd.innerText || "")) { DATE_G.lastIndex = 0; push(clip(dt.innerText), clip(dd.innerText), row++); }
-        DATE_G.lastIndex = 0;
+        if (dd && dd.tagName === "DD" && shown(dd) && !dd.querySelector(CTRL)) { const t = dd.innerText || ""; DATE_G.lastIndex = 0; if (DATE_G.test(t)) push(clip(textOf(dt)), t, row++); DATE_G.lastIndex = 0; }
       }
       try { text += " " + (d.body ? d.body.innerText : "").slice(0, 20000); } catch (e) {}
     }

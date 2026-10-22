@@ -134,7 +134,7 @@ def test_ask_ai_answer_requires_verified_quote(client, monkeypatch):
     def fake(system, text, schema, image=None, effort="low"):
         ids = schema["properties"]["citations"]["items"]["properties"]["id"]["enum"]
         aid = next(i for i in ids if f"[{i}] 「복무규정」 제34조" in text)
-        return {"found": True, "answer": "결혼 5일 등입니다.", "caution": "",
+        return {"found": True, "answer": calls.get("answer", "결혼 5일 등입니다."), "caution": "",
                 "citations": [{"id": aid, "quote": calls.get("quote", sentence)}]}
     monkeypatch.setattr(api_server, "_sec_ai_json", fake)
     d = client.post("/api/secretary/ask", json={"q": q}).get_json()
@@ -143,6 +143,8 @@ def test_ask_ai_answer_requires_verified_quote(client, monkeypatch):
     calls["quote"] = "본인 결혼 시 30일의 특별휴가를 준다"           # 조문에 없는 문장
     d = client.post("/api/secretary/ask", json={"q": q}).get_json()
     assert not d["found"] and not d["answer"] and d["candidates"]
+    calls["quote"] = "제"                                             # 짧은 조각은 확인으로 치지 않음
+    assert not client.post("/api/secretary/ask", json={"q": q}).get_json()["found"]
 
 
 def test_erp_profile_preset_and_custom():
@@ -171,3 +173,30 @@ def test_erp_meta_and_zip_carry_profile(client):
     cfg = z.read("secretary-extension/config.js").decode()
     assert "SEC_PROFILE_DEFAULT = {" in cfg and "/koat/bt/" in cfg
     assert client.get("/api/secretary/erp/presets").get_json()["presets"]["sap"]["verified"] is False
+
+
+def test_related_items_find_the_right_article():
+    """규정 질의응답의 조문 찾기(키워드) — 흔한 물음에서 답이 든 조문이 위 5개 안에."""
+    cases = {"반차 쓰면 연차 몇 개 차감돼?": ("복무규정", "31"), "경조사 휴가 며칠": ("복무규정", "34"),
+             "병가 며칠 넘으면 진단서 필요해?": ("복무규정", "33"), "숙박비 상한 얼마야": ("여비규정", "15"),
+             "육아휴직 몇 번 나눠 쓸 수 있어?": ("인사규정", "55"), "선물 받으면 신고해야 하나요": ("임직원 행동강령", "20"),
+             "연차 저축 가능해?": ("복무규정", "29"), "출장 다녀오면 정산은 언제까지 해야 하나요": ("여비규정", "8")}
+    for q, want in cases.items():
+        top = [(x["reg"], x["art"]) for x in api_server._sec_related_items(q, n=8, semantic=False)[:5]]
+        assert want in top, (q, top)
+
+
+
+def test_ask_rejects_numbers_not_in_cited_article(client, monkeypatch):
+    """인용이 맞아도 답의 숫자가 근거 조문에 없으면(지어낸 일수) 답을 감춘다."""
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    q = "경조사 휴가 며칠"
+    real = next(x for x in api_server._sec_related_items(q, n=14, semantic=False) if x["art"] == "34")
+
+    def fake(system, text, schema, image=None, effort="low"):
+        ids = schema["properties"]["citations"]["items"]["properties"]["id"]["enum"]
+        aid = next(i for i in ids if f"[{i}] 「복무규정」 제34조" in text)
+        return {"found": True, "answer": "결혼하면 365일 쉽니다.", "caution": "", "citations": [{"id": aid, "quote": real["text"][40:100]}]}
+    monkeypatch.setattr(api_server, "_sec_ai_json", fake)
+    d = client.post("/api/secretary/ask", json={"q": q}).get_json()
+    assert not d["found"] and "숫자" in d["note"]

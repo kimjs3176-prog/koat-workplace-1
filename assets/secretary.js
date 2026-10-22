@@ -166,7 +166,8 @@ function parseDates(q, base){
   const R=(re,fn)=>{ re.lastIndex=0; while((m=re.exec(t))) fn(m); };
   R(/(\d{4})\s*[.\-\/년]\s*(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})\s*일?/g, m=>add(m.index,m[0].length,mk(+m[1],+m[2],+m[3])));
   R(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2])));
-  R(/(?<![\d.])(\d{1,2})\s*[\/.]\s*(\d{1,2})(?![\d.]|\s*(?:%|퍼센트|배))/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2])));
+  // '11/3' · '11.3' · 공문식 '11. 3.(화)' — 끝의 마침표는 허용하고, '1.4.6'(판 번호)·'1.5배'·'30%' 는 빼고
+  R(/(?<![\d.])(\d{1,2})\s*[\/.]\s*(\d{1,2})(?!\d|\.\d|\s*(?:%|퍼센트|배))/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2])));
   const REL={'그저께':-2,'그제':-2,'어제':-1,'오늘':0,'내일':1,'모레':2,'내일모레':2,'글피':3};
   R(/그저께|그제|어제|오늘|내일\s*모레|내일|모레|글피/g, m=>add(m.index,m[0].length,addDays(base,REL[m[0].replace(/\s+/g,'')])));
   R(/(이번|다음|담|지난|저번)\s*주\s*([일월화수목금토])요일?/g, m=>{
@@ -179,7 +180,13 @@ function parseDates(q, base){
       if(!m[2] && !/[~\-–]\s*$/.test(t.slice(Math.max(0,m.index-3),m.index))) return;   // "14일 이내" 같은 기간은 제외
       const prev=[...hits].reverse().find(h=>h.pos<m.index); if(!prev) return;
       const [y,mo]=prev.d.split('-').map(Number); let d=mk(y,mo,+m[1]); if(d && d<prev.d) d=mk(mo===12?y+1:y, mo===12?1:mo+1, +m[1]);
-      add(m.index,m[0].length,d); }); hits.sort((a,b)=>a.pos-b.pos); }
+      add(m.index,m[0].length,d); });
+    // '11. 3.(화) ~ 4.(수)' — 기간 끝의 일(日)만 '숫자.(요일)' 꼴로 적은 경우
+    R(/[~∼–]\s*(\d{1,2})\s*\.?\s*\(\s*[일월화수목금토]\s*\)/g, m=>{
+      const at=m.index+m[0].indexOf(m[1]); const prev=[...hits].reverse().find(h=>h.pos<at); if(!prev) return;
+      const [y,mo]=prev.d.split('-').map(Number); let d=mk(y,mo,+m[1]); if(d && d<prev.d) d=mk(mo===12?y+1:y, mo===12?1:mo+1, +m[1]);
+      add(at,m[1].length,d); });
+    hits.sort((a,b)=>a.pos-b.pos); }
   const out=hits.map(h=>h.d);
   const nb=t.match(/(\d{1,2})\s*박\s*(\d{1,2})?\s*일?/);       // 2박3일 → 마친 날 = 시작 + 2
   if(nb && out.length===1) out.push(addDays(out[0], +nb[1]));
@@ -411,12 +418,15 @@ function render(){
   // 입력하다 화면이 다시 그려져도 그 칸(포커스·커서)과 스크롤 위치를 지킨다 — 같은 화면일 때만
   const ae=document.activeElement, same=S._lastView===S.view;
   const sig=el=>el&&el!==document.body&&w.contains(el)?el.tagName+(el.id?'#'+el.id:'')+[...el.attributes].filter(a=>/^data-|^name$/.test(a.name)).map(a=>`[${a.name}="${a.value}"]`).join(''):'';
-  const keep=same?{sig:sig(ae), ss:ae&&ae.selectionStart, se:ae&&ae.selectionEnd, y:window.scrollY}:null;
+  let ss=null, se=null; try{ ss=ae&&ae.selectionStart; se=ae&&ae.selectionEnd; }catch(e){}
+  const keep=same?{sig:sig(ae), v:ae&&'value' in ae?ae.value:null, ss, se, y:window.scrollY}:null;
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
   S._lastView=S.view;
   if(keep){
     if(keep.sig){ const el=[...w.querySelectorAll(ae.tagName)].find(x=>sig(x)===keep.sig);
-      if(el){ try{ el.focus({preventScroll:true}); if(keep.ss!=null && el.setSelectionRange) el.setSelectionRange(keep.ss, keep.se); }catch(e){} } }
+      // 입력 중이던 글도 되살린다(답을 기다리는 사이 다시 그려져 새로 치던 질문이 지워지지 않게)
+      if(el){ try{ if(keep.v!=null && el.value!==keep.v && el.tagName!=='SELECT' && el.type!=='file') el.value=keep.v;
+        el.focus({preventScroll:true}); if(keep.ss!=null && el.setSelectionRange) el.setSelectionRange(keep.ss, keep.se); }catch(e){} } }
     if(Math.abs(window.scrollY-keep.y)>2) window.scrollTo(0, keep.y);
   }
   if(S.view==='proc') loadOpenBasis();
@@ -465,7 +475,7 @@ function syncDeadlines(){
       .map(d=>({date:d.date, proc:d.proc, step:String(d.step||'').slice(0,80), caseId:d.caseId, i:d.i, optional:d.optional}))
       // 내 일정(오늘 이후, 이미 시작했지만 아직 안 끝난 여러 날 일정 포함)도 확장 배지·알림에 — 진행 중이면 오늘 날짜로(지난 기한으로 보이지 않게)
       .concat(scheds().filter(x=>!x.done && (x.end||x.date)>=today() && x.date<=hi).slice(0,50)
-        .map(x=>({date:x.date>=today()?x.date:today(), proc:'일정', step:schedLabel(x).slice(0,80), caseId:'sch:'+x.id, i:0, optional:false})));
+        .map(x=>({date:x.date>=today()?x.date:today(), proc:'일정', step:schedLabel(x).slice(0,80), caseId:'sch:'+x.id, i:0, optional:false, kind:'sched', last:x.end||x.date})));
     const key=JSON.stringify(items); if(key===_dlLast) return; _dlLast=key;
     if(EMBED) toExt({type:'deadlines', items});
     else window.postMessage({src:'koat-sec', type:'deadlines', items}, location.origin);
@@ -880,8 +890,13 @@ async function saveConfig(cfg, okMsg){
   if(S.admin.token_required && !tok){ toast('위쪽에 관리자 토큰을 입력하세요.'); const el=document.getElementById('secTokG'); if(el) el.focus(); return false; }
   try{ const r=await fetch('/api/secretary/config',{method:'POST',headers:{'Content-Type':'application/json','X-Upload-Token':tok},
       body:JSON.stringify({config:cfg, editor:_ls(LS_EDITOR,''), base:String((S.cfg||{}).updated||'')})});
-    const d=await r.json(); if(!d.success){ toast(d.error||'저장하지 못했습니다.', 5200); if(d.conflict){ await load(true); render(); } return false; }
-    S._tok=tok; S._cfgDraft=null; S._aliasDraft=null; S.regMap=null; toast(okMsg||d.message, 4200);
+    const d=await r.json(); if(!d.success){
+      // 충돌: 다른 관리자의 저장본을 불러오고 내 초안은 버린다(그대로 두면 다시 '저장'이 상대 변경을 덮어씀)
+      if(d.conflict){ S._cfgDraft=null; S._aliasDraft=null; S._erpRaw=null; S._erpProblems=null; await load(true); render();
+        toast((d.error||'다른 관리자가 먼저 저장했습니다.')+' 고친 내용은 새로 불러온 설정 위에 다시 넣어 주세요.', 7000); return false; }
+      toast(d.error||'저장하지 못했습니다.', 5200); return false; }
+    S._tok=tok; S._cfgDraft=null; S._aliasDraft=null; S._erpRaw=null; S._erpProblems=null; S.erpPresets=null; S.regMap=null;
+    toast((d.erp_dropped||[]).length?`저장했지만 서버가 받지 않은 ERP 규칙 ${d.erp_dropped.length}개가 있습니다(정규식 문법): ${d.erp_dropped.slice(0,3).join(', ')}`:(okMsg||d.message), (d.erp_dropped||[]).length?7000:4200);
     await load(true); render(); return true;
   }catch(e){ toast('서버에 저장하지 못했습니다.'); return false; }
 }
@@ -1263,7 +1278,7 @@ function bind(panel){
       case 'cfgsave': { const c=S._cfgDraft||S.cfg; if(!String((c.org||{}).name||'').trim()){ toast('기관명을 입력하세요.'); break; } S._cfgOpen=true;
         S._erpProblems=Object.entries(S._erpRaw||{}).flatMap(([k,v])=>erpRulesParse(k,v).problems);
         if(S._erpProblems.length){ S._erpOpen=true; render(); toast('ERP 화면 규칙에 고칠 줄이 있습니다.', 4200); break; }
-        saveConfig(c, '기관 설정을 저장했습니다.').then(ok=>{ if(ok){ S._erpRaw=null; S.erpPresets=null; } }); break; }
+        saveConfig(c, '기관 설정을 저장했습니다.'); break; }
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
@@ -1366,7 +1381,10 @@ function normSched(x){
     ...(typeof x.caseId==='string'&&x.caseId?{caseId:x.caseId.slice(0,40)}:{})};            // caseId: 이 일정으로 만든 처리 건(일정 → 업무 연결)          // uid: 초대장(.ics) 고유 번호 — 같은 초대장을 다시 넣어도 겹치지 않게
 }
 function scheds(){ const a=_ls(LS_SCHED,[]); return Array.isArray(a)?a.map(normSched).filter(Boolean):[]; }
-function saveScheds(a){ const ok=_lsPut(LS_SCHED, a.slice(0,1000)); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
+function saveScheds(a){
+  // 1000건을 넘으면 오래된(지난) 일정부터 버린다 — 방금 넣은 일정이 잘리지 않게
+  if(a.length>1000) a=a.slice().sort((x,y)=>(x.end||x.date)<(y.end||y.date)?1:-1).slice(0,1000);
+  const ok=_lsPut(LS_SCHED, a); if(ok&&typeof syncDeadlines==='function') syncDeadlines(); return ok; }
 function schedDays(x){ const out=[x.date]; let d=x.date; for(let i=0;i<62 && x.end && d<x.end;i++){ d=addDays(d,1); out.push(d); } return out; }
 function schedLabel(x){ return (x.time?x.time+' ':'')+x.title; }
 // ── 메일에서 일정 가져오기 — 끌어다 놓은 글·붙여 넣은 글·.ics·.eml 에서 제목·날짜·시각·장소를 읽는다 ─────────
@@ -1405,12 +1423,13 @@ function parseSchedText(text, base){
   }
   // 문서에 처음 나온 날짜가 시작일 — 끝나는 날은 '~'·'부터'로 이어진 기간일 때만
   const pd=parseDates(src, base||today()); const ds=(pd.dates||[]).filter(Boolean);
-  const ranged=ds.length>1 && ds[1]>ds[0] && /(?:일|\d)\s*(?:\([^)]{1,4}\))?\s*(?:[~∼–]|-(?!\d{2}\b)|부터)/.test(src);
+  const ranged=ds.length>1 && ds[1]>ds[0] && /(?:일|\d)\.?\s*(?:\([^)]{1,4}\))?\s*(?:[~∼–]|-(?!\d{2}\b)|부터)/.test(src);
   const time=schedTime(when||bodyNoHead.split('\n').find(l=>/\d\s*(?::|시)/.test(l)&&!/\d{4}[.\-\/]\d/.test(l.replace(/\d{1,2}:\d{2}/,'')))||when||bodyNoHead);
   const DUE=/회신|제출|마감|송부|회람|신청\s*기한/;
   let title=subj||lines.find(l=>!_MAIL_HEAD.test(l) && !/^(일시|일정|시간|장소|위치|기간)\s*[:：]/.test(l) && !DUE.test(l) && /[가-힣a-z]{2}/i.test(l) && l.length<=80)||'';
   // 제목 줄 앞의 날짜·시각('10월 30일 오후 2시 운영위원회')은 일정 칸에 따로 들어가므로 뗀다
-  if(!subj) title=title.replace(/^(?:\s*(?:\d{4}\s*[.\-\/년]\s*)?\d{1,2}\s*(?:월\s*\d{1,2}\s*일|[\/.]\s*\d{1,2})(?:\s*\([^)]{1,4}\))?|\s*(?:오전|오후)?\s*\d{1,2}\s*(?::\s*\d{2}|시(?:\s*\d{1,2}\s*분|\s*반)?))+\s*/,'').trim()||title;
+  // 날짜·기간·시각('11. 3.(화) ~ 5.(목)', '11월 3일부터 5일까지', '오후 2시')은 일정 칸에 따로 들어가므로 제목 앞에서 뗀다
+  if(!subj && ds.length) title=title.replace(/^(?:[\s.,~∼–\-:]|\d{1,4}\s*(?:년|월|일|시|분)?|\(\s*[일월화수목금토]\s*\)|오전|오후|부터|까지|반(?=\s))+/,'').trim()||title;
   title=title.replace(/^((re|fw|fwd|회신|전달)\s*[:：]\s*)+/i,'').replace(/^\[[^\]]{0,20}\]\s*/,'').replace(/\s+/g,' ').trim().slice(0,80);
   const memo=place?'장소: '+place:'';
   return {title, date:ds[0]||'', end:ranged?ds[ds.length-1]:'', time, memo:memo.slice(0,500)};
@@ -1419,7 +1438,9 @@ function parseSchedText(text, base){
 function parseIcs(text){
   const un=String(text||'').replace(/\r?\n[ \t]/g,'');                      // 접힌 줄 펴기
   const out=[];
-  for(const blk of un.split(/BEGIN:VEVENT/).slice(1)){
+  for(const raw of un.split(/BEGIN:VEVENT/).slice(1)){
+    const blk=raw.replace(/BEGIN:VALARM[^]*?END:VALARM/g,'');           // 알림 블록의 DESCRIPTION:Reminder 가 메모로 들어가지 않게
+    if(/^RECURRENCE-ID/m.test(blk)) continue;                            // 반복 일정의 예외 회차(같은 UID) — 첫 회만 넣는다
     const get=k=>{ const m=blk.match(new RegExp('^'+k+'(?:;[^:\\r\\n]*)?:(.*)$','m')); return m?m[1].replace(/\\n/gi,'\n').replace(/\\([,;\\])/g,'$1').trim():''; };
     // 끝에 Z 가 붙은 시각(구글·Exchange 초대장 대부분)은 UTC — 이 PC 시각(한국)으로 바꾼다
     const dt=v=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(?:\d{2})?(Z)?)?/); if(!m) return null;
@@ -1474,7 +1495,8 @@ async function schedFromDrop(dt, day){
     if(name.endsWith('.ics')||f.type==='text/calendar'){ const got=parseIcs(await f.text());
       // 이미 넣은 초대장(같은 UID)은 다시 넣지 않는다 · 반복 일정은 첫 회만 들어간다고 알린다
       const have=new Map(scheds().filter(x=>x.uid).map(x=>[x.uid,x]));
-      const evs=got.filter(e=>!e.uid||!have.has(e.uid)); const dup=got.length-evs.length;
+      const seenU=new Set(); const evs=got.filter(e=>{ if(!e.uid) return true; if(have.has(e.uid)||seenU.has(e.uid)) return false; seenU.add(e.uid); return true; });
+      const dup=got.length-evs.length;
       const rep=got.some(e=>e.repeat)?' 반복 일정은 첫 회만 넣었습니다.':'';
       if(!evs.length && got.length===1){ const old=have.get(got[0].uid); toast('이미 추가한 초대장입니다 — 저장된 일정을 엽니다.', 3200); openSched(old.id); return; }
       if(!evs.length && dup){ toast(`초대장의 일정 ${dup}건은 이미 추가돼 있습니다.`, 3200); return; }
@@ -1511,6 +1533,12 @@ function linkSchedCase(n, pid){
   if(!saveCases(all)) return null;
   n.caseId=c.id;
   return {c, p, due:(p.steps||[]).filter(s=>stepDue(s, c.dates)).length};
+}
+// 일정을 지우거나 연결을 끊으면(바꾸면) 연결됐던 처리 건의 기한이 계속 알리지 않게 — 물어보고 완료로 닫는다
+function closeLinkedCase(caseId, why){
+  const all=cases(); const c=all.find(x=>x.id===caseId); if(!c || c.status==='done') return;
+  if(!confirm(`연결된 처리 건 '${c.title}'도 닫을까요? (${why})\n닫으면 기한이 달력·알림에서 빠지고, 처리 이력에는 남습니다.`)) return;
+  c.status='done'; c.doneAt=today(); c.note=((c.note||'')+(c.note?'\n':'')+`[${today()}] ${why}`).slice(0,2000); c.updated=Date.now(); saveCases(all);
 }
 function schedLinkRow(x){
   const ps=linkableProcs(); if(!ps.length) return '';
@@ -1556,9 +1584,9 @@ function openSched(id, date, pre){
       if(v('end') && v('end')<v('date')){ toast('끝나는 날이 시작일보다 앞입니다.'); return; }
       if(cur && cur.caseId) n.caseId=cur.caseId;
       const lk=body.querySelector('[data-sk="link"]'), pid=(body.querySelector('[data-sk="proc"]')||{}).value||'';
-      let linked=null;
-      if(lk && lk.checked && pid){ linked=linkSchedCase(n, pid); if(!linked) return; }
-      else if(lk && !lk.checked) delete n.caseId;                      // 연결을 끊어도 처리 건은 남긴다(이력)
+      let linked=null; const was=cur&&cur.caseId;
+      if(lk && lk.checked && pid){ linked=linkSchedCase(n, pid); if(!linked) return; if(was && was!==n.caseId) closeLinkedCase(was, '일정을 다른 업무로 연결'); }
+      else if(lk && !lk.checked){ delete n.caseId; if(was) closeLinkedCase(was, '일정과 업무 연결을 끊음'); }   // 닫지 않으면 처리 건은 그대로 남는다
       if(i>=0) all[i]=n; else all.push(n);
       if(!saveScheds(all)) return;
       closeModal('secSchedModal'); const [yy,mm]=n.date.split('-').map(Number); S.calYM={y:yy,m:mm};
@@ -1566,7 +1594,7 @@ function openSched(id, date, pre){
       if(typeof syncDeadlines==='function') syncDeadlines(); render(); }
     else if(b.dataset.sk==='opencase' && cur){ const c=cases().find(y=>y.id===cur.caseId); closeModal('secSchedModal'); if(c){ S.query=''; S.matches=[]; selectProc(c.procId,{caseId:c.id}); } }
     else if(b.dataset.sk==='done' && i>=0){ all[i].done=!all[i].done; saveScheds(all); closeModal('secSchedModal'); render(); }
-    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?${all[i].caseId?' (연결된 처리 건은 처리 이력에 남습니다)':''}`)) return; all.splice(i,1); saveScheds(all); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
+    else if(b.dataset.sk==='del' && i>=0){ if(!confirm(`'${all[i].title}' 일정을 삭제할까요?${all[i].caseId?' (연결된 처리 건은 처리 이력에 남습니다)':''}`)) return; const gone=all[i].caseId; all.splice(i,1); saveScheds(all); if(gone) closeLinkedCase(gone, '연결된 일정을 삭제'); closeModal('secSchedModal'); toast('일정을 삭제했습니다.'); render(); }
   };
   body.onkeydown=e=>{ if(e.key==='Enter' && e.target.tagName==='INPUT' && e.target.dataset.sk!=='paste'){ e.preventDefault(); const b=body.querySelector('[data-sk="save"]'); b&&b.click(); } };
 }
@@ -1630,7 +1658,7 @@ function calIcs(){
       'DTSTART;VALUE=DATE:'+d,'DTEND;VALUE=DATE:'+nx,'SUMMARY:'+icsEsc(`[서무] ${e.proc} — ${e.step.replace(/[.。]$/,'').slice(0,50)}`),'END:VEVENT'].join('\r\n'); });
   const stamp='DTSTAMP:'+new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z';
   let tz=false;
-  sc.forEach(x=>{ const d=x.date.replace(/-/g,''); const ev2=['BEGIN:VEVENT',`UID:${x.uid||`sch-${x.id}@secretary`}`,stamp];
+  sc.forEach(x=>{ const d=x.date.replace(/-/g,''); const ev2=['BEGIN:VEVENT',`UID:sch-${x.id}@secretary`,stamp];
     if(x.time){ const hm=x.time.replace(':',''); const [h,mi]=x.time.split(':').map(Number); const eh=String(Math.min(23,h+1)).padStart(2,'0');
       // 시각이 있으면 한국 시각으로(받는 캘린더의 시간대와 상관없이) 1시간 — 여러 날이면 끝나는 날 같은 시각까지
       ev2.push(`DTSTART;TZID=Asia/Seoul:${d}T${hm}00`,`DTEND;TZID=Asia/Seoul:${(x.end||x.date).replace(/-/g,'')}T${eh}${String(mi).padStart(2,'0')}00`); tz=true; }
@@ -1823,7 +1851,7 @@ function openAiKey(){
     else if(b.dataset.ak==='del'){ try{ localStorage.removeItem(LS_AIKEY); }catch(_){} closeModal('secAiKeyModal'); toast('키를 지웠습니다.'); render(); } });
 }
 // ── 규정 질의응답 — 찾은 조문 안에서만 답하고(서버가 인용문을 조문에서 확인), 근거가 확인되지 않으면 조문만 보여 준다
-const REG_Q=/[?？]\s*$|며칠|몇\s*(일|번|회|개|시간|명|박)|얼마|언제까지|되나요|되나\b|돼\s*\?|가능(한가|할까|해|하나)|인가요|있나요|없나요|해야\s*(하나|돼|되나)|맞나요|안\s*되|기준이?|한도|상한|며칠/;
+const REG_Q=/[?？]\s*$|며칠|몇\s*(일|번|회|개|시간|명|박)|얼마|언제까지|되나요|되나(?=\s|[?？]|$)|돼\s*\?|가능(한가|할까|해|하나)|인가요|있나요|없나요|해야\s*(하나|돼|되나)|맞나요|안\s*되|기준(이|은)\s*(뭐|어떻|무엇)|한도|상한/;
 function isRegQuestion(q){ return REG_Q.test(String(q||'')); }
 async function askRegs(q, force){
   if(!q) return; if(!force && S.regAns && S.regAns.q===q) return;

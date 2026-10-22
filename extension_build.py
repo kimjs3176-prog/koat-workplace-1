@@ -15,7 +15,7 @@ def origin_pattern(u: str) -> str:
         return ""
     if not re.match(r"^https?://", u):
         u = "https://" + u
-    m = re.match(r"^(https?://[A-Za-z0-9.\-]+(?::\d+)?)(?:/|$)", u)
+    m = re.match(r"^(https?://(?:\*\.)?[A-Za-z0-9._\-]+(?::\d+)?)(?:/|$)", u)   # '*.기관.kr' 와일드카드·밑줄 호스트 허용(확장 설정과 같게)
     return (m.group(1) + "/*") if m else ""
 
 
@@ -31,6 +31,8 @@ def build_zip(server: str = "", erps=None, name: str = "", version: str = "", pr
     man = manifest()
     pats = [p for p in (origin_pattern(x) for x in (erps or [])) if p]
     # 기관이 ERP 주소를 정했으면 그 주소만(다른 기관 배포본에 KOAT 주소 권한이 남지 않게), 없으면 기본 주소
+    if erps and not pats:   # 기관이 주소를 적었는데 하나도 못 읽었으면 KOAT 기본 주소로 대신하지 않고 알린다
+        raise ValueError("ERP 주소를 읽지 못했습니다: " + ", ".join(map(str, erps))[:200])
     pats = list(dict.fromkeys(pats)) or man["content_scripts"][0]["matches"]
     man["host_permissions"] = pats
     man["content_scripts"][0]["matches"] = pats

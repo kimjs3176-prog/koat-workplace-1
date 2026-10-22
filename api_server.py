@@ -2219,6 +2219,11 @@ _SEC_Q_STOP = {"어떻게", "얼마", "얼마나", "언제", "언제까지", "�
                "누가", "몇", "인가요", "건가요", "맞나요", "되는", "하는", "있는", "없는", "우리", "기관", "규정", "내규"}
 
 
+_SEC_DF_CACHE: dict = {}                 # (조문 색인, 낱말) → 그 낱말이 든 조문 수
+_SEC_Q_SYN = {"나눠": "분할", "나누어": "분할", "쪼개": "분할", "반차": "반일", "월급": "보수", "야근": "시간외", "선물": "금품",
+              "출장비": "여비", "경조사": "경조", "재택": "재택근무", "카드": "법인카드", "사례금": "사례금"}
+
+
 def _sec_related_items(q: str, n: int = 12, semantic: bool = True) -> list:
     """상황·질문 문장 → 관련 조문 [{reg, art, art_title, preview, text, score, src}] (키워드 + 의미 검색)."""
     words = [w for w in re.split(r"[\s,.!?？~·]+", q) if len(w) >= 2]
@@ -2230,18 +2235,37 @@ def _sec_related_items(q: str, n: int = 12, semantic: bool = True) -> list:
         if len(s) >= 2:
             stems.add(s)
     stems -= _SEC_Q_STOP
+    for w in list(stems):                                 # 말하는 말 → 규정에 쓰는 말("나눠 쓰다" → "분할")
+        for k, v in _SEC_Q_SYN.items():
+            if w.startswith(k):
+                stems.add(v)
+    chunks = _sec_chunks()
+    # 드문 낱말일수록 무겁게(IDF) — '있어'·'기준'처럼 어디에나 있는 말이 순위를 흐리지 않게
+    import math
+    n_all = max(1, len(chunks))
+    idf = {}
+    for s_ in stems:
+        key = (id(chunks), s_)
+        if key not in _SEC_DF_CACHE:
+            if len(_SEC_DF_CACHE) > 5000:
+                _SEC_DF_CACHE.clear()
+            _SEC_DF_CACHE[key] = sum(1 for t, no, at, text in chunks if s_ in text or s_ in (at or ""))
+        df = _SEC_DF_CACHE[key]
+        idf[s_] = math.log((n_all + 1) / (df + 1)) if df else 0.0
     scored = []
-    for t, no, at, text in _sec_chunks():
+    for t, no, at, text in chunks:
         head = (t + " " + (at or ""))
-        sc = 0
-        for s in stems:
-            if s in head:
-                sc += 3
-            c = text.count(s)
-            if c:
-                sc += min(c, 4)
+        sc, hit = 0.0, 0
+        for s_ in stems:
+            w_ = idf.get(s_, 0.0)
+            if not w_:
+                continue
+            got = (3 if s_ in head else 0) + min(text.count(s_), 4)
+            if got:
+                sc += w_ * got
+                hit += 1
         if sc:
-            scored.append((sc, t, no, at, text))
+            scored.append((round(sc * (1 + 0.5 * (hit - 1)), 2), t, no, at, text))   # 여러 낱말이 함께 맞을수록 위로
     scored.sort(key=lambda x: -x[0])
     items, seen = [], set()
     for sc, t, no, at, text in scored[:40]:
@@ -2278,6 +2302,11 @@ def _sec_save_repo_file(repo_path: str, local_path: str, payload: str, message: 
 
 _SEC_READONLY_MSG = ("이 서버는 파일을 쓸 수 없습니다(읽기 전용 배포). "
                      "GITHUB_TOKEN·GITHUB_REPO 를 설정하면 저장소에 커밋됩니다.")
+
+
+def _sec_stamp_now() -> str:
+    """기관 층·설정의 판 표시 — 초 단위(같은 분에 두 번 저장해도 충돌을 알아보게)."""
+    return datetime.now(_KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _sec_stale_base(base, current: dict) -> bool:
@@ -2317,7 +2346,7 @@ def secretary_org_save():
                      "fields": [{"k": _sec_clean_str(f.get("k"), 24), "l": _sec_clean_str(f.get("l"), 40),
                                  "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {})}
                                 for f in (d.get("fields") or [])[:20] if isinstance(f, dict) and f.get("k")]}
-    data = {"version": 1, "layer": "org", "updated": _now_kst(),
+    data = {"version": 1, "layer": "org", "updated": _sec_stamp_now(),
             "updated_by": _sec_clean_str(body.get("editor"), 40),
             "procedures": procs, "drafts": drafts}
     payload = json.dumps(data, ensure_ascii=False, indent=1) + "\n"
@@ -2372,7 +2401,7 @@ def secretary_config_save():
             "exclude": [str(d) for d in ((body.get("holidays") or {}).get("exclude") or [])[:100]
                         if re.match(r"^\d{4}-\d{2}-\d{2}$", str(d))],
         },
-        "updated": _now_kst(),
+        "updated": _sec_stamp_now(),
         "updated_by": _sec_clean_str((request.get_json(silent=True) or {}).get("editor"), 40),
     }
     # ERP·그룹웨어 주소(브라우저 확장이 붙을 곳) — 'https://호스트/*' 꼴로 정리
@@ -2408,7 +2437,13 @@ def secretary_config_save():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 502
     _SEC_CFG_CACHE.update({"ts": time.time(), "data": cfg})
-    return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config())})
+    # 화면 검사는 통과했지만 서버가 버린 ERP 규칙(파이썬 정규식이 받지 않는 문법 등)을 알려 준다
+    sent = erp_in if isinstance(erp_in, dict) else {}
+    kept = cfg.get("erp") or {}
+    dropped = [str(r.get("match", ""))[:60] for r in (sent.get("screen_rules") if isinstance(sent.get("screen_rules"), list) else [])
+               if isinstance(r, dict) and r.get("match") not in {k.get("match") for k in kept.get("screen_rules") or []}]
+    dropped += [str(x)[:60] for x in (sent.get("skip_paths") if isinstance(sent.get("skip_paths"), list) else []) if x not in (kept.get("skip_paths") or [])]
+    return jsonify({"success": True, "message": where, "config": _sec_public_config(_sec_config()), "erp_dropped": dropped})
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2820,7 +2855,8 @@ def secretary_ask():
         x = picks[ids.index(c["id"])]
         quote_ = _sec_clean_str(c.get("quote"), 200)
         # 인용문이 실제 조문에 있는지 확인 — 없으면(지어낸 문장) 인용문은 버리고 조문만 근거로 남긴다
-        ok = bool(quote_) and _sec_ask_norm(quote_) in _sec_ask_norm(x.get("text") or "")
+        nq = _sec_ask_norm(quote_)
+        ok = len(nq) >= 8 and nq in _sec_ask_norm(x.get("text") or "")   # 짧은 조각('제'·'출장')은 어디에나 있어 확인이 아니다
         key = (x["reg"], x["art"])
         if key in used and not ok:
             continue
@@ -2829,10 +2865,19 @@ def secretary_ask():
                       "quote": quote_ if ok else "", "verified": ok})
     verified = any(c["verified"] for c in cites)
     found = bool(data.get("found")) and verified            # 확인된 인용이 하나도 없으면 답으로 내지 않는다
+    # 답에 나온 숫자(일수·금액·횟수)가 근거 조문에 실제로 있는지도 본다 — 지어낸 숫자로 답하지 않게
+    if found:
+        cited = " ".join(str(picks[ids.index(c["id"])].get("text") or "") for c in (data.get("citations") or [])
+                         if isinstance(c, dict) and c.get("id") in ids)
+        nums = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", str(data.get("answer") or ""))}
+        have = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", cited)}
+        if nums - have:
+            found = False
+            data["found"] = True                              # note 문구를 '확인 못함' 쪽으로
     return jsonify({"success": True, "mode": "ai", "found": found,
                     "answer": _sec_clean_str(data.get("answer"), 1200) if found else "",
                     "note": "" if found else _sec_clean_str(data.get("answer"), 400) if not data.get("found") else
-                    "AI 답의 근거 문장을 조문에서 확인하지 못해 답을 보여 드리지 않습니다. 아래 조문을 직접 확인하세요.",
+                    "AI 답의 근거(인용 문장·숫자)를 조문에서 확인하지 못해 답을 보여 드리지 않습니다. 아래 조문을 직접 확인하세요.",
                     "caution": _sec_clean_str(data.get("caution"), 300) if found else "",
                     "citations": cites[:4] if found else [], "candidates": cands, "provider": _sec_ai_provider()})
 
@@ -3743,14 +3788,15 @@ def _sec_rx_ok(rx: str) -> bool:
 def _sec_clean_erp_rules(e: dict) -> dict:
     """기관 맞춤 ERP 규칙 정규화 — 바탕 묶음 이름, 제출 버튼 이름, 화면 규칙, 제외 경로, 칸 이름."""
     e = e if isinstance(e, dict) else {}
+    lst = lambda v: v if isinstance(v, list) else []   # noqa: E731 — 목록 자리에 다른 꼴이 오면(손으로 고친 설정) 빈 목록으로
     out = {}
     if e.get("preset") in _sec_erp_presets():
         out["preset"] = e["preset"]
-    words = [_sec_clean_str(w, 30) for w in (e.get("submit_words") or [])[:40] if isinstance(w, str)]
+    words = [_sec_clean_str(w, 30) for w in lst(e.get("submit_words"))[:40] if isinstance(w, str)]
     if any(words):
         out["submit_words"] = list(dict.fromkeys(w for w in words if w))
     rules = []
-    for r in (e.get("screen_rules") or [])[:60]:
+    for r in lst(e.get("screen_rules"))[:60]:
         if not isinstance(r, dict):
             continue
         m, proc = str(r.get("match") or "").strip(), _sec_clean_str(r.get("proc"), 48).lower()
@@ -3759,12 +3805,13 @@ def _sec_clean_erp_rules(e: dict) -> dict:
                           "q": _sec_clean_str(r.get("q"), 80)})
     if rules:
         out["screen_rules"] = rules
-    skips = [str(x).strip() for x in (e.get("skip_paths") or [])[:40] if isinstance(x, str) and _sec_rx_ok(str(x).strip())]
+    skips = [str(x).strip() for x in lst(e.get("skip_paths"))[:40] if isinstance(x, str) and _sec_rx_ok(str(x).strip())]
     if skips:
         out["skip_paths"] = skips
     labels = {}
     for k in ("start", "end", "ignore"):
-        ws = [_sec_clean_str(w, 30) for w in ((e.get("labels") or {}).get(k) or [])[:20] if isinstance(w, str)]
+        lb = e.get("labels") if isinstance(e.get("labels"), dict) else {}
+        ws = [_sec_clean_str(w, 30) for w in lst(lb.get(k))[:20] if isinstance(w, str)]
         if any(ws):
             labels[k] = [w for w in ws if w]
     if labels:
