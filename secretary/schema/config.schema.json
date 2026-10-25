@@ -197,6 +197,19 @@
     }
    }
   },
+  "budget": {
+   "type": "object",
+   "description": "예산과목 기준표(기관 자체예산집행지침) — 절차별 흔한 과목 안내와 결재 전 점검에 쓴다",
+   "properties": {
+    "basis": {"type": "string", "description": "기준 문서(예: 2026 자체예산집행지침)"},
+    "items": {"type": "array", "items": {"type": "object", "required": ["name"],
+              "properties": {"code": {"type": "string"}, "name": {"type": "string"},
+                             "procs": {"type": "array", "items": {"type": "string"}, "description": "이 과목을 흔히 쓰는 절차 id"},
+                             "includes": {"type": "string", "description": "넣는 것"},
+                             "excludes": {"type": "string", "description": "넣지 않는 것(헷갈리는 과목)"},
+                             "note": {"type": "string", "description": "금액 기준 등 덧붙임"}}}}
+   }
+  },
   "updated": {
    "type": "string"
   },

@@ -422,3 +422,52 @@ def test_audit_survives_malformed_ai_basis_and_receipt_rejects_impossible_date(c
     png = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
     rc = client.post("/api/secretary/ai/receipt", json={"image": png}).get_json()["receipt"]
     assert rc["date"] == "" and rc["end_date"] == ""
+
+
+BUDGET = {"basis": "2026 자체예산집행지침", "items": [
+    {"code": "210-01", "name": "일반수용비", "procs": ["goods-purchase", "daily-expense"], "includes": "사무용품", "excludes": "자산취득비"},
+    {"code": "210-02", "name": "국내여비", "procs": ["domestic-trip"]},
+    {"code": "430-01", "name": "자산취득비", "procs": ["goods-purchase"]},
+]}
+
+
+def test_budget_config_is_cleaned_and_kept_when_omitted(client, monkeypatch):
+    clean = api_server._sec_clean_budget({"basis": "x" * 200, "items": [
+        {"code": "1", "name": "가", "procs": ["goods-purchase", "../evil", 3], "includes": "y" * 999},
+        {"code": "1", "name": "중복"}, {"code": "2", "name": ""}, "문자열", {"name": "나"}]})
+    assert len(clean["basis"]) == 80 and [i["name"] for i in clean["items"]] == ["가", "나"]
+    assert clean["items"][0]["procs"] == ["goods-purchase"] and len(clean["items"][0]["includes"]) == 300
+    assert api_server._sec_clean_budget({"items": []}) == {}
+    saved = []
+    real = api_server._sec_config
+    monkeypatch.setattr(api_server, "_sec_config", lambda force=False: {**real(force), "budget": BUDGET})
+    monkeypatch.setattr(api_server, "_sec_save_repo_file", lambda rp, lp, payload, msg: saved.append(json.loads(payload)) or "local")
+    base = str(real(True).get("updated") or "")
+    r = client.post("/api/secretary/config", json={"config": {"org": {"name": "x"}}, "base": base})
+    assert r.status_code == 200, r.data[:300]
+    assert len(saved[-1]["budget"]["items"]) == 3                            # 보내지 않으면 지금 기준표를 지킨다
+    client.post("/api/secretary/config", json={"config": {"org": {"name": "x"}, "budget": {}}, "base": base})
+    assert "budget" not in saved[-1]                                         # 빈 표를 보내면 비운다
+    assert client.get("/api/secretary/config").get_json()["config"]["budget"]["basis"] == BUDGET["basis"]
+
+
+def test_budget_audit_rules(monkeypatch):
+    real = api_server._sec_config
+    monkeypatch.setattr(api_server, "_sec_config", lambda force=False: {**real(force), "budget": BUDGET})
+    procs = {p["id"]: p for p in api_server._sec_read_json(api_server.SEC_COMMON_PATH, {})["procedures"]}
+    ids = lambda pid, case: [f["id"] for f in api_server._sec_audit_rules(procs[pid], case, "2026-10-25") if f["id"].startswith("budget")]  # noqa: E731
+    assert ids("goods-purchase", {}) == ["budget-none"]
+    assert ids("leave", {}) == []                                            # 과목이 이어지지 않은 업무는 묻지 않는다
+    assert ids("goods-purchase", {"budget": "210-01 일반수용비"}) == []
+    assert ids("goods-purchase", {"budget": "○○사업 일반수용비"}) == []
+    assert ids("goods-purchase", {"budget": "업무추진비"}) == ["budget-unknown"]
+    assert ids("goods-purchase", {"budget": "210-09 일반수용비"}) == ["budget-unknown"]   # 코드가 다르면 다른 과목
+    assert ids("goods-purchase", {"budget": "국내여비"}) == ["budget-unusual"]
+    # 결재에 올라가는 초안 값이 우선, 고른 값과 다르면 짚는다
+    case = {"budget": "일반수용비", "draft_values": {"purchase-request": {"budget": "430-01 자산취득비"}}}
+    assert ids("goods-purchase", case) == ["budget-diff"]
+    assert ids("goods-purchase", {"draft_values": {"purchase-request": {"budget": "국내여비"}}}) == ["budget-unusual"]
+    f = [x for x in api_server._sec_audit_rules(procs["goods-purchase"], {}, "2026-10-25") if x["id"] == "budget-none"][0]
+    assert "일반수용비" in f["detail"] and f["basis"] == {"reg": "재무회계규정", "art": "82"}
+    monkeypatch.setattr(api_server, "_sec_config", real)
+    assert ids("goods-purchase", {}) == []                                   # 기준표가 없으면 점검하지 않는다

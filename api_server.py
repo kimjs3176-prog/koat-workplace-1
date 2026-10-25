@@ -2181,6 +2181,7 @@ def _sec_public_config(cfg: dict) -> dict:
     return {"org": cfg.get("org", {}), "service": cfg.get("service", {}), "terms": cfg.get("terms", {}),
             "reg_aliases": cfg.get("reg_aliases", {}), "holidays": cfg.get("holidays", {}),
             "audit": cfg.get("audit") or {}, "insights": cfg.get("insights") or {}, "erp": cfg.get("erp") or {},
+            "budget": cfg.get("budget") or {},
             "updated": cfg.get("updated", "")}
 
 
@@ -2539,6 +2540,9 @@ def _secretary_config_save():
             if getattr(e, "status", 0) != 404:
                 return jsonify({"success": False, "error": "저장소의 현재 설정을 읽지 못해 저장을 멈췄습니다. 잠시 뒤 다시 저장하세요."}), 503
     cur = _sec_config(force=True)
+    bud = _sec_clean_budget(body.get("budget") if isinstance(body.get("budget"), dict) else cur.get("budget"))
+    if bud:
+        cfg["budget"] = bud
     for k in ("audit", "insights"):
         v = body.get(k) if isinstance(body.get(k), dict) else cur.get(k)
         if isinstance(v, dict) and v and len(json.dumps(v, ensure_ascii=False)) < 20000:
@@ -3359,7 +3363,91 @@ def _sec_audit_rules(p: dict, case: dict, today: str) -> list:
             add(f"draft-{key}", "high" if key == "card-evidence" else "medium",
                 f"초안 필수 항목 {len(miss)}개가 비었습니다", "빈 항목: " + ", ".join(miss), rule.get("basis"),
                 "초안을 열어 빈 칸을 채우세요.")
+    # 5) 예산과목 — 기관 기준표가 있을 때만(「재무회계규정」 제82조제3항: 지출할 때 예산과목의 적정성 검토)
+    for f in _sec_budget_findings(p, case):
+        add(*f)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 예산과목 기준표 — 기관이 자체예산집행지침의 과목을 넣어 두면 절차마다 흔히 쓰는 과목을 보여 주고,
+#   결재 전 사전 감사에서 '고르지 않음 / 기준표에 없는 과목 / 이 업무에 흔치 않은 과목'을 짚는다.
+#   기준표가 없으면 아무 것도 하지 않는다(과목 체계는 기관마다 달라 지어내지 않는다).
+# ══════════════════════════════════════════════════════════════════════════
+_SEC_BUDGET_BASIS = {"reg": "재무회계규정", "art": "82"}
+
+
+def _sec_clean_budget(b) -> dict:
+    """기관 설정 budget = {basis, items:[{code, name, procs:[절차 id], includes, excludes, note(금액 기준 등)}]}"""
+    b = b if isinstance(b, dict) else {}
+    items, seen = [], set()
+    for it in (b.get("items") if isinstance(b.get("items"), list) else [])[:300]:
+        if not isinstance(it, dict):
+            continue
+        name = _sec_clean_str(it.get("name"), 40)
+        code = _sec_clean_str(it.get("code"), 20)
+        if not name or (code or name) in seen:
+            continue
+        seen.add(code or name)
+        procs = [x for x in (it.get("procs") if isinstance(it.get("procs"), list) else [])[:20]
+                 if isinstance(x, str) and _SEC_ID_RE.match(x)]
+        items.append({"code": code, "name": name, "procs": list(dict.fromkeys(procs)),
+                      "includes": _sec_clean_str(it.get("includes"), 300), "excludes": _sec_clean_str(it.get("excludes"), 300),
+                      "note": _sec_clean_str(it.get("note"), 200)})
+    return {"basis": _sec_clean_str(b.get("basis"), 80), "items": items} if items else {}
+
+
+def _sec_budget_key(v: str) -> str:
+    return re.sub(r"[\s()\[\]·\-_.]", "", str(v or "")).lower()
+
+
+def _sec_budget_match(items: list, v: str):
+    """'210-01 일반수용비'·'일반수용비'·'210-01' 처럼 적은 값 → 기준표 항목(없으면 None)."""
+    k = _sec_budget_key(v)
+    if not k:
+        return None
+    keys = [(it, _sec_budget_key(it.get("code")), _sec_budget_key(it.get("name"))) for it in items]
+    for it, c, n in keys:
+        if k in {x for x in (c, n, c + n, n + c) if x}:
+            return it
+    # '○○사업 일반수용비'처럼 과목명이 들어 있으면 — 코드를 함께 적었다면 코드도 맞아야 한다. 더 긴 과목명 우선
+    loose = [(len(n), it) for it, c, n in keys
+             if n and n in k and (c in k if c and re.search(r"\d", k) else True)]
+    return max(loose, key=lambda x: x[0])[1] if loose else None
+
+
+def _sec_budget_findings(p: dict, case: dict) -> list:
+    items = (_sec_config().get("budget") or {}).get("items") or []
+    if not items:
+        return []
+    used = [it for it in items if p.get("id") in (it.get("procs") or [])]
+    label = lambda it: " ".join(x for x in (it.get("code"), it.get("name")) if x)   # noqa: E731
+    # 고른 과목: 결재에 올라가는 저장한 초안의 '예산과목' 칸 → 없으면 절차 화면에서 고른 값
+    picked = _sec_clean_str(case.get("budget"), 80)
+    dv = case.get("draft_values") if isinstance(case.get("draft_values"), dict) else {}
+    chosen = next((_sec_clean_str(v.get("budget"), 80) for v in dv.values()
+                   if isinstance(v, dict) and _sec_clean_str(v.get("budget"), 80)), "") or picked
+    fix = "절차 화면의 💰 예산과목에서 고르거나 초안의 예산과목 칸에 적으세요."
+    pre = []
+    if picked and chosen != picked and _sec_budget_match(items, picked) is not _sec_budget_match(items, chosen):
+        pre.append(("budget-diff", "low", f"초안의 예산과목({chosen})이 고른 과목({picked})과 다릅니다",
+                    "결재에는 초안의 값이 올라갑니다. 둘 중 맞는 것으로 맞추세요.", _SEC_BUDGET_BASIS, fix))
+    if not chosen:
+        if not used:
+            return []                          # 이 업무에 연결된 과목이 없으면(예산 집행이 없는 업무) 묻지 않는다
+        return [("budget-none", "medium", "예산과목을 정하지 않았습니다",
+                 "이 업무에 흔히 쓰는 과목: " + ", ".join(label(it) for it in used[:5]), _SEC_BUDGET_BASIS, fix)]
+    it = _sec_budget_match(items, chosen)
+    if not it:
+        return pre + [("budget-unknown", "medium", f"기준표에 없는 예산과목: {chosen}",
+                 "기관 예산과목 기준표에서 찾지 못했습니다. 과목명·코드를 확인하세요."
+                 + (f" 이 업무에 흔히 쓰는 과목: {', '.join(label(x) for x in used[:5])}" if used else ""), _SEC_BUDGET_BASIS, fix)]
+    if used and it not in used:
+        return pre + [("budget-unusual", "low", f"이 업무에 흔치 않은 예산과목: {label(it)}",
+                 f"흔히 쓰는 과목: {', '.join(label(x) for x in used[:5])}."
+                 + (f" 이 과목에 넣지 않는 것: {it['excludes']}" if it.get("excludes") else ""), _SEC_BUDGET_BASIS,
+                 "과목 기준표의 '넣는 것·넣지 않는 것'을 확인하세요.")]
+    return pre
 
 
 _SEC_AUDIT_SYSTEM = (
@@ -3794,7 +3882,7 @@ _SEC_KV_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_RE
 _SEC_KV_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN") or "").strip()
 _SEC_INS_LOCK = _FileLock(lambda: SEC_INS_FILE + ".lock")    # 작업자 프로세스끼리도(세던 숫자가 덮여 사라지지 않게)
 _SEC_INS_HITS: dict = {}
-_SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft")
+_SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft", "budget")
 
 
 def _sec_int(v, default: int, lo: int, hi: int) -> int:

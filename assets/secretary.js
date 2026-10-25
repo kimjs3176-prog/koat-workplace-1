@@ -316,7 +316,7 @@ function normCase(c){
     confidence:str(r.confidence,10), ai:!!r.ai, ...(r.ai?{aiSt:['ok','edited'].includes(r.aiSt)?r.aiSt:'pending', aiAt:D.test(r.aiAt||'')?r.aiAt:'', edited:!!r.edited}:{}), region:str(r.region,40), thumb:/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.thumb||'')?r.thumb:undefined }));
   const drafts={}; for(const [k,v] of Object.entries(obj(c.drafts))){ const o={}; for(const [f,x] of Object.entries(obj(v))) if(typeof x==='string') o[String(f).slice(0,40)]=x.slice(0,4000); drafts[String(k).slice(0,40)]=o; }
   return {id:str(c.id,40), procId:str(c.procId,48), title:str(c.title,120), created:D.test(c.created||'')?c.created:today(), updated:Number(c.updated)||Date.now(),
-    query:str(c.query,200), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
+    query:str(c.query,200), ...(str(c.budget,80)?{budget:str(c.budget,80)}:{}), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
     status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined,
     // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
     sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{}),
@@ -632,7 +632,7 @@ function procView(){
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
   return regAnsBox()+aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
-    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${aiLedgerHtml(c)}${caseNote}</div>`+
+    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${budgetHtml(p, c)}${pitHtml}${auditHtml(p, c)}${aiLedgerHtml(c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
 
@@ -782,7 +782,7 @@ function manageView(){
     `<div class="sec-row"><button class="sec-btn primary" data-a="newproc">＋ 새 절차 만들기</button>`+
     `<button class="sec-btn ghost" data-a="reload">↻ 기관 절차 새로고침</button></div>`+
     `<div class="sec-card">${rows}${hidRows}</div>`+
-    aiKeyCard()+healthCard()+impactCard()+aiReportCard()+insightsCard()+mappingCard()+packCard()+configCard()+
+    aiKeyCard()+healthCard()+impactCard()+aiReportCard()+insightsCard()+mappingCard()+packCard()+configCard()+budgetCard()+
     `<div class="sec-hint">규정·지침이 개정되면: 근거 조문은 내규 원문(업로드 반영)에서 자동으로 최신본을 보여 줍니다. 근거 규정이 개정된 절차에는 '재확인 필요'가 표시되니, 원문과 대조한 뒤 <b>수정</b>해 기관 층으로 다시 저장하세요.</div>`;
 }
 
@@ -903,6 +903,91 @@ function erpRulesBlock(c){
     (S._erpProblems&&S._erpProblems.length?`<div class="sec-notice warn">${S._erpProblems.map(esc).join('<br>')}</div>`:'')+
     (prof?`<div class="sec-sub">지금 확장에 가는 규칙(저장된 것): 제출 버튼 ${prof.submit_words.length} · 화면 규칙 ${prof.screen_rules.length} · 제외 주소 ${prof.skip_paths.length} — 확장은 30분 안에 새 규칙을 받습니다.</div>`:'')+
     `</details>`;
+}
+// ── 관리: 예산과목 기준표 ─────────────────────────────────────────────────
+// 기관 자체예산집행지침의 과목표를 엑셀에서 복사해 붙여 넣는다(탭 또는 | 로 칸 구분).
+// 칸: 코드 | 과목명 | 주로 쓰는 업무 | 넣는 것 | 넣지 않는 것 | 기준(금액 등)
+const BUD_COLS=['code','name','procs','includes','excludes','note'];
+function budgetItems(){ return ((S.cfg||{}).budget||{}).items||[]; }
+function budLabel(it){ return [it.code, it.name].filter(Boolean).join(' '); }
+function budKey(v){ return String(v||'').replace(/[\s()\[\]·\-_.]/g,'').toLowerCase(); }
+// 서버 _sec_budget_match 와 같은 규칙 — 적은 값이 기준표의 어느 과목인지
+function budMatch(items, v){
+  const k=budKey(v); if(!k) return null;
+  const ks=items.map(it=>[it, budKey(it.code), budKey(it.name)]);
+  for(const [it,c,n] of ks) if([c,n,c+n,n+c].filter(Boolean).includes(k)) return it;
+  const dig=/\d/.test(k); let best=null, bl=0;
+  for(const [it,c,n] of ks) if(n && k.includes(n) && (c&&dig?k.includes(c):true) && n.length>bl){ best=it; bl=n.length; }
+  return best;
+}
+// 과목명·넣는 것 → 흔히 쓰는 업무(관리자가 '흔한 연결 채우기'를 누를 때만, 고칠 수 있게 칸에 채워 넣는다)
+const BUD_GUESS=[[/국외.*여비|여비.*국외|국외출장/,['overseas-trip']],[/여비|출장/,['domestic-trip']],[/업무추진/,['corp-card','event']],
+  [/일반수용|소모품|사무용품|수용비/,['goods-purchase','daily-expense']],[/자산취득|비품|기계|장비/,['goods-purchase']],[/용역|위탁/,['service-contract']],
+  [/행사|홍보/,['event']],[/교육|훈련|연수/,['training']],[/자문|수당|사례금|강사/,['expert-fee']],[/상품권|복리후생/,['gift-cert']],
+  [/차량|유류|연료/,['official-vehicle']],[/시간외|초과근무/,['overtime']],[/당직/,['night-duty']],[/경조/,['family-event']]];
+function budGuess(it){ const t=`${it.name} ${it.includes||''}`; const ids=new Set(allProcs().map(p=>p.id));
+  for(const [rx,ps] of BUD_GUESS) if(rx.test(t)) return ps.filter(x=>ids.has(x)); return []; }
+function budProcName(id){ const p=getProc(id); return p?shortTitle(p.title):id; }
+function budgetText(b){
+  return ((b&&b.items)||[]).map(it=>[it.code, it.name, (it.procs||[]).map(budProcName).join(', '), it.includes, it.excludes, it.note].map(x=>String(x||'').replace(/[\t|\n]/g,' ')).join(' | ').replace(/( \| )+$/,'')).join('\n');
+}
+function budgetParse(txt){
+  const procs=allProcs().filter(p=>!p.hidden); const problems=[], items=[], seen=new Set();
+  const findProc=t=>{ const x=t.trim(); if(!x) return null; const k=budKey(x);
+    return procs.find(p=>p.id===x) || procs.find(p=>budKey(shortTitle(p.title))===k) || procs.find(p=>budKey(p.title).includes(k)&&k.length>=2) || null; };
+  String(txt||'').split('\n').forEach((l,i)=>{
+    if(!l.trim()) return;
+    const cs=(l.includes('\t')?l.split('\t'):l.split('|')).map(x=>x.trim());
+    if(i===0 && /코드|과목/.test(cs[0]+cs[1]) && /과목|명/.test(cs[1]||'')) return;     // 엑셀 머리줄
+    if(cs[0] && !/\d/.test(cs[0])) cs.unshift('');                                      // 코드 없이 과목명부터 적은 줄
+    const it={}; BUD_COLS.forEach((k,j)=>{ it[k]=cs[j]||''; });
+    if(!it.name){ problems.push(`${i+1}째 줄 — 과목명(둘째 칸)이 비었습니다`); return; }
+    if(seen.has(it.code||it.name)){ problems.push(`${i+1}째 줄 — '${budLabel(it)}'가 두 번 나옵니다`); return; }
+    seen.add(it.code||it.name);
+    const ps=[]; it.procs.split(/[,，/·]/).forEach(t=>{ if(!t.trim()) return; const p=findProc(t); if(p) ps.push(p.id); else problems.push(`${i+1}째 줄 '${it.name}' — 업무 '${t.trim()}'를 찾지 못했습니다(절차 이름이나 id)`); });
+    it.procs=[...new Set(ps)];
+    items.push({code:it.code.slice(0,20), name:it.name.slice(0,40), procs:it.procs, includes:it.includes.slice(0,300), excludes:it.excludes.slice(0,300), note:it.note.slice(0,200)});
+  });
+  if(items.length>300) problems.push('과목은 300개까지 넣을 수 있습니다');
+  return {items:items.slice(0,300), problems};
+}
+function budgetCard(){
+  const b=(S.cfg||{}).budget||{}; const raw=S._budRaw!=null?S._budRaw:budgetText(b);
+  const pv=budgetParse(raw); const basis=S._budBasis!=null?S._budBasis:(b.basis||'');
+  const prev=pv.items.length?`<div class="sec-tbl-wrap"><table class="sec-tbl"><thead><tr><th>과목</th><th>주로 쓰는 업무</th><th>넣는 것 / 넣지 않는 것</th></tr></thead><tbody>`+
+    pv.items.slice(0,60).map(it=>`<tr><td><b>${esc(budLabel(it))}</b>${it.note?`<div class="sec-sub">${esc(it.note)}</div>`:''}</td><td>${it.procs.length?it.procs.map(x=>esc(budProcName(x))).join(', '):'<span class="sec-sub">없음</span>'}</td>`+
+      `<td>${it.includes?esc(it.includes):''}${it.excludes?`<div class="sec-sub">✕ ${esc(it.excludes)}</div>`:''}</td></tr>`).join('')+
+    `</tbody></table></div>${pv.items.length>60?`<div class="sec-sub">… 외 ${pv.items.length-60}개</div>`:''}`:'';
+  return `<details class="sec-card sec-cfg"${S._budOpen?' open':''}><summary class="sec-card-h">💰 예산과목 기준표 <span class="sec-sub">${b.items&&b.items.length?`${b.items.length}개 과목${b.basis?' · '+esc(b.basis):''}`:'아직 없음 — 넣으면 절차 화면에 흔한 과목이 뜨고 사전 감사가 과목을 점검합니다'}</span></summary>`+
+    `<div class="sec-hint">기관 <b>자체예산집행지침</b>의 과목표를 엑셀에서 복사해 붙여 넣으세요. 칸 순서: <b>코드 | 과목명 | 주로 쓰는 업무 | 넣는 것 | 넣지 않는 것 | 기준(금액 등)</b>. 코드가 없으면 과목명부터 적고, 뒤쪽 칸은 비워도 됩니다. 업무는 절차 이름(국내출장, 물품 구매…)을 쉼표로 적습니다.</div>`+
+    `<label class="sec-f"><span>기준 문서</span><input data-a="budbasis" value="${esc(basis)}" placeholder="예: 2026년 자체예산집행지침" maxlength="80"></label>`+
+    `<label class="sec-f"><span>과목표</span><textarea data-a="budraw" rows="8" placeholder="210-01 | 일반수용비 | 물품 구매, 일상경비 | 사무용품·소모품 | 자산취득비(내용연수 1년 이상·50만 원 이상) | 50만 원 미만">${esc(raw)}</textarea></label>`+
+    (pv.problems.length?`<div class="sec-notice warn">${pv.problems.slice(0,12).map(esc).join('<br>')}</div>`:'')+prev+
+    `<div class="sec-row"><button class="sec-btn sm" data-a="budguess">흔한 연결 채우기</button><button class="sec-btn primary sm" data-a="budsave">기준표 저장</button>`+
+    `<span class="sec-sub">'흔한 연결 채우기'는 업무 칸이 빈 과목만 과목명으로 짐작해 채웁니다 — 저장 전에 확인하세요.</span></div></details>`;
+}
+// ── 절차 화면: 이 업무에 흔히 쓰는 예산과목 ────────────────────────────────
+function budgetHtml(p, c){
+  const items=budgetItems(); if(!items.length) return '';
+  const used=items.filter(it=>(it.procs||[]).includes(p.id));
+  const hasField=procDraftKeys(p).some(k=>((allDrafts()[k]||{}).fields||[]).some(f=>f.k==='budget'));
+  const cur=(c&&c.budget)||''; if(!used.length && !hasField && !cur) return '';
+  const it=cur?budMatch(items, cur):null; const b=(S.cfg||{}).budget||{};
+  const chips=used.map(x=>{ const l=budLabel(x); return `<button class="sec-chip sm${it===x?' on':''}" data-a="budpick" data-v="${esc(l)}" aria-pressed="${it===x}">${esc(l)}</button>`; }).join('');
+  const opts=`<option value="">${used.length?'다른 과목…':'과목 고르기…'}</option>`+items.map(x=>{ const l=budLabel(x); return `<option value="${esc(l)}"${it===x?' selected':''}>${esc(l)}</option>`; }).join('');
+  const info=it?`<div class="sec-bud-info">${it.includes?`<div>✔ 넣는 것: ${esc(it.includes)}</div>`:''}${it.excludes?`<div>✕ 넣지 않는 것: ${esc(it.excludes)}</div>`:''}${it.note?`<div>· ${esc(it.note)}</div>`:''}`+
+      (used.length&&!used.includes(it)?`<div class="sec-warn-t">⚠ 이 업무에 흔히 쓰는 과목이 아닙니다 — 맞는지 한 번 더 확인하세요.</div>`:'')+`</div>`
+    :cur?`<div class="sec-notice warn">'${esc(cur)}'은(는) 기관 기준표에 없는 과목입니다.</div>`:'';
+  return `<div class="sec-card"><div class="sec-card-h">💰 예산과목 <span class="sec-sub">${b.basis?esc(b.basis)+' 기준 · ':''}고르면 초안의 예산과목 칸에 들어가고 사전 감사가 점검합니다</span></div>`+
+    (used.length?`<div class="sec-sub">이 업무에 흔히 쓰는 과목</div><div class="sec-ai-chips">${chips}</div>`:'')+
+    `<div class="sec-row"><select data-a="budsel" aria-label="예산과목">${opts}</select>${cur?`<button class="sec-btn sm" data-a="budpick" data-v="">지우기</button>`:''}</div>${info}</div>`;
+}
+function setBudget(v){
+  ensureCase(); updateCase(c=>{ const old=c.budget||'';
+    // 저장해 둔 초안의 예산과목 칸이 비었거나 전에 고른 값 그대로면 같이 바꾼다(사람이 따로 적은 값은 두고 감사가 다르면 짚는다)
+    for(const d of Object.values(c.drafts||{})) if(d && Object.prototype.hasOwnProperty.call(d,'budget') && (!d.budget || d.budget===old)) d.budget=v;
+    if(v) c.budget=v; else delete c.budget; });
+  render();
 }
 // ── 관리: 기관 설정 ─────────────────────────────────────────────────────
 function configCard(){
@@ -1117,6 +1202,7 @@ function draftAuto(d, c, p){
     if(f.auto==='period' && dates.start){ out[f.k]=fmtLong(dates.start)+(dates.end&&dates.end!==dates.start?' ~ '+fmtLong(dates.end):''); }
     else if(f.auto==='period' && dates.end){ out[f.k]=fmtLong(dates.end); }
     else if(f.auto==='start' && dates.start){ out[f.k]=fmtLong(dates.start); }
+    else if(f.k==='budget' && c && c.budget){ out[f.k]=c.budget; }
     else if(f.auto==='history'){ const lines=openCasesWithNext().map(({c,next})=>`${c.title}${next?' — 다음: '+next.s.t.slice(0,40)+(next.due?' ('+fmtLong(next.due)+'까지)':''):''}`); if(lines.length) out[f.k]=lines.join('\n'); }
   });
   return out;
@@ -1412,7 +1498,7 @@ function bind(panel){
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule','budraw','budbasis','budsel'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -1438,6 +1524,17 @@ function bind(panel){
         S._erpProblems=Object.entries(S._erpRaw||{}).flatMap(([k,v])=>erpRulesParse(k,v).problems);
         if(S._erpProblems.length){ S._erpOpen=true; render(); toast('ERP 화면 규칙에 고칠 줄이 있습니다.', 4200); break; }
         saveConfig(c, '기관 설정을 저장했습니다.'); break; }
+      case 'budpick': setBudget(D.v||''); break;
+      case 'budguess': { S._budOpen=true; const pv=budgetParse(S._budRaw!=null?S._budRaw:budgetText((S.cfg||{}).budget)); let n=0;
+        pv.items.forEach(it=>{ if(!it.procs.length){ const g=budGuess(it); if(g.length){ it.procs=g; n++; } } });
+        S._budRaw=budgetText({items:pv.items}); render(); toast(n?`과목 ${n}개에 흔히 쓰는 업무를 채웠습니다. 맞는지 확인하고 저장하세요.`:'짐작해 채울 과목이 없습니다.'); break; }
+      case 'budsave': { S._budOpen=true; const pv=budgetParse(S._budRaw!=null?S._budRaw:budgetText((S.cfg||{}).budget));
+        if(pv.problems.length){ render(); toast('과목표에 고칠 줄이 있습니다.', 4200); break; }
+        // 기관 설정 칸에 고치다 만 값이 있으면 함께 저장된다(저장하면 초안을 비우므로 따로 버리지 않게)
+        const cfg=JSON.parse(JSON.stringify(S._cfgDraft||S.cfg||{})); delete cfg.updated;
+        if(!String((cfg.org||{}).name||'').trim()){ toast('기관 설정의 기관명을 먼저 입력하세요.'); break; }
+        cfg.budget={basis:(S._budBasis!=null?S._budBasis:((S.cfg.budget||{}).basis||'')).trim(), items:pv.items};
+        saveConfig(cfg, pv.items.length?`예산과목 ${pv.items.length}개를 저장했습니다.`:'예산과목 기준표를 비웠습니다.').then(ok=>{ if(ok){ S._budRaw=null; S._budBasis=null; } }); break; }
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
@@ -1515,6 +1612,8 @@ function bind(panel){
     if(a==='date'){ ensureCase(); updateCase(c=>{ c.dates=c.dates||{}; if(el.value) c.dates[el.dataset.k]=el.value; else delete c.dates[el.dataset.k];
         if(c.datesAi) delete c.datesAi[el.dataset.k]; }); render(); }     // 사람이 고친 기준일은 더 이상 AI 값이 아니다
     else if(a==='lay'){ S.editLayer=el.value; render(); }
+    else if(a==='budsel') setBudget(el.value);
+    else if(a==='budraw'){ S._budOpen=true; render(); }                  // 칸을 벗어나면 미리 보기·고칠 줄을 새로 보여 준다
     else if(a==='alias'){ S._aliasDraft=S._aliasDraft||{}; if(el.value) S._aliasDraft[el.dataset.n]=el.value; else delete S._aliasDraft[el.dataset.n]; }
     else if(a==='packfile') readJsonFile(el, packRead);
     else if(a==='rcfile'){ const fs=[...(el.files||[])].filter(f=>/^image\//.test(f.type)); el.value=''; if(fs.length) addReceipts(fs); }
@@ -1539,6 +1638,8 @@ function bind(panel){
     if(a==='cfgerprule'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}); S._erpOpen=true;
       const k=el.dataset.k; if(k==='preset'){ c.erp.preset=el.value; render(); return; }
       S._erpRaw=S._erpRaw||{}; S._erpRaw[k]=el.value; Object.assign(c.erp, erpRulesParse(k, el.value).val); return; }
+    if(a==='budraw'){ S._budRaw=el.value; return; }
+    if(a==='budbasis'){ S._budBasis=el.value; return; }
     if(a==='cfgerp'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}, {hosts:el.value.split('\n').map(x=>x.trim()).filter(Boolean)}); return; }
     if(a==='cfghol'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.holidays=c.holidays||{};
       c.holidays.extra=el.value.split('\n').map(l=>l.trim().match(/^(\d{4}-\d{2}-\d{2})\s*(.*)$/)).filter(Boolean).map(m=>({date:m[1], name:m[2]||'기관 휴일'})); return; }
@@ -2205,7 +2306,7 @@ function auditInput(p, c){
   c=c||{}; const dv={}, dt={};
   procDraftKeys(p).forEach(k=>{ const saved=(c.drafts||{})[k]; if(!saved) return;   // '이력에 저장'한 초안만 감사
     const d=allDrafts()[k]; const v=Object.assign({}, draftAuto(d,c,p), receiptDraftVals(k,c), saved); dv[k]=v; dt[d.title||k]=fillTemplate(d.template, v); });
-  return {dates:c.dates||{}, checks:c.checks||{}, note:c.note||'', draft_values:dv, drafts:dt,
+  return {dates:c.dates||{}, checks:c.checks||{}, note:c.note||'', draft_values:dv, drafts:dt, budget:c.budget||'',
     receipts:receipts(c).map(r=>{ const o=Object.assign({}, r); delete o.thumb; delete o.name; return o; })};
 }
 function auditSig(inp){ const x=JSON.stringify(inp); let h=0; for(let i=0;i<x.length;i++) h=(h*31+x.charCodeAt(i))|0; return String(h); }
@@ -2242,7 +2343,8 @@ async function runAudit(){
 function auditHtml(p, c){
   const a=c&&c.audit; const busy=c&&S.auditBusy===c.id;
   const stale=a && a.sig!==auditSig(auditInput(p, c));
-  const intro=`<span class="sec-sub">${aiOn()?'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검하고, AI 감사관이 근거 조문과 대조합니다':'기한·숙박비 상한·증빙·초안 필수 항목을 규칙으로 점검합니다(AI 감사는 \'내 AI 키\' 또는 기관 AI 키가 있으면 켜집니다)'}</span>`;
+  const what='기한·숙박비 상한·증빙·초안 필수 항목'+(budgetItems().length?'·예산과목':'');
+  const intro=`<span class="sec-sub">${aiOn()?what+'을 규칙으로 점검하고, AI 감사관이 근거 조문과 대조합니다':what+'을 규칙으로 점검합니다(AI 감사는 \'내 AI 키\' 또는 기관 AI 키가 있으면 켜집니다)'}</span>`;
   const btn=`<button class="sec-btn sm ${a?'':'primary'}" data-a="audit" ${busy?'disabled':''}>${a?'🔁 다시 감사':'🔍 감사 실행'}</button>`;
   let body='';
   if(busy) body=`<div class="assist-loading sm"><div class="spinner"></div><span>${aiOn()?'규칙 점검 + AI 감사관이 조문과 대조하는 중...':'점검하는 중...'}</span></div>`;
@@ -2340,7 +2442,7 @@ async function applyImpact(body){
 //    담당자가 직접 공유한 반려 사유를 모아, 같은 업무를 처음 하는 사람에게 돌려준다.
 //    이름·금액·메모·초안 내용·영수증은 보내지 않는다. 처리 이력 화면에서 끌 수 있다.
 // ═══════════════════════════════════════════════════════════════════════════
-const AU_KIND={due:'기한 경과', soon:'기한 임박', lodge:'숙박비 상한 초과', pay:'법인카드 외 결제', 'no-fare':'운임 증빙 누락', 'no-lodge':'숙박 증빙 누락', out:'기간 밖 증빙', draft:'초안 필수 항목 누락'};
+const AU_KIND={due:'기한 경과', soon:'기한 임박', lodge:'숙박비 상한 초과', pay:'법인카드 외 결제', 'no-fare':'운임 증빙 누락', 'no-lodge':'숙박 증빙 누락', out:'기간 밖 증빙', draft:'초안 필수 항목 누락', budget:'예산과목 확인'};
 function canShare(ignoreAvail){ return (ignoreAvail||S.insights.available) && _ls(LS_SHARE, true)!==false; }
 function shareToggle(){
   if(!S.insights.available) return '';
