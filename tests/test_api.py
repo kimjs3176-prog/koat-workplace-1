@@ -324,3 +324,40 @@ def test_ai_review_counts_in_month_result_was_made(client, monkeypatch, tmp_path
     months = {m["month"]: m for m in client.get("/api/secretary/insights/ai").get_json()["months"]}
     assert months["2026-10"]["receipt"]["ok"] == 1 and months["2026-10"]["receipt"]["pending"] == 0
     assert months["2026-11"]["receipt"]["made"] == 1 and "2031-01" not in months
+
+
+def test_ai_report_rejects_inconsistent_counts(client, monkeypatch, tmp_path):
+    # 만든 적 없는 결과의 '확인'·없는 판단의 되돌리기는 받지 않는다 — 사용률이 100%를 넘는 꾸민 숫자가 쌓이지 않게
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
+    assert ev(kind="draft", st="ok").status_code == 409                       # 만든 것 없음
+    assert ev(kind="draft", st="made").status_code == 200
+    assert ev(kind="draft", st="ok").status_code == 200
+    assert ev(kind="draft", st="ok").status_code == 409                       # 1건 만들고 2번 확인
+    assert ev(kind="draft", st="pending", prev="rejected").status_code == 409 # 없는 판단 되돌리기
+    assert ev(kind="draft", st="rejected", prev="ok").status_code == 200      # 판단 바꾸기
+    m = client.get("/api/secretary/insights/ai").get_json()["months"][0]["draft"]
+    assert m == {"made": 1, "ok": 0, "edited": 0, "rejected": 1, "pending": 0}
+
+
+def test_ai_audit_finding_id_follows_title_and_bad_src_drops_line(client, monkeypatch):
+    # AI 지적 id 는 순서가 아니라 제목 — 다시 감사해 순서가 바뀌어도 같은 지적은 같은 id
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    monkeypatch.setattr(api_server, "_sec_ai_rate_ok", lambda: True)
+    proc = json.loads(json.dumps(api_server._sec_read_json(api_server.SEC_COMMON_PATH, {})["procedures"][0]))
+
+    def run(titles):
+        monkeypatch.setattr(api_server, "_sec_ai_json", lambda *a, **k: {"summary": "", "findings": [
+            {"severity": "low", "title": t, "detail": "", "basis": "x", "fix": ""} for t in titles]})
+        d = client.post("/api/secretary/audit", json={"procedure": proc, "case": {}, "ai": True}).get_json()
+        return {f["title"]: f["id"] for f in d["findings"] if f["source"] == "ai"}
+    a, b = run(["가 지적", "나 지적"]), run(["나 지적", "가 지적"])
+    assert a == b and len(set(a.values())) == 2
+    # AI 초안: 출처를 숫자·객체로 돌려줘도 요청 전체가 실패하지 않고 그 줄만 근거 없음
+    monkeypatch.setattr(api_server, "_sec_ai_json", lambda *a, **k: {"lines": [
+        {"text": "스마트팜 실증사업 협의", "src": 1}, {"text": "스마트팜 실증사업 협의", "src": [{"x": 1}]},
+        {"text": "스마트팜 실증사업 협의", "src": ["S1"]}], "missing": []})
+    r = client.post("/api/secretary/ai/draft", json={"draft": "출장결과보고서", "field": "주요 내용",
+                                                     "sources": [{"kind": "메모", "text": "스마트팜 실증사업 협의"}]})
+    assert r.status_code == 200 and [x["ok"] for x in r.get_json()["lines"]] == [False, False, True]

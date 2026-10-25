@@ -18,6 +18,7 @@ from urllib.parse import quote
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import hmac
+import hashlib
 import requests as req_lib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -2893,7 +2894,8 @@ def secretary_ai_draft():
         if not isinstance(ln, dict):
             continue
         t = re.sub(r"^\s*(?:[-·•○□*]|\d+[.)])\s*", "", _sec_clean_str(ln.get("text"), 200))
-        src = [i for i in dict.fromkeys(ln.get("src") or []) if i in by]
+        raw = ln.get("src") if isinstance(ln.get("src"), list) else []            # 출처 형식이 틀리면 그 줄만 근거 없음으로
+        src = [i for i in dict.fromkeys(str(x) for x in raw if isinstance(x, (str, int))) if i in by]
         if not t:
             continue
         ok, why = _sec_draft_line_ok(t, " ".join(by[i]["text"] for i in src), known) if src else (False, "근거 자료 표시 없음")
@@ -3447,8 +3449,13 @@ def secretary_audit():
                     sev = f.get("severity") if f.get("severity") in ("high", "medium", "low") else "low"
                     if not b:
                         sev = "low"                     # 근거 조문이 없는 지적은 참고 수준으로만
+                    title = _sec_clean_str(f.get("title"), 120)
+                    # id 는 순서가 아니라 제목으로 — 다시 감사해 순서가 바뀌어도 같은 지적은 같은 id(사람 판단이 이어지게)
+                    fid = "ai-" + hashlib.sha1(re.sub(r"\s+", "", title).encode("utf-8")).hexdigest()[:10]
+                    while any(x["id"] == fid for x in result["findings"]):
+                        fid += "x"
                     result["findings"].append({
-                        "id": f"ai-{i}", "severity": sev, "title": _sec_clean_str(f.get("title"), 120),
+                        "id": fid, "severity": sev, "title": title,
                         "detail": _sec_clean_str(f.get("detail"), 400), "fix": _sec_clean_str(f.get("fix"), 200),
                         "basis": {k: v for k, v in (b or {}).items() if k in ("reg", "art", "q")} or None,
                         "source": "ai"})
@@ -3902,6 +3909,15 @@ def _sec_ai_event(b: dict):
     if not cmds:
         return jsonify({"success": True})
     try:
+        # 숫자가 서로 맞는 기록만 받는다 — 만든 적 없는 결과를 '확인'하거나(확인+고침+버림 > 만듦), 없는 판단을 되돌리지 못하게
+        if "made" in allowed and st != "made":
+            h = {k: int(v) for k, v in ((_sec_kv([["HGETALL", key]])[0]) or {}).items() if str(v).lstrip("-").isdigit()}
+            cnt = lambda s_: h.get(f"{kind}:{s_}", 0)   # noqa: E731
+            if prev and cnt(prev) < 1:
+                return jsonify({"success": False, "error": "되돌릴 판단 기록이 없습니다."}), 409
+            decided = cnt("ok") + cnt("edited") + cnt("rejected") + (1 if st != "pending" else 0) - (1 if prev else 0)
+            if decided > cnt("made"):
+                return jsonify({"success": False, "error": "만든 AI 결과보다 판단 기록이 많아집니다."}), 409
         _sec_kv(cmds)
     except Exception as e:
         print(f"[secretary] AI 산출물 기록 실패: {e}")
