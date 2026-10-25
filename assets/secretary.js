@@ -1170,7 +1170,10 @@ function openDraft(key){
     return (d.fields||[]).map(f=>({f, rids:[...new Set(rids(f))].filter(id=>{ const r=rs.find(x=>x.id===id); return r?r.ai&&(!pendOnly||(r.aiSt||'pending')==='pending'):Object.values(dai).some(v=>(v||[]).includes(id)); })})).filter(x=>x.rids.length); };
   const persist=fk=>{ const x=me.ai[fk]; if(!me.cid||!x) return;
     updateCaseById(me.cid, cc=>{ cc.draftAi=cc.draftAi||{};
-      if(x.st==='rejected'){ aiLogPush(cc, 'draft', 'rejected', d.title, x.at); delete cc.draftAi[key]; }
+      // 버림: AI 기록을 지우기 전에 이력에 저장된 칸 값도 지금 칸 값(버리기면 앞 내용, 다 바꿔 썼으면 사람 글)으로 맞춘다
+      //  — 저장해 둔 AI 글이 다시 열 때 표시 없이 되살아나 'AI 없음'으로 나가지 않게
+      if(x.st==='rejected'){ aiLogPush(cc, 'draft', 'rejected', d.title, x.at); delete cc.draftAi[key];
+        if(cc.drafts&&cc.drafts[key]&&fk in cc.drafts[key]) cc.drafts[key][fk]=String(me.vals[fk]??''); }
       else cc.draftAi[key]={k:fk, st:x.st, at:x.at, text:String(x.text||'').slice(0,4000), prev:String(x.prev??'').slice(0,4000),
         lines:(x.lines||[]).slice(0,10).map(l=>({text:String(l.text||'').slice(0,200), src:(l.src||[]).slice(0,6), ok:!!l.ok, why:String(l.why||'').slice(0,80)})),
         sources:(x.sources||[]).slice(0,12)}; }); };
@@ -1263,8 +1266,6 @@ function openDraft(key){
     // 버리기: AI 초안 앞의 내용으로 되돌린다(앞 내용을 모르는 옛 기록이면 칸을 비운다 — AI 글이 남은 채 'AI 없음'으로 나가지 않게)
     else if(da==='aino'){ const fk=b.dataset.k, x=me.ai[fk]; if(!x) return;
       const back=typeof x.prev==='string'?x.prev:''; me.vals[fk]=back; { const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=back; } out();
-      // 이력에 저장해 둔 초안 값도 앞 내용으로 — 저장 없이 닫았다 다시 열 때 버린 AI 글이 표시 없이 되살아나지 않게
-      if(me.cid) updateCaseById(me.cid, cc=>{ if(cc.drafts&&cc.drafts[key]&&fk in cc.drafts[key]) cc.drafts[key][fk]=back; });
       const was=x.st; x.st='rejected'; aiEvent('draft','rejected', was, 1, x.at); persist(fk); panel(fk); refreshAi(); if(S.view==='proc') render(); }
     else if(da==='airc'){ confirmRc([...new Set(rcFields(true).flatMap(y=>y.rids))]); refreshAi(); if(S.view==='proc') render(); toast('영수증 인식값을 확인한 것으로 기록했습니다.'); }
     // 초안 창을 연 건에 저장한다(그사이 확장 패널이 다른 ERP 화면의 건으로 넘어가도 섞이지 않게)
