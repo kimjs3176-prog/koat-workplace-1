@@ -3909,20 +3909,54 @@ def _sec_ai_event(b: dict):
     if not cmds:
         return jsonify({"success": True})
     try:
-        # 숫자가 서로 맞는 기록만 받는다 — 만든 적 없는 결과를 '확인'하거나(확인+고침+버림 > 만듦), 없는 판단을 되돌리지 못하게
+        # 숫자가 서로 맞는 기록만 받는다 — 만든 적 없는 결과를 '확인'하거나(확인+고침+버림 > 만듦), 없는 판단을 되돌리지 못하게.
+        # 검사와 기록을 한 번에(동시에 온 두 '확인'이 같은 숫자를 보고 둘 다 통과하지 않게): Redis 는 스크립트 하나, 파일은 같은 잠금 안에서.
         if "made" in allowed and st != "made":
-            h = {k: int(v) for k, v in ((_sec_kv([["HGETALL", key]])[0]) or {}).items() if str(v).lstrip("-").isdigit()}
-            cnt = lambda s_: h.get(f"{kind}:{s_}", 0)   # noqa: E731
-            if prev and cnt(prev) < 1:
+            if _sec_ins_backend() == "redis":
+                r = int((_sec_kv([["EVAL", _SEC_AI_CHECK_LUA, "1", key, kind, st, prev]]) or [0])[0] or 0)
+            else:
+                with _SEC_INS_LOCK:
+                    r = _sec_ai_check_file(key, kind, st, prev, cmds)
+            if r == -1:
                 return jsonify({"success": False, "error": "되돌릴 판단 기록이 없습니다."}), 409
-            decided = cnt("ok") + cnt("edited") + cnt("rejected") + (1 if st != "pending" else 0) - (1 if prev else 0)
-            if decided > cnt("made"):
+            if r == -2:
                 return jsonify({"success": False, "error": "만든 AI 결과보다 판단 기록이 많아집니다."}), 409
-        _sec_kv(cmds)
+            if r != 1:
+                raise RuntimeError(f"예상하지 못한 결과 {r}")
+        else:
+            _sec_kv(cmds)
     except Exception as e:
         print(f"[secretary] AI 산출물 기록 실패: {e}")
         return jsonify({"success": False, "error": "기록하지 못했습니다."}), 502
     return jsonify({"success": True})
+
+
+# 판단 기록의 숫자 검사 + 증가를 한 번에(Redis). 1 = 기록함, -1 = 되돌릴 판단 없음, -2 = 판단 > 만듦
+_SEC_AI_CHECK_LUA = """
+local kind, st, prev = ARGV[1], ARGV[2], ARGV[3]
+local function g(f) return tonumber(redis.call('HGET', KEYS[1], kind .. ':' .. f) or '0') or 0 end
+if prev ~= '' and g(prev) < 1 then return -1 end
+local decided = g('ok') + g('edited') + g('rejected')
+if st ~= 'pending' then decided = decided + 1 end
+if prev ~= '' then decided = decided - 1 end
+if decided > g('made') then return -2 end
+if st ~= 'pending' then redis.call('HINCRBY', KEYS[1], kind .. ':' .. st, 1) end
+if prev ~= '' then redis.call('HINCRBY', KEYS[1], kind .. ':' .. prev, -1) end
+return 1
+"""
+
+
+def _sec_ai_check_file(key: str, kind: str, st: str, prev: str, cmds: list) -> int:
+    """파일 저장소: 같은 잠금 안에서 숫자를 읽어 검사하고 기록한다(_SEC_INS_LOCK 을 잡은 채로 부른다)."""
+    h = {k: int(v) for k, v in ((_sec_kv([["HGETALL", key]])[0]) or {}).items() if str(v).lstrip("-").isdigit()}
+    cnt = lambda s_: h.get(f"{kind}:{s_}", 0)   # noqa: E731
+    if prev and cnt(prev) < 1:
+        return -1
+    decided = cnt("ok") + cnt("edited") + cnt("rejected") + (1 if st != "pending" else 0) - (1 if prev else 0)
+    if decided > cnt("made"):
+        return -2
+    _sec_kv(cmds)
+    return 1
 
 
 def _sec_ai_month_summary(h: dict) -> dict:

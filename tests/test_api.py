@@ -1,5 +1,6 @@
 """서무비서 API — 정상 응답, 잘못된 입력, 관리 저장 권한, AI 키 취급."""
 import json
+import time
 
 import pytest
 
@@ -361,3 +362,33 @@ def test_ai_audit_finding_id_follows_title_and_bad_src_drops_line(client, monkey
     r = client.post("/api/secretary/ai/draft", json={"draft": "출장결과보고서", "field": "주요 내용",
                                                      "sources": [{"kind": "메모", "text": "스마트팜 실증사업 협의"}]})
     assert r.status_code == 200 and [x["ok"] for x in r.get_json()["lines"]] == [False, False, True]
+
+
+def test_ai_report_check_is_atomic_under_concurrent_requests(monkeypatch, tmp_path):
+    # 1건 만든 결과에 '확인' 10건이 동시에 와도 1건만 받는다(검사와 기록을 같은 잠금 안에서)
+    import threading as th
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    monkeypatch.setattr(api_server, "_sec_ins_rate_ok", lambda *a, **k: True)
+    real = api_server._sec_kv
+
+    def slow(cmds):                       # 읽은 뒤 잠깐 쉬어 경합을 일부러 만든다
+        out = real(cmds)
+        if cmds and cmds[0][0] == "HGETALL":
+            time.sleep(0.02)
+        return out
+    monkeypatch.setattr(api_server, "_sec_kv", slow)
+    app = api_server.app
+    with app.test_client() as c:
+        assert c.post("/api/secretary/insights/event", json={"type": "ai", "kind": "draft", "st": "made"}).status_code == 200
+    codes = []
+
+    def go():
+        with app.test_client() as c:
+            codes.append(c.post("/api/secretary/insights/event", json={"type": "ai", "kind": "draft", "st": "ok"}).status_code)
+    ts = [th.Thread(target=go) for _ in range(10)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert sorted(codes) == [200] + [409] * 9
+    with app.test_client() as c:
+        assert c.get("/api/secretary/insights/ai").get_json()["months"][0]["draft"]["ok"] == 1
