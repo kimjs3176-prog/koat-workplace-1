@@ -3559,7 +3559,8 @@
      "k": "content",
      "l": "주요 내용",
      "ph": "협의 내용·결과를 줄마다 적어 주세요",
-     "multi": true
+     "multi": true,
+     "ai": true
     },
     {
      "k": "follow",
@@ -3640,7 +3641,8 @@
      "k": "content",
      "l": "주요 활동",
      "ph": "일자별 활동을 줄마다 적어 주세요",
-     "multi": true
+     "multi": true,
+     "ai": true
     },
     {
      "k": "use",

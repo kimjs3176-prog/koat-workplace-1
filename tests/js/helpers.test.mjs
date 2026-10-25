@@ -221,3 +221,22 @@ test("parseIcs: TZID 시각·DURATION·취소된 모임", () => {
   assert.equal(ev[3].cancelled, true); assert.equal(ev[0].cancelled, false);
   assert.equal(plain(T.parseIcs("METHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTART:20261101\r\nEND:VEVENT"))[0].cancelled, true);
 });
+
+test("aiReportText: 월간 AI 산출물 보고 문구(만듦·사용·버림·대기·낸 문서)", () => {
+  const r = T.aiMonth("2026-10");
+  Object.assign(r.receipt, { made: 10, ok: 6, edited: 2, rejected: 1, pending: 1 });
+  Object.assign(r.draft, { made: 2, ok: 0, edited: 2 });
+  r.output = { ai: 5, plain: 7 };
+  const t = T.aiReportText(r, "기관 전체");
+  assert.match(t, /2026년 10월/);
+  assert.match(t, /AI가 만든 결과 12건\(영수증 인식 10건, 문서 초안 2건\)/);
+  assert.match(t, /쓴 결과 10건\(그대로 6건 · 고쳐서 4건\), 사용률 83%/);
+  assert.match(t, /낸 문서\(복사·한글·ERP 넣기\) 12건 중 AI 결과가 들어간 문서 5건/);
+});
+
+test("draftSources: AI 초안 자료는 이 건에 사람이 적은 것만(메모·상황·기준일·증빙)", () => {
+  assert.deepEqual(plain(T.draftSources(null)), []);
+  const src = plain(T.draftSources({ procId: "x", note: "세종 방문 협의", query: "출장 정산", dates: {}, receipts: [{ date: "2026-10-05", kind: "운임", vendor: "코레일", route: "서울→오송" }] }));
+  assert.deepEqual(src.map((s) => s.kind), ["이 건 메모", "처음 적은 상황", "증빙"]);
+  assert.match(src[2].text, /코레일 서울→오송/);
+});

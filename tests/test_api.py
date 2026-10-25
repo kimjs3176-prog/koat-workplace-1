@@ -252,3 +252,47 @@ def test_manifest_reload_when_another_worker_writes(tmp_path, monkeypatch):
     api_server._SEC_RESOLVE_CACHE[("x", "")] = (None, "")
     assert api_server._load_reg_manifest() == man
     assert api_server._REG_MANIFEST_STAMP == stamp and not api_server._SEC_RESOLVE_CACHE
+
+
+def test_ai_draft_lines_must_cite_sources(client, monkeypatch):
+    # AI 문서 초안: 줄마다 근거 자료가 있어야 하고, 자료에 없는 숫자·겹치는 말이 없는 줄은 채우지 않는다
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    monkeypatch.setattr(api_server, "_sec_ai_rate_ok", lambda: True)
+    monkeypatch.setattr(api_server, "_sec_ai_json", lambda *a, **k: {"lines": [
+        {"text": "- 스마트팜 실증사업 추진 현황 협의함", "src": ["S1"]},
+        {"text": "참석자 12명과 예산 3억 원 확정", "src": ["S1"]},        # 자료에 없는 숫자
+        {"text": "향후 일정 논의", "src": []},                               # 근거 없음
+        {"text": "우주 정거장 견학", "src": ["S2"]},                          # 자료와 겹치는 말 없음
+    ], "missing": ["협의 결과(합의 사항)"]})
+    r = client.post("/api/secretary/ai/draft", json={"draft": "출장결과보고서", "field": "주요 내용",
+                                                     "fields": {"출장지": "세종"},
+                                                     "sources": [{"kind": "이 건 메모", "text": "세종 농식품부 방문, 스마트팜 실증사업 추진 현황 협의"},
+                                                                 {"kind": "일정", "text": "세종 출장 10월 5일"}]})
+    d = r.get_json()
+    assert d["success"] and [x["ok"] for x in d["lines"]] == [True, False, False, False]
+    assert d["lines"][0]["text"] == "스마트팜 실증사업 추진 현황 협의함"           # 줄머리 기호 정리
+    assert "숫자" in d["lines"][1]["why"] and d["sources"][0] == {"id": "S1", "kind": "이 건 메모"}
+    assert client.post("/api/secretary/ai/draft", json={"draft": "x", "field": "y", "sources": []}).status_code == 400
+
+
+def test_ai_output_monthly_report(client, monkeypatch, tmp_path):
+    # AI 결과를 사람이 처리한 숫자(만듦·확인·고침·버림, 낸 문서)를 월별로 모은다 — 판단을 바꾸면 앞 상태를 뺀다
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
+    assert ev(kind="receipt", st="made", n=3).status_code == 200
+    ev(kind="receipt", st="ok"); ev(kind="receipt", st="ok")
+    ev(kind="receipt", st="pending", prev="ok")                 # 확인 취소
+    ev(kind="receipt", st="rejected")
+    ev(kind="draft", st="made"); ev(kind="draft", st="edited")
+    ev(kind="output", st="ai"); ev(kind="output", st="plain")
+    assert ev(kind="receipt", st="bogus").status_code == 400 and ev(kind="x", st="made").status_code == 400
+    d = client.get("/api/secretary/insights/ai").get_json()
+    m = d["months"][0]
+    assert d["available"] and m["receipt"] == {"made": 3, "ok": 1, "edited": 0, "rejected": 1, "pending": 1}
+    assert m["draft"]["edited"] == 1 and m["draft"]["pending"] == 0 and m["output"] == {"plain": 1, "ai": 1}
+
+
+def test_draft_field_ai_flag_kept_in_data():
+    procs = api_server._sec_read_json(api_server.SEC_COMMON_PATH, {})
+    assert any(f.get("ai") for f in procs["drafts"]["trip-report"]["fields"])
