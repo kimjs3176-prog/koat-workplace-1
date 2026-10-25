@@ -1207,7 +1207,10 @@ function openDraft(key){
         if(prior&&prior.st!=='none') toast('근거를 확인한 줄이 없어 바꾸지 않았습니다.', 3600); panel(fk); return; }
       const cur=String(me.vals[fk]||'');
       if(cur.trim() && !confirm(`'${f.l}'에 적힌 내용을 AI 초안으로 바꿀까요?\n(✕ 버리기를 누르면 지금 내용으로 돌아옵니다)`)){ me.ai[fk]=prior; panel(fk); return; }
-      if(me.cid) updateCaseById(me.cid, cc=>{ const old=(cc.draftAi||{})[key]; if(old&&old.st!=='pending') aiLogPush(cc, 'draft', old.st, d.title, old.at); });
+      // 앞 AI 초안은 기록으로 옮긴다 — 확인 대기인 채 새 초안으로 바꿨으면 사람이 버린 것으로 센다(기관 숫자에 대기로 남지 않게)
+      if(me.cid) updateCaseById(me.cid, cc=>{ const old=(cc.draftAi||{})[key]; if(!old) return;
+        if(old.st==='pending'){ aiLogPush(cc, 'draft', 'rejected', d.title, old.at); aiEvent('draft','rejected', null, 1, old.at); }
+        else aiLogPush(cc, 'draft', old.st, d.title, old.at); });
       const text=good.map(l=>l.text).join('\n');
       me.vals[fk]=text; const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=text; out();
       me.ai[fk]={text, prev:cur, st:'pending', at:today(), lines:res.lines, missing:res.missing||[], sources:res.sources||[]};
@@ -1427,6 +1430,7 @@ function bind(panel){
           if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before, 1, au.at); } }); render(); break;
       case 'impact': openImpact(D.reg); break;
       case 'aiscope': S.aiRepScope=D.v; render(); break;
+      case 'airef': S.aiRep=null; render(); break;
       case 'aicopy': { const org=S.aiRepScope!=='local' && S.aiRep && S.aiRep.months;
         const r=(org?S.aiRep.months:aiLocalMonths()).find(x=>x.month===D.m); if(!r) break;
         const t=aiReportText(r, org?'기관 전체, 익명 통계':'이 브라우저 처리 이력 기준');
@@ -1864,7 +1868,8 @@ function aiEvent(kind, st, prev, n, at){
   if(!canShare()) return;
   const month=/^\d{4}-\d{2}/.test(at||'')?String(at).slice(0,7):'';
   fetch('/api/secretary/insights/event',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1, ...(month?{month}:{})})}).catch(()=>{});
+    body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1, ...(month?{month}:{})})})
+    .then(()=>{ S.aiRep=null; }).catch(()=>{});             // 관리 화면의 기관 숫자는 다음에 열 때 다시 불러온다
 }
 function aiLogPush(c, k, st, label, at){ (c.aiLog=c.aiLog||[]).push({k, st, at:at||today(), label:String(label||'').slice(0,80)}); c.aiLog=c.aiLog.slice(-100); }
 // 영수증 AI 값: confirm(사람 확인 — 고친 적이 있으면 '고쳐서') · undo(확인 취소)
@@ -1916,7 +1921,7 @@ function aiReportCard(){
   const scope=S.aiRepScope==='local'||!org?'local':'org';
   const rows=scope==='org'?(S.aiRep.months||[]):aiLocalMonths();
   const ks=['receipt','audit','draft']; const sum=(r,st)=>ks.reduce((a,k)=>a+((r[k]||{})[st]||0),0);
-  const tabs=`<div class="sec-row"><button class="sec-mini ${scope==='org'?'on':''}" data-a="aiscope" data-v="org" ${org?'':'disabled title="기관 집단 지식 저장소가 있으면 켜집니다"'}>기관 전체(익명 통계)</button><button class="sec-mini ${scope==='local'?'on':''}" data-a="aiscope" data-v="local">이 브라우저의 처리 이력</button>${S.insights.available&&S.aiRep&&S.aiRep.loading?'<span class="sec-sub">불러오는 중...</span>':''}</div>`;
+  const tabs=`<div class="sec-row"><button class="sec-mini ${scope==='org'?'on':''}" data-a="aiscope" data-v="org" ${org?'':'disabled title="기관 집단 지식 저장소가 있으면 켜집니다"'}>기관 전체(익명 통계)</button><button class="sec-mini ${scope==='local'?'on':''}" data-a="aiscope" data-v="local">이 브라우저의 처리 이력</button>${S.insights.available&&S.aiRep&&S.aiRep.loading?'<span class="sec-sub">불러오는 중...</span>':''}${org&&scope==='org'?'<button class="sec-mini" data-a="airef" title="기관 숫자 다시 불러오기">↻ 새로고침</button>':''}</div>`;
   if(!rows.length) return `<div class="sec-card">${head}${tabs}<div class="sec-hint">아직 기록이 없습니다. 영수증 AI 인식, AI 감사, 문서 초안의 ✦ AI 초안을 쓰고 담당자가 확인하면 쌓입니다.${scope==='org'?' 기관 전체 숫자는 담당자가 기관 통계 기여를 켜 둔 경우에만 모입니다.':''}</div></div>`;
   return `<div class="sec-card">${head}${tabs}<div class="sec-airep"><div class="sec-airep-r h"><span>월</span><span>AI 결과</span><span>그대로</span><span>고쳐서</span><span>버림</span><span>대기</span><span>낸 문서(AI)</span><span></span></div>`+
     rows.map(r=>{ const made=sum(r,'made');

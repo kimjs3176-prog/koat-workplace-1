@@ -3867,7 +3867,8 @@ def _sec_ins_rate_ok(store: dict | None = None, limit: int = 60) -> bool:
 # ── AI 산출물 기록 — AI 가 만든 결과(영수증 인식·감사 지적·보고서 초안)를 사람이 어떻게 처리했는지 월별 익명 숫자로 ──
 #   made(만듦) · ok(확인 후 그대로) · edited(고쳐서) · rejected(버림). 확인 대기 = made − ok − edited − rejected.
 #   output 은 문서 산출물(복사·한글·ERP 넣기)을 낸 횟수 — ai(AI 결과가 들어간 문서) · plain(AI 결과 없음).
-#   기관 사무실은 한 IP 로 나가는 일이 많아 사건 기록보다 넉넉히 받는다.
+#   기관 사무실은 한 IP 로 나가는 일이 많아 사건 기록보다 넉넉히(시간당 300) 받는다. 로그인 없는 익명 기록이므로
+#   숫자는 '담당자 화면이 보낸 자기 보고'이다 — 한 요청의 크기와 속도만 막고, 정확한 실적은 처리 이력(건별 기록)으로 확인한다.
 _SEC_AI_KINDS = {"receipt": ("made", "ok", "edited", "rejected"), "audit": ("made", "ok", "edited", "rejected"),
                  "draft": ("made", "ok", "edited", "rejected"), "output": ("plain", "ai")}
 _SEC_AIEV_HITS: dict = {}
@@ -3879,13 +3880,14 @@ def _sec_ai_month() -> str:
 
 def _sec_ai_event(b: dict):
     """{type:'ai', kind, st, prev?, n?} → 이번 달 숫자. prev 는 사람이 판단을 바꿨을 때(확인 → 되돌리기 등) 앞 상태를 하나 뺀다."""
-    if not _sec_ins_rate_ok(_SEC_AIEV_HITS, 600):
+    if not _sec_ins_rate_ok(_SEC_AIEV_HITS, 300):
         return jsonify({"success": False, "error": "요청이 너무 많습니다."}), 429
     kind, st, prev = str(b.get("kind") or ""), str(b.get("st") or ""), str(b.get("prev") or "")
     allowed = _SEC_AI_KINDS.get(kind)
     if not allowed or (st not in allowed and st != "pending") or (prev and (prev not in allowed or prev == "made")):
         return jsonify({"success": False, "error": "kind·st 가 올바르지 않습니다."}), 400
-    n = _sec_int(b.get("n"), 1, 1, 50)
+    # 한 번에 여러 건은 감사 한 번의 AI 지적 수(최대 12)까지만 — 익명 기록이라 한 요청으로 숫자를 크게 부풀리지 못하게
+    n = _sec_int(b.get("n"), 1, 1, 12) if kind == "audit" and st == "made" else 1
     # 판단(확인·고침·버림·되돌리기)은 그 결과를 만든 달에 센다 — 다음 달에 확인해도 만든 달의 '대기'가 줄도록.
     # 화면이 보낸 달은 이번 달부터 2년 안일 때만 받는다(엉뚱한 달 숫자를 만들지 않게)
     month, now = str(b.get("month") or ""), _sec_ai_month()

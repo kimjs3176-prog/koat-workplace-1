@@ -280,7 +280,9 @@ def test_ai_output_monthly_report(client, monkeypatch, tmp_path):
     monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
     monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
     ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
-    assert ev(kind="receipt", st="made", n=3).status_code == 200
+    assert ev(kind="receipt", st="made", n=3).status_code == 200     # 영수증은 한 요청에 한 건만(익명 숫자 부풀리기 방지)
+    ev(kind="receipt", st="made"); ev(kind="receipt", st="made")
+    ev(kind="audit", st="made", n=99)                              # 감사 지적은 한 번에 12건까지
     ev(kind="receipt", st="ok"); ev(kind="receipt", st="ok")
     ev(kind="receipt", st="pending", prev="ok")                 # 확인 취소
     ev(kind="receipt", st="rejected")
@@ -291,6 +293,7 @@ def test_ai_output_monthly_report(client, monkeypatch, tmp_path):
     m = d["months"][0]
     assert d["available"] and m["receipt"] == {"made": 3, "ok": 1, "edited": 0, "rejected": 1, "pending": 1}
     assert m["draft"]["edited"] == 1 and m["draft"]["pending"] == 0 and m["output"] == {"plain": 1, "ai": 1}
+    assert m["audit"]["made"] == 12
 
 
 def test_draft_field_ai_flag_kept_in_data():
