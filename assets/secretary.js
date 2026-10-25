@@ -1880,7 +1880,7 @@ function aiQaAll(){ const a=_ls(LS_AIQA, []); return Array.isArray(a)?a.filter(x
 function aiQaGet(id){ return id?aiQaAll().find(x=>x.id===id)||null:null; }
 function aiQaMade(k, label){
   const x={id:uid(), k, st:'pending', at:today(), label:String(label||'').slice(0,80)};
-  _lsPut(LS_AIQA, aiQaAll().concat([x]).slice(-300)); aiEvent(k, 'made'); return x.id;
+  _lsPut(LS_AIQA, aiQaAll().concat([x]).slice(-300)); aiEvent(k, 'made', null, 1, x.at); return x.id;
 }
 // 같은 판단을 다시 누르면 되돌린다(판단 안 함)
 function aiQaJudge(id, st){
