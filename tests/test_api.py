@@ -200,3 +200,55 @@ def test_ask_rejects_numbers_not_in_cited_article(client, monkeypatch):
     monkeypatch.setattr(api_server, "_sec_ai_json", fake)
     d = client.post("/api/secretary/ask", json={"q": q}).get_json()
     assert not d["found"] and "숫자" in d["note"]
+
+
+def test_erp_regex_rejects_nested_repeats():
+    # 반복을 겹친 정규식은 긴 화면 제목에서 ERP 탭을 멈춘다 — 저장 단계에서 버린다
+    ok = api_server._sec_rx_ok
+    assert not ok(r"^(\s*\S+)*\s*신청서$") and not ok(r"(a+)+") and not ok(r"(a{1,3})*")
+    assert ok(r"^/erp/(trip|travel)/apply") and ok(r"출장\s*(신청|정산)") and ok(r"(출장|여비)+정산")
+
+
+def test_audit_config_tolerates_hand_edited_numbers(monkeypatch):
+    base = api_server._sec_config()
+    monkeypatch.setattr(api_server, "_sec_config", lambda *a, **k: {**base, "audit": {
+        "lodging_caps": [{"name": "서울", "cap": "100,000"}, {"name": "기타", "cap": "7만"}, {"name": "x", "cap": "?"}],
+        "lodging_extra_ratio": "30%", "trip_procs": "domestic-trip", "draft_required": {"a": "b"}}})
+    c = api_server._sec_audit_cfg()
+    assert [x["cap"] for x in c["lodging_caps"]] == [100000, 70000]
+    assert c["lodging_extra_ratio"] == pytest.approx(0.3)
+    assert isinstance(c["trip_procs"], list) and c["draft_required"] == {}
+
+
+def test_reg_diff_finds_inserted_article_that_took_an_old_number():
+    words = ["출장", "휴가", "물품", "행사", "계약", "회계", "감사"]
+    old = "\n".join(f"제{i}조(조문{i}) {w}에 관한 사항은 {w} 담당 부서가 {w} 계획을 세워 처리하고 {w} 결과를 보고한다." for i, w in enumerate(words, 1))
+    new = old.replace("제7조(조문7)", "제8조(조문7)").replace("제6조(조문6)", "제7조(조문6)").replace("제5조(조문5)", "제6조(조문5)")
+    new = new.replace("제6조(조문5)", "제5조(신설 조문) 직원은 새로 정한 기한 안에 그 결과를 부서장에게 보고하여야 한다.\n제6조(조문5)")
+    d = api_server._sec_reg_diff(old, new)
+    assert d["moved"] == {"5": "6", "6": "7", "7": "8"}
+    assert [a["no"] for a in d["added"]] == ["5"]
+
+
+def test_regulation_files_get_script_blocking_csp(client):
+    slug = api_server._load_reg_manifest()[0]["slug"]
+    r = client.get(f"/regulations/{slug}/index.html")
+    assert r.status_code == 200 and "script-src 'none'" in r.headers["Content-Security-Policy"]
+    out = api_server._sanitize_html('<svg/onload=alert(1)><a href=javascript:alert(1)>x</a><p class="a"onclick="b">ok</p>')
+    assert "onload" not in out and "javascript" not in out and "onclick" not in out and 'class="a"' in out
+
+
+def test_check_rejects_too_many_reg_names(client):
+    procs = [{"id": f"p{i}", "title": "t", "steps": [{"t": "s", "basis": [{"reg": f"없는규정{i}-{k}"} for k in range(6)]}]} for i in range(80)]
+    r = client.post("/api/secretary/check", json={"procedures": procs})
+    assert r.status_code == 400
+
+
+def test_manifest_reload_when_another_worker_writes(tmp_path, monkeypatch):
+    # 다른 작업자가 manifest 를 고쳐 쓰면 다시 읽는다(옛 사본으로 덮어써 등록을 지우지 않게)
+    man = api_server._load_reg_manifest()
+    stamp = api_server._REG_MANIFEST_STAMP
+    monkeypatch.setattr(api_server, "_REG_MANIFEST_STAMP", (0, 0))
+    api_server._SEC_RESOLVE_CACHE[("x", "")] = (None, "")
+    assert api_server._load_reg_manifest() == man
+    assert api_server._REG_MANIFEST_STAMP == stamp and not api_server._SEC_RESOLVE_CACHE

@@ -161,22 +161,23 @@ function parseDates(q, base){
   const past=PAST_CUE.test(t);
   const guessYear=(m,d)=>{ let x=mk(by,m,d); if(!x) return x;
     if(past){ if(x>addDays(base,7)) x=mk(by-1,m,d); } else if(x<addDays(base,-200)) x=mk(by+1,m,d); return x; };
-  const add=(pos,len,d)=>{ if(d && !hits.some(h=>pos<h.pos+h.len && h.pos<pos+len)) hits.push({pos,len,d}); };
+  const add=(pos,len,d,ny)=>{ if(d && !hits.some(h=>pos<h.pos+h.len && h.pos<pos+len)) hits.push({pos,len,d,ny}); };
   let m;
   const R=(re,fn)=>{ re.lastIndex=0; while((m=re.exec(t))) fn(m); };
   R(/(\d{4})\s*[.\-\/년]\s*(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})\s*일?/g, m=>add(m.index,m[0].length,mk(+m[1],+m[2],+m[3])));
-  R(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2])));
-  // '11/3' · '11.3' · 공문식 '11. 3.(화)' — 끝의 마침표는 허용하고, '1.4.6'(판 번호)·'1.5배'·'30%' 는 빼고
-  R(/(?<![\d.])(\d{1,2})\s*[\/.]\s*(\d{1,2})(?!\d|\.\d|\s*(?:%|퍼센트|배))/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2])));
+  R(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2]),1));
+  // '11/3' · '11.3' · 공문식 '11. 3.(화)' — 끝의 마침표는 허용하고, '1.4.6'·'v1.4'(판 번호)·'1.5배'·'30%'·'7.5만원'·'2.5시간'·'1/2 감액'(분수) 은 빼고
+  R(/(?<![\d.A-Za-z])(\d{1,2})\s*[\/.]\s*(\d{1,2})(?!\d|\.\d|\s*(?:%|퍼센트|배|만|천|원|시간|분|km|킬로|개|명|건|대|감액|지급|이상|이하|초과|미만|정도|수준|만큼))/g, m=>add(m.index,m[0].length,guessYear(+m[1],+m[2]),1));
   const REL={'그저께':-2,'그제':-2,'어제':-1,'오늘':0,'내일':1,'모레':2,'내일모레':2,'글피':3};
   R(/그저께|그제|어제|오늘|내일\s*모레|내일|모레|글피/g, m=>add(m.index,m[0].length,addDays(base,REL[m[0].replace(/\s+/g,'')])));
   R(/(이번|다음|담|지난|저번)\s*주\s*([일월화수목금토])요일?/g, m=>{
     const [y,mo,d]=base.split('-').map(Number); const bw=new Date(y,mo-1,d).getDay(); const mon=addDays(base, -((bw+6)%7));
     const wk={이번:0,다음:7,담:7,지난:-7,저번:-7}[m[1]]; const off=(WD.indexOf(m[2])+6)%7; add(m.index,m[0].length,addDays(mon,wk+off)); });
-  R(/(\d{1,3})\s*일\s*(후|뒤|전)/g, m=>add(m.index,m[0].length,addDays(base,(m[2]==='전'?-1:1)*(+m[1]))));
+  // '3일 전에 다녀왔어요'는 날짜, '출장 3일 전까지 신청'은 기한(날짜 아님)
+  R(/(?<!(?:출장|출발|출국|행사|시작|휴가|사용|교육|회의|개최|종료|귀국)\s*)(\d{1,3})\s*일\s*(후|뒤|전)(?!\s*(?:까지|이내|에\s*(?:신청|제출|등록|보고|요청)))/g, m=>add(m.index,m[0].length,addDays(base,(m[2]==='전'?-1:1)*(+m[1]))));
   hits.sort((a,b)=>a.pos-b.pos);
   // "10월 5일부터 7일까지" — 앞 날짜의 달을 이어받는 일(日)만 있는 표현
-  if(hits.length){ R(/(?<![\d월\/.])(\d{1,2})\s*일\s*(까지|~|에|부터)?/g, m=>{
+  if(hits.length){ R(/(?<![\d월\/.])(?<!박\s*)(\d{1,2})\s*일\s*(까지|~|에|부터)?/g, m=>{
       if(!m[2] && !/[~\-–]\s*$/.test(t.slice(Math.max(0,m.index-3),m.index))) return;   // "14일 이내" 같은 기간은 제외
       const prev=[...hits].reverse().find(h=>h.pos<m.index); if(!prev) return;
       const [y,mo]=prev.d.split('-').map(Number); let d=mk(y,mo,+m[1]); if(d && d<prev.d) d=mk(mo===12?y+1:y, mo===12?1:mo+1, +m[1]);
@@ -187,9 +188,19 @@ function parseDates(q, base){
       const [y,mo]=prev.d.split('-').map(Number); let d=mk(y,mo,+m[1]); if(d && d<prev.d) d=mk(mo===12?y+1:y, mo===12?1:mo+1, +m[1]);
       add(at,m[1].length,d); });
     hits.sort((a,b)=>a.pos-b.pos); }
+  // '12월 28일부터 1월 3일까지' — 연도 없이 적은 뒤 날짜가 앞 날짜보다 이르면 해를 넘긴 것(지난 일이면 앞 날짜를 작년으로)
+  for(let i=1;i<hits.length;i++){ const a=hits[i-1], b=hits[i];
+    if(!(b.ny && b.d<a.d)) continue;
+    const [y,mo,d]=b.d.split('-').map(Number), nx=mk(y+1,mo,d);
+    if(!nx || nx>addDays(a.d,200)) continue;               // 반년 넘는 기간은 해 넘김이 아니다
+    if(past && a.ny && nx>addDays(base,7)){ const [ay,am,ad]=a.d.split('-').map(Number); a.d=mk(ay-1,am,ad)||a.d; } else b.d=nx; }
   const out=hits.map(h=>h.d);
-  const nb=t.match(/(\d{1,2})\s*박\s*(\d{1,2})?\s*일?/);       // 2박3일 → 마친 날 = 시작 + 2
-  if(nb && out.length===1) out.push(addDays(out[0], +nb[1]));
+  // 2박3일 — 날짜가 하나면 그 날이 떠난 날인지 돌아온 날인지 본다: '부터·출발'은 떠난 날, 지난 일·'귀국·복귀'는 돌아온 날
+  const nb=t.match(/(\d{1,2})\s*박\s*(\d{1,2})?\s*일?/);
+  if(nb && out.length===1){
+    const back=!/부터|출발|출국|떠나|떠난|가요|갑니다|갈\s*예정/.test(t) && (past || /귀국|복귀|도착|돌아/.test(t));
+    if(back) out.unshift(addDays(out[0], -nb[1])); else out.push(addDays(out[0], +nb[1]));
+  }
   return {dates:[...new Set(out)].slice(0,3), past, from:/부터/.test(t)};
 }
 function assignDates(p, q){
@@ -290,7 +301,6 @@ function reconcileAll(){
   for(const c of all){ const p=getProc(c.procId); if(p && reconcileCase(c, p)) n++; }
   if(n) saveCases(all);
 }
-// 같은 절차의 진행 건 중 이번 기준일과 어긋나지 않는 건(비어 있거나 같은 날짜)은 이어서 쓴다 — 같은 물음을 다시 해도 건이 늘지 않게
 // 남에게 받은 처리 이력 파일 — 알려진 칸만 형식을 맞춰 받는다(엉뚱한 값이 화면을 깨거나 코드가 끼어들지 않게)
 function normCase(c){
   if(!c||typeof c!=='object'||!c.id||!c.procId) return null;
@@ -311,9 +321,14 @@ function normCase(c){
     // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
     sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{})};
 }
+// 같은 절차의 진행 건 중 이번 기준일과 어긋나지 않는 건은 이어서 쓴다(같은 물음을 다시 해도 건이 늘지 않게) —
+// 빈 칸만 채우고, 이미 있는 날짜와 두 달 넘게 떨어지면 다른 건으로 본다
+// (6월에 시작일만 넣어 둔 건에 '어제 다녀왔어요'가 끝난 날로 붙어 넉 달짜리 출장이 되지 않게)
 function reusableCase(pid, ds){
+  const near=(a,b)=>Math.abs(new Date(a)-new Date(b))<=62*864e5;
   return cases().filter(x=>x.procId===pid && x.status!=='done').sort((a,b)=>(b.updated||0)-(a.updated||0))
-    .find(x=>Object.keys(ds).every(k=>!(x.dates||{})[k] || x.dates[k]===ds[k]))||null;
+    .find(x=>{ const cur=x.dates||{}, have=Object.values(cur).filter(Boolean);
+      return Object.keys(ds).every(k=>!cur[k] || cur[k]===ds[k]) && Object.values(ds).every(v=>have.every(c=>near(v,c))); })||null;
 }
 // 비동기 작업(감사·영수증 인식)은 시작할 때의 건 id 로 저장한다 — 그사이 다른 건을 열어도 섞이지 않게
 function updateCaseById(id, fn){
@@ -361,6 +376,8 @@ async function start(opts){
   syncDeadlines();
   if(opts.reg) openReg(opts.reg);
   if(opts.q){ ask(opts.q); return; }
+  // 확장의 기한 알림을 누르면 그 건으로 바로(이 브라우저에 있는 건일 때만)
+  if(opts.case){ const c=cases().find(x=>x.id===opts.case); if(c && getProc(c.procId)){ selectProc(c.procId, {caseId:c.id, scroll:false}); return; } }
   if(opts.view && ['list','history','forms','manage','cal','ext'].includes(opts.view)) S.view=opts.view;
   render();
 }
@@ -416,12 +433,15 @@ function render(){
   else if(S.view==='edit') body=editView();
   else if(S.view==='ext') body=extView();
   // 입력하다 화면이 다시 그려져도 그 칸(포커스·커서)과 스크롤 위치를 지킨다 — 같은 화면일 때만
-  const ae=document.activeElement, same=S._lastView===S.view;
+  // (같은 화면이라도 다른 절차·다른 건으로 바뀌었으면 되살리지 않는다 — 앞 건의 메모·날짜가 새 건에 저장되지 않게)
+  // (새 건은 첫 입력 때 만들어지므로 '건 없음 → 새 건'은 같은 건으로 본다)
+  const lv=S._lastView||{}, where={v:S.view, p:S.procId||'', c:S.caseId||''};
+  const ae=document.activeElement, same=lv.v===where.v && lv.p===where.p && (!lv.c || lv.c===where.c);
   const sig=el=>el&&el!==document.body&&w.contains(el)?el.tagName+(el.id?'#'+el.id:'')+[...el.attributes].filter(a=>/^data-|^name$/.test(a.name)).map(a=>`[${a.name}="${a.value}"]`).join(''):'';
   let ss=null, se=null; try{ ss=ae&&ae.selectionStart; se=ae&&ae.selectionEnd; }catch(e){}
   const keep=same?{sig:sig(ae), v:ae&&'value' in ae?ae.value:null, ss, se, y:window.scrollY}:null;
   w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
-  S._lastView=S.view;
+  S._lastView=where;
   if(keep){
     if(keep.sig){ const el=[...w.querySelectorAll(ae.tagName)].find(x=>sig(x)===keep.sig);
       // 입력 중이던 글도 되살린다(답을 기다리는 사이 다시 그려져 새로 치던 질문이 지워지지 않게)
@@ -1111,7 +1131,9 @@ function openDraft(key){
     else if(b.dataset.da==='fgian'){ formsGian(d, S._draft.vals); }
     else if(b.dataset.da==='fmine'){ formsFill(key, d, S._draft.vals); }
     else if(b.dataset.da==='fforget'){ myForms(key, null); document.getElementById('secFormsRow').innerHTML=formsRow(key); toast('이 초안의 내 서식을 지웠습니다.'); }
-    else if(b.dataset.da==='keep'){ updateCase(cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); }); toast('처리 이력에 초안 입력값을 저장했습니다.'); }
+    // 초안 창을 연 건에 저장한다(그사이 확장 패널이 다른 ERP 화면의 건으로 넘어가도 섞이지 않게)
+    else if(b.dataset.da==='keep'){ const ok=updateCaseById(c.id, cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); });
+      toast(ok?'처리 이력에 초안 입력값을 저장했습니다.':'저장하지 못했습니다 — 이 건이 지워졌거나 저장 공간이 부족합니다.'); }
   });
   out();
 }
@@ -1344,6 +1366,7 @@ function bind(panel){
     else if(a==='es' && (el.type==='checkbox'||el.tagName==='SELECT')){ editorField(el); if(el.dataset.k==='dlref') render(); }
     else if(a==='himport') readJsonFile(el, d=>{ if(!d||!Array.isArray(d.cases)){ toast('처리 이력 파일이 아닙니다.'); return; }
       const cur=cases(); const ids=new Set(cur.map(c=>c.id)); const add=d.cases.map(normCase).filter(c=>c&&!ids.has(c.id)); saveCases(add.concat(cur));
+      reconcileAll();                                  // 다른 판의 절차로 만든 체크를 지금 단계에 맞춰 다시 붙인다
       if(d.notes||d.rejects){ const per=personal(); per.notes=Object.assign({}, d.notes||{}, per.notes);
         per.rejects=per.rejects||{}; for(const k in (d.rejects||{})){ const ids=new Set((per.rejects[k]||[]).map(x=>x.id)); per.rejects[k]=(per.rejects[k]||[]).concat((d.rejects[k]||[]).filter(x=>x&&x.id&&!ids.has(x.id))); }
         savePersonal(per); }
@@ -1435,22 +1458,39 @@ function parseSchedText(text, base){
   return {title, date:ds[0]||'', end:ranged?ds[ds.length-1]:'', time, memo:memo.slice(0,500)};
 }
 // .ics(일정 초대장) — VEVENT 의 제목·시작·끝·장소. 여러 개면 모두
+// 초대장의 TZID(예: America/New_York, Outlook 의 'Eastern Standard Time') 시각 → 이 PC 시각. 모르는 이름이면 적힌 시각 그대로
+const _WIN_TZ={'korea standard time':'Asia/Seoul','tokyo standard time':'Asia/Tokyo','china standard time':'Asia/Shanghai','singapore standard time':'Asia/Singapore',
+  'utc':'UTC','gmt standard time':'Europe/London','w. europe standard time':'Europe/Berlin','romance standard time':'Europe/Paris','central europe standard time':'Europe/Budapest',
+  'eastern standard time':'America/New_York','central standard time':'America/Chicago','mountain standard time':'America/Denver','pacific standard time':'America/Los_Angeles',
+  'aus eastern standard time':'Australia/Sydney','se asia standard time':'Asia/Bangkok','india standard time':'Asia/Kolkata'};
+function _zoned(y,mo,d,h,mi,tz){
+  tz=String(tz||'').replace(/^"|"$/g,'').trim(); if(!tz) return null; tz=_WIN_TZ[tz.toLowerCase()]||tz;
+  let f; try{ f=new Intl.DateTimeFormat('en-US',{timeZone:tz, hourCycle:'h23', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}); }catch(e){ return null; }
+  const off=t=>{ const p=Object.fromEntries(f.formatToParts(new Date(t)).map(x=>[x.type,x.value])); return Date.UTC(+p.year,p.month-1,+p.day,+p.hour%24,+p.minute)-t; };
+  const wall=Date.UTC(y,mo-1,d,h,mi); let t=wall-off(wall); t=wall-off(t);      // 서머타임 경계도 한 번 더 맞춘다
+  return new Date(t);
+}
 function parseIcs(text){
   const un=String(text||'').replace(/\r?\n[ \t]/g,'');                      // 접힌 줄 펴기
-  const out=[];
+  const out=[]; const cancelAll=/^METHOD:CANCEL\s*$/im.test(un);          // 주최자가 보낸 '모임 취소' 메일
   for(const raw of un.split(/BEGIN:VEVENT/).slice(1)){
     const blk=raw.replace(/BEGIN:VALARM[^]*?END:VALARM/g,'');           // 알림 블록의 DESCRIPTION:Reminder 가 메모로 들어가지 않게
     if(/^RECURRENCE-ID/m.test(blk)) continue;                            // 반복 일정의 예외 회차(같은 UID) — 첫 회만 넣는다
     const get=k=>{ const m=blk.match(new RegExp('^'+k+'(?:;[^:\\r\\n]*)?:(.*)$','m')); return m?m[1].replace(/\\n/gi,'\n').replace(/\\([,;\\])/g,'$1').trim():''; };
-    // 끝에 Z 가 붙은 시각(구글·Exchange 초대장 대부분)은 UTC — 이 PC 시각(한국)으로 바꾼다
-    const dt=v=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(?:\d{2})?(Z)?)?/); if(!m) return null;
-      if(m[6]){ const u=new Date(Date.UTC(+m[1],m[2]-1,+m[3],+m[4],+m[5])); return {d:ymd(u), t:String(u.getHours()).padStart(2,'0')+':'+String(u.getMinutes()).padStart(2,'0')}; }
+    const tzOf=k=>{ const m=blk.match(new RegExp('^'+k+';(?:[^:\\r\\n]*;)?TZID=("[^"]*"|[^;:\\r\\n]*)','m')); return m?m[1]:''; };
+    const hm=u=>({d:ymd(u), t:String(u.getHours()).padStart(2,'0')+':'+String(u.getMinutes()).padStart(2,'0')});
+    // 끝에 Z 가 붙은 시각(구글·Exchange 초대장 대부분)은 UTC, TZID 가 붙은 시각은 그 지역 시각 — 이 PC 시각(한국)으로 바꾼다
+    const dt=(v,tz)=>{ const m=String(v).match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(?:\d{2})?(Z)?)?/); if(!m) return null;
+      if(m[6]) return hm(new Date(Date.UTC(+m[1],m[2]-1,+m[3],+m[4],+m[5])));
+      const z=m[4]&&_zoned(+m[1],+m[2],+m[3],+m[4],+m[5],tz); if(z) return hm(z);
       return {d:`${m[1]}-${m[2]}-${m[3]}`, t:m[4]?`${m[4]}:${m[5]}`:''}; };
-    const s0=dt(get('DTSTART')); if(!s0) continue; const e0=dt(get('DTEND'));
+    const s0=dt(get('DTSTART'), tzOf('DTSTART')); if(!s0) continue; let e0=dt(get('DTEND'), tzOf('DTEND'));
+    if(!e0){ const du=get('DURATION').match(/^P(?:(\d+)W)?(?:(\d+)D)?/);       // DTEND 대신 기간(P2D·P1W)만 적은 초대장
+      const n=du?(+du[1]||0)*7+(+du[2]||0):0; if(n) e0={d:addDays(s0.d,n), t:s0.t}; }
     let end=''; if(e0){ end=e0.t?e0.d:addDays(e0.d,-1); if(end<=s0.d) end=''; }   // 종일 일정의 DTEND 는 다음 날
     const loc=get('LOCATION');
     out.push({title:(get('SUMMARY')||'일정').slice(0,80), date:s0.d, end, time:s0.t, memo:[loc?'장소: '+loc:'', get('DESCRIPTION').slice(0,300)].filter(Boolean).join('\n'),
-      uid:get('UID').slice(0,200), repeat:!!get('RRULE')});
+      uid:get('UID').slice(0,200), repeat:!!get('RRULE'), cancelled:cancelAll || /^CANCELLED$/i.test(get('STATUS'))});
   }
   return out;
 }
@@ -1492,27 +1532,46 @@ async function schedFromDrop(dt, day){
   const files=[...(dt&&dt.files||[])];
   for(const f of files){
     const name=(f.name||'').toLowerCase(); if(f.size>2e6) continue;
-    if(name.endsWith('.ics')||f.type==='text/calendar'){ const got=parseIcs(await f.text());
-      // 이미 넣은 초대장(같은 UID)은 다시 넣지 않는다 · 반복 일정은 첫 회만 들어간다고 알린다
-      const have=new Map(scheds().filter(x=>x.uid).map(x=>[x.uid,x]));
-      const seenU=new Set(); const evs=got.filter(e=>{ if(!e.uid) return true; if(have.has(e.uid)||seenU.has(e.uid)) return false; seenU.add(e.uid); return true; });
-      const dup=got.length-evs.length;
-      const rep=got.some(e=>e.repeat)?' 반복 일정은 첫 회만 넣었습니다.':'';
-      if(!evs.length && got.length===1){ const old=have.get(got[0].uid); toast('이미 추가한 초대장입니다 — 저장된 일정을 엽니다.', 3200); openSched(old.id); return; }
-      if(!evs.length && dup){ toast(`초대장의 일정 ${dup}건은 이미 추가돼 있습니다.`, 3200); return; }
-      if(evs.length>1){ if(!confirm(`초대장에 새 일정 ${evs.length}건이 있습니다${dup?`(이미 넣은 ${dup}건 제외)`:''}. 모두 내 일정에 추가할까요?`)) return;
-        const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.${rep}`, rep?5200:2600); render(); return; }
-      if(evs.length===1){ openSched(null, day, evs[0]); if(rep) toast(rep.trim(), 4200); return; } }
+    if(name.endsWith('.ics')||f.type==='text/calendar'){ if(icsDrop(parseIcs(await f.text()), day)) return; }
     if(name.endsWith('.eml')||f.type==='message/rfc822'){ const u8=new Uint8Array(await f.arrayBuffer()); let b='';
       for(let i=0;i<u8.length;i+=8192) b+=String.fromCharCode.apply(null, u8.subarray(i,i+8192));
+      // Outlook 모임 요청 메일은 초대장(text/calendar)이 들어 있다 — 본문 글보다 정확하므로 먼저 쓴다
+      const cal=_mimeLeaves(b).find(p=>p.type==='text/calendar');
+      if(cal){ let t=cal.body; try{ if(cal.cte==='base64') t=_bytesToText(_bin(atob(t.replace(/[^A-Za-z0-9+/=]/g,''))), cal.cs);
+          else if(cal.cte==='quoted-printable') t=_bytesToText(_bin(t.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(x,h)=>String.fromCharCode(parseInt(h,16)))), cal.cs);
+          else t=_bytesToText(_bin(t), cal.cs||'utf-8'); }catch(e){}
+        if(icsDrop(parseIcs(t), day)) return; }
       openSched(null, day, parseSchedText(emlToText(b))); return; }
     if(name.endsWith('.txt')||/^text\//.test(f.type)){ openSched(null, day, parseSchedText(await f.text())); return; }
   }
   if(files.length){ toast('읽을 수 있는 파일은 .ics(초대장)·.eml(메일)·.txt 입니다. 메일 본문 글을 끌어다 놓아도 됩니다.', 4200); return; }
   const txt=(dt.getData('text/plain')||'').trim() || htmlToText(dt.getData('text/html')||'').trim();
   if(!txt){ toast('끌어다 놓은 내용에서 글을 찾지 못했습니다.'); return; }
-  if(/BEGIN:VEVENT/.test(txt)){ const evs=parseIcs(txt); if(evs.length){ openSched(null, day, evs[0]); return; } }
+  if(/BEGIN:VEVENT/.test(txt) && icsDrop(parseIcs(txt), day)) return;
   openSched(null, day, parseSchedText(txt));
+}
+// 초대장 일정 → 내 일정. 처리했으면 true(못 읽었으면 false 로 글 읽기에 넘긴다)
+function icsDrop(got, day){
+  if(!got.length) return false;
+  // 취소된 모임: 이미 넣은 일정이면 지울지 묻고, 처음 보는 것이면 넣지 않는다
+  const gone=got.filter(e=>e.cancelled); got=got.filter(e=>!e.cancelled);
+  if(gone.length){ const all=scheds(); const hit=all.filter(x=>x.uid && gone.some(e=>e.uid===x.uid));
+    if(hit.length && confirm(`취소된 모임입니다: ${hit.map(x=>`'${x.title}'`).join(', ')}\n내 일정에서 삭제할까요?`)){
+      saveScheds(all.filter(x=>!hit.includes(x))); hit.forEach(x=>{ if(x.caseId) closeLinkedCase(x.caseId, '연결된 일정이 취소'); });
+      toast(`취소된 일정 ${hit.length}건을 삭제했습니다.`); render(); }
+    else if(!hit.length && !got.length) toast('취소된 모임의 초대장입니다 — 내 일정에 넣지 않았습니다.', 3200);
+    if(!got.length) return true; }
+  // 이미 넣은 초대장(같은 UID)은 다시 넣지 않는다 · 반복 일정은 첫 회만 들어간다고 알린다
+  const have=new Map(scheds().filter(x=>x.uid).map(x=>[x.uid,x]));
+  const seenU=new Set(); const evs=got.filter(e=>{ if(!e.uid) return true; if(have.has(e.uid)||seenU.has(e.uid)) return false; seenU.add(e.uid); return true; });
+  const dup=got.length-evs.length;
+  const rep=got.some(e=>e.repeat)?' 반복 일정은 첫 회만 넣었습니다.':'';
+  if(!evs.length && got.length===1){ const old=have.get(got[0].uid); toast('이미 추가한 초대장입니다 — 저장된 일정을 엽니다.', 3200); openSched(old.id); return true; }
+  if(!evs.length && dup){ toast(`초대장의 일정 ${dup}건은 이미 추가돼 있습니다.`, 3200); return true; }
+  if(evs.length>1){ if(!confirm(`초대장에 새 일정 ${evs.length}건이 있습니다${dup?`(이미 넣은 ${dup}건 제외)`:''}. 모두 내 일정에 추가할까요?`)) return true;
+    const all=scheds(); evs.forEach(e=>{ const n=normSched(Object.assign({id:uid()},e)); n&&all.push(n); }); saveScheds(all); toast(`일정 ${evs.length}건을 추가했습니다.${rep}`, rep?5200:2600); render(); return true; }
+  if(evs.length===1){ openSched(null, day, evs[0]); if(rep) toast(rep.trim(), 4200); return true; }
+  return false;
 }
 // ── 일정 → 업무 연결: 출장·교육·행사 같은 일정이면 그 절차의 처리 건을 만들어 기한(사전 신청·사후 정산)을 달력·알림에 올린다
 function linkableProcs(){ return allProcs().filter(p=>!p.hidden && (p.dates||[]).length && (p.steps||[]).some(s=>s.deadline)); }
@@ -2258,7 +2317,11 @@ function downloadHwpx(title, text){
   // 일반 폼 전송(숨은 iframe)으로 받는다 — 서버가 붙인 파일명이 그대로 쓰이고, 비동기 뒤 클릭 제약도 없다
   if(!String(text||'').trim()){ toast('초안 내용이 비어 있습니다.'); return; }
   let fr=document.getElementById('secDlFrame');
-  if(!fr){ fr=document.createElement('iframe'); fr.id=fr.name='secDlFrame'; fr.hidden=true; fr.title='파일 받기'; document.body.appendChild(fr); }
+  if(!fr){ fr=document.createElement('iframe'); fr.id=fr.name='secDlFrame'; fr.hidden=true; fr.title='파일 받기'; document.body.appendChild(fr);
+    // 파일을 받으면 iframe 은 새 문서를 그리지 않는다 — 문서가 그려졌으면 서버가 오류(JSON·HTML)를 돌려준 것
+    fr.addEventListener('load', ()=>{ let msg=''; try{ const t=(fr.contentDocument&&fr.contentDocument.body&&fr.contentDocument.body.textContent||'').trim();
+        if(!t) return; try{ msg=(JSON.parse(t)||{}).error||''; }catch(e){ msg=t.slice(0,120); } }catch(e){ msg='서버 응답을 읽지 못했습니다.'; }
+      toast('한글 파일을 만들지 못했습니다'+(msg?' — '+msg:'')+'. 복사해서 붙여 넣어 쓰세요.', 5200); }); }
   const f=document.createElement('form'); f.method='POST'; f.action='/api/secretary/draft/hwpx'; f.target='secDlFrame'; f.hidden=true;
   [['title',title||'초안'],['text',text]].forEach(([k,v])=>{ const i=document.createElement('textarea'); i.name=k; i.value=v; f.appendChild(i); });
   document.body.appendChild(f); f.submit(); f.remove();

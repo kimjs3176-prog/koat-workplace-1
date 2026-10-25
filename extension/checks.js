@@ -18,8 +18,13 @@
     const d = new Date(+m[1], +m[2] - 1, +m[3]);
     return d.getMonth() === +m[2] - 1 ? ymd(d) : "";
   }
+  // '오후 06:00'·'PM 6:30' 은 12시간을 더하고, '3시간'(걸린 시간)은 시각이 아니다
   function parseTimes(v) {
-    return [...String(v || "").matchAll(/(?<!\d)([01]?\d|2[0-3])\s*[:시]\s*([0-5]\d)?/g)].map((m) => +m[1] * 60 + (+m[2] || 0));
+    return [...String(v || "").matchAll(/(?:(오전|오후|AM|PM)\s*)?(?<!\d)([01]?\d|2[0-4])\s*(?::|시(?!간))\s*([0-5]\d)?/gi)].map((m) => {
+      let h = +m[2]; const ap = (m[1] || "").toUpperCase();
+      if ((ap === "오후" || ap === "PM") && h < 12) h += 12; else if ((ap === "오전" || ap === "AM") && h === 12) h = 0;
+      return h * 60 + (+m[3] || 0);
+    }).filter((t) => t <= 1440);
   }
   // 문서 작성일·결재일처럼 업무 날짜가 아닌 칸은 뺀다
   const NOT_WORK = /작성|기안|신청일|등록일|결재|접수|처리일|수정일|생년|입사|오늘|조회/;
@@ -36,11 +41,14 @@
     labels = labels || {};
     const NOT_WORK2 = plus(NOT_WORK, labels.ignore), END2 = plus(END, labels.end), START2 = plus(START, labels.start);
     const isEnd = (l) => hasWord(l, labels.end) || (!hasWord(l, labels.start) && END2.test(l));
+    // '출발일 ~ 도착일'·'시작일~종료일' 처럼 한 이름이 앞뒤를 다 가리키면 화면 순서대로 앞 = 시작, 뒤 = 끝
+    const both = (l) => !hasWord(l, labels.end) && !hasWord(l, labels.start) && START2.test(l) && END2.test(l);
     const out = {}, lb = {};
     const ds = fields.map((f) => ({ ...f, d: parseDate(f.value) })).filter((f) => f.d && !NOT_WORK2.test(f.label || ""));
     for (const f of ds) {
       const l = f.label || "";
-      if (isEnd(l) && !out.end) { out.end = f.d; lb.end = l; }
+      if (both(l)) { if (!out.start) { out.start = f.d; lb.start = l; } else if (!out.end) { out.end = f.d; lb.end = l; } }
+      else if (isEnd(l) && !out.end) { out.end = f.d; lb.end = l; }
       else if (START2.test(l) && !out.start) {
         out.start = f.d; lb.start = l;
         const mate = ds.find((g) => g !== f && g.row === f.row && g.d >= f.d && !isEnd(g.label || "") && (g.label === f.label || !START2.test(g.label || "")));
@@ -85,7 +93,7 @@
         return screen.attach > 0 ? { ok: true, note: `첨부 ${screen.attach}건` } : { ok: false, note: "화면에 첨부가 없습니다" };
       if (c.kind === "hours" && times) { const h = (times.to - times.from) / 60;
         return h > 0 && h <= (+c.max || 0) ? { ok: true, note: `${h}시간` } : h > 0 ? { ok: false, note: `${h}시간 — 하루 ${c.max}시간 넘음` } : null; }
-      if (c.kind === "span" && times) { const toM = (s) => { const [h, mm] = s.split(":").map(Number); return h * 60 + mm; };
+      if (c.kind === "span" && times && times.to > times.from) { const toM = (s) => { const [h, mm] = s.split(":").map(Number); return h * 60 + mm; };
         return times.from <= toM(c.from) && times.to >= toM(c.to) ? { ok: true, note: `${c.from}~${c.to} 포함` } : { ok: false, note: `근무 시각이 ${c.from}~${c.to}를 덮지 않습니다` }; }
       return null;                                            // 화면에서 값을 못 읽음 — 사람이 확인
     });

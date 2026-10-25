@@ -128,13 +128,37 @@ def index():
 #   예) https://xxxx.supabase.co/storage/v1/object/public/regulations/pdf
 REG_PDF_BASE_URL = os.environ.get("REG_PDF_BASE_URL", "").strip().rstrip("/")
 _REG_MANIFEST: list | None = None
+_REG_MANIFEST_STAMP = None          # 읽은 파일의 (수정 시각, 크기) — 다른 작업자(gunicorn -w 2)가 고쳐 쓰면 다시 읽는다
+
+
+def _reg_manifest_stamp():
+    try:
+        st = os.stat(os.path.join(os.path.dirname(os.path.abspath(__file__)), "regulations_manifest.json"))
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _reg_index_changed() -> None:
+    """내규 등록이 바뀌었다 — 조문 색인·서식 목록·낱말 빈도·규정명 연결 기억을 비운다(다음 요청에서 다시 만든다)."""
+    global _REG_FORMS_CACHE, _SEC_CHUNKS, _SEC_ART_INDEX
+    _REG_FORMS_CACHE = None
+    _SEC_CHUNKS = None
+    _SEC_ART_INDEX = None
+    _SEC_DF_CACHE.clear()
+    _SEC_RESOLVE_CACHE.clear()
 
 
 def _load_reg_manifest() -> list:
-    """규정명 → 원본 PDF 매핑(regulations_manifest.json). 없으면 빈 목록."""
-    global _REG_MANIFEST
-    if _REG_MANIFEST is not None:
+    """규정명 → 원본 PDF 매핑(regulations_manifest.json). 없으면 빈 목록.
+
+    파일이 바뀌었으면(다른 작업자 프로세스의 업로드·되돌리기) 다시 읽고 색인을 비운다 —
+    옛 사본을 고쳐 써서 다른 작업자가 등록한 규정을 지우거나, 새 규정을 재시작 전까지 못 찾는 일이 없게."""
+    global _REG_MANIFEST, _REG_MANIFEST_STAMP
+    stamp = _reg_manifest_stamp()
+    if _REG_MANIFEST is not None and stamp == _REG_MANIFEST_STAMP:
         return _REG_MANIFEST
+    first = _REG_MANIFEST is None
     try:
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "regulations_manifest.json")
@@ -142,8 +166,20 @@ def _load_reg_manifest() -> list:
             _REG_MANIFEST = json.load(f)
     except Exception as e:
         print(f"[reg-manifest] 로드 실패: {e}")
-        _REG_MANIFEST = []
+        if _REG_MANIFEST is None:
+            _REG_MANIFEST = []
+    _REG_MANIFEST_STAMP = stamp
+    if not first:
+        _reg_index_changed()
     return _REG_MANIFEST
+
+
+def _set_reg_manifest(man: list) -> None:
+    """이 프로세스가 방금 저장한 manifest 를 기억하고 색인을 비운다."""
+    global _REG_MANIFEST, _REG_MANIFEST_STAMP
+    _REG_MANIFEST = man
+    _REG_MANIFEST_STAMP = _reg_manifest_stamp()
+    _reg_index_changed()
 
 # ── 서식(별표·별지) 라이브러리 — 번들 규정 HTML에서 서식 '정의'만 집계(캐시) ──────
 _REG_FORMS_CACHE = None
@@ -531,12 +567,16 @@ _SCRIPT_RE = re.compile(
     re.I | re.S)
 _SCRIPT_OPEN_RE = re.compile(
     r"<\s*/?\s*(script|iframe|object|embed|applet|link|meta|base)\b[^>]*>", re.I)
-_ON_ATTR_RE = re.compile(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
+_ON_ATTR_RE = re.compile(r"(?<=[\s/\"'])on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)   # <svg/onload=…> 처럼 / 뒤에 붙은 것도
 # srcdoc/formaction 은 스크립트 실행 경로가 되므로 속성째 제거
 _DANGER_ATTR_RE = re.compile(
     r"\s(srcdoc|formaction)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
 _JS_URL_RE = re.compile(
     r"(href|src)\s*=\s*(\"|')\s*(?:javascript|data|vbscript):[^\"']*(\2)", re.I)
+_JS_URL_BARE_RE = re.compile(r"(href|src|action)\s*=\s*(?:javascript|data|vbscript):[^\s>]*", re.I)   # 따옴표 없는 값
+# 같은 출처 정적 파일이므로 브라우저도 막는다(vercel.json 의 /regulations 정책과 같게 — 내부망·Docker 설치 대비)
+_REG_FILE_CSP = ("default-src 'self'; script-src 'none'; object-src 'none'; frame-src 'none'; "
+                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'")
 
 
 def _sanitize_html(html: str) -> str:
@@ -551,6 +591,7 @@ def _sanitize_html(html: str) -> str:
     out = _ON_ATTR_RE.sub("", out)
     out = _DANGER_ATTR_RE.sub("", out)
     out = _JS_URL_RE.sub(r"\1=\2#\2", out)
+    out = _JS_URL_BARE_RE.sub(r'\1="#"', out)
     return out
 
 
@@ -826,17 +867,60 @@ def _write_reg_files(slug: str, view_html: str, text: str,
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
         f.write(view_html)
+    ext = os.path.splitext(orig_filename)[1].lower()
+    stored = ("original.pdf" if ext == ".pdf" else f"original{ext}")
+    # 개정본이 다른 형식(예: 글 → PDF)이면 옛 본문·원본이 남아 옛 내용이 검색되지 않게 지운다(GitHub 저장 경로와 같게)
+    for fn in os.listdir(d):
+        if (fn == "text.txt" and not text) or (fn.startswith("original.") and fn != stored):
+            try:
+                os.remove(os.path.join(d, fn))
+            except OSError:
+                pass
     if text:
         with open(os.path.join(d, "text.txt"), "w", encoding="utf-8") as f:
             f.write(text)
-    ext = os.path.splitext(orig_filename)[1].lower()
-    stored = ("original.pdf" if ext == ".pdf" else f"original{ext}")
     with open(os.path.join(d, stored), "wb") as f:
         f.write(raw)
     return stored
 
 
-_MANIFEST_LOCK = threading.RLock()   # manifest 읽고-고치고-쓰기를 한 번에 하나씩(동시 업로드에 등록이 사라지지 않게)
+class _FileLock:
+    """읽고-고치고-쓰기를 한 번에 하나씩(동시 업로드·저장에 앞사람 내용이 사라지지 않게).
+
+    한 프로세스 안은 RLock, 작업자 프로세스 사이(gunicorn -w 2)는 잠금 파일(fcntl, 리눅스·맥)로 막는다.
+    같은 스레드가 겹쳐 잡아도 되도록 깊이를 센다(같은 프로세스에서 flock 을 두 번 잡으면 스스로 막힌다)."""
+    def __init__(self, path_fn):
+        self._path = path_fn                # 잠금 파일 경로(경로 상수가 아래에 정의되므로 함수로 받는다)
+        self._rl = threading.RLock()
+        self._depth = 0
+        self._fh = None
+
+    def __enter__(self):
+        self._rl.acquire()
+        self._depth += 1
+        if self._depth == 1:
+            try:
+                import fcntl
+                self._fh = open(self._path(), "a")
+                fcntl.flock(self._fh, fcntl.LOCK_EX)
+            except Exception:              # 윈도(fcntl 없음)·읽기 전용 배포 — 프로세스 안 잠금만
+                if self._fh:
+                    self._fh.close()
+                self._fh = None
+        return self
+
+    def __exit__(self, *exc):
+        self._depth -= 1
+        if self._depth == 0 and self._fh:
+            try:
+                self._fh.close()            # 닫으면 flock 도 풀린다
+            finally:
+                self._fh = None
+        self._rl.release()
+        return False
+
+
+_MANIFEST_LOCK = _FileLock(lambda: REG_MANIFEST_PATH + ".lock")
 
 
 def _upsert_manifest(entry: dict, backup_name: str = "") -> dict:
@@ -867,8 +951,7 @@ def _upsert_manifest_locked(entry: dict, backup_name: str = "") -> dict:
         man.append(entry)
     # 정렬하지 않는다 — 기존 항목 순서를 유지해 커밋 diff 를 최소화한다
     _save_reg_manifest(man)
-    global _REG_MANIFEST
-    _REG_MANIFEST = man
+    _set_reg_manifest(man)
     return entry
 
 
@@ -1171,7 +1254,10 @@ def serve_regulation_file(subpath):
     if any(part.startswith(".") for part in subpath.replace("\\", "/").split("/")):
         return Response("<h1>404</h1>", status=404, mimetype="text/html; charset=utf-8")
     try:
-        return send_from_directory(REG_DIR, subpath)
+        resp = send_from_directory(REG_DIR, subpath)
+        resp.headers["Content-Security-Policy"] = _REG_FILE_CSP
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
     except Exception:
         return Response("<h1>404 — 규정 파일을 찾을 수 없습니다</h1>",
                         status=404, mimetype="text/html; charset=utf-8")
@@ -1553,8 +1639,7 @@ def _reg_upload_delete():
             shutil.rmtree(d, ignore_errors=True)
 
     _save_reg_manifest(man)
-    global _REG_MANIFEST
-    _REG_MANIFEST = man
+    _set_reg_manifest(man)
 
     return jsonify({"success": True, "removed": cur.get("title", ""),
                     "restored": bool(restored_rev),
@@ -1795,7 +1880,7 @@ def _sec_config(force: bool = False) -> dict:
 
 
 def _sec_clean_str(v, n: int = 400) -> str:
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v or "")).strip()[:n]
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]", "", str(v or "")).strip()[:n]   # 짝 없는 대리 문자는 저장·인코딩을 깨뜨린다
 
 
 def _sec_ref_list(arr, n=6):
@@ -1940,16 +2025,32 @@ def _sec_art(title: str, no: str):
 _SEC_REG_SUFFIX = re.compile(r"(규정|규칙|지침|요령|세칙|기준|매뉴얼|훈령|예규)$")
 
 
+_SEC_RESOLVE_CACHE: dict = {}            # (규정명, 매핑·기관명) → (항목, 방식) — 내규 등록이 바뀌면 비운다
+
+
 def _sec_resolve_reg(name: str):
     """절차의 규정명 → 우리 기관 manifest 항목. (항목, 방식) — 방식: alias|exact|prefix|approx.
 
     다른 기관에 그대로 옮겨도 절차가 깨지지 않도록 단계적으로 찾는다.
     approx(포함 관계·어간) 는 틀릴 수 있으므로 호환성 점검에서 '확인 필요'로 표시한다.
+    한 번 찾은 결과는 기억한다(규정명마다 manifest 를 여러 번 훑어 큰 요청 하나가 서버를 오래 붙잡지 않게).
     """
     name = (name or "").strip()
     if not name:
         return None, ""
+    _load_reg_manifest()                               # 다른 작업자가 바꿨으면 여기서 기억을 비운다
     cfg = _sec_config()
+    org = cfg.get("org") or {}
+    key = (name[:200], json.dumps([cfg.get("reg_aliases") or {}, [org.get(k) for k in ("name", "short", "abbr")]],
+                                  ensure_ascii=False, sort_keys=True, default=str))
+    if key not in _SEC_RESOLVE_CACHE:
+        if len(_SEC_RESOLVE_CACHE) > 4000:
+            _SEC_RESOLVE_CACHE.clear()
+        _SEC_RESOLVE_CACHE[key] = _sec_resolve_reg_uncached(name, cfg)
+    return _SEC_RESOLVE_CACHE[key]
+
+
+def _sec_resolve_reg_uncached(name: str, cfg: dict):
     aliases = {_norm_key(k): v for k, v in (cfg.get("reg_aliases") or {}).items() if v}
     via = ""
     if _norm_key(name) in aliases:
@@ -2134,9 +2235,13 @@ def secretary_check():
     if not isinstance(procs, list) or len(procs) > 150:
         return jsonify({"success": False, "error": "procedures 목록(최대 150건)이 필요합니다."}), 400
     forms = _sec_forms_set()
+    cleaned = [(p, _sec_clean_proc(p)) for p in procs if isinstance(p, dict)]
+    # 규정명마다 manifest 를 훑으므로 서로 다른 규정명 수를 막는다(실제 절차 팩은 수십 개) — 큰 요청 하나가 서버를 붙잡지 않게
+    names = {r.get("reg", "") for _, c in cleaned if c for _, r in _sec_proc_refs(c)}
+    if len(names) > 400:
+        return jsonify({"success": False, "error": f"근거·서식 규정명이 너무 많습니다({len(names)}개, 최대 400개)."}), 400
     out = {}
-    for p in procs:
-        c = _sec_clean_proc(p)
+    for p, c in cleaned:
         if c and not c.get("hidden"):
             if isinstance(p.get("verified"), dict):
                 c["verified"] = {str(k)[:80]: ({"title": _sec_clean_str(v.get("title"), 80), "revision": _sec_clean_str(v.get("revision"), 60)}
@@ -2207,7 +2312,7 @@ def secretary_basis():
 @app.route("/api/secretary/related")
 def secretary_related():
     """등록된 절차가 없을 때 — 상황 문장과 관련 있는 내규 조문(키워드 + 가능하면 의미 검색)."""
-    q = (request.args.get("q") or "").strip()
+    q = (request.args.get("q") or "").strip()[:300]          # /ask 와 같은 길이 — 긴 글 하나로 서버·의미 검색 키를 붙잡지 않게
     if len(q) < 2:
         return jsonify({"success": True, "items": []})
     return jsonify({"success": True, "items": [{k: v for k, v in it.items() if k != "text"} for it in _sec_related_items(q)]})
@@ -2293,7 +2398,7 @@ def _sec_save_repo_file(repo_path: str, local_path: str, payload: str, message: 
         sha = _gh_commit_files({repo_path: payload}, message)
         return f"저장소에 커밋했습니다({sha[:7]}). 배포가 끝나면 모든 사용자에게 반영됩니다."
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    tmp = local_path + ".tmp"
+    tmp = f"{local_path}.{os.getpid()}.{threading.get_ident()}.tmp"     # 동시에 저장하는 요청끼리 임시 파일이 섞이지 않게
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(payload)
     os.replace(tmp, local_path)
@@ -2315,9 +2420,18 @@ def _sec_stale_base(base, current: dict) -> bool:
     return isinstance(base, str) and base != str((current or {}).get("updated") or "")
 
 
+# 기관 층·설정 저장은 '판 확인 → 저장'을 한 번에 하나씩 — 두 관리자가 동시에 저장해 둘 다 판 확인을 통과하지 않게
+_SEC_SAVE_LOCK = _FileLock(lambda: os.path.join(SEC_DIR, ".save.lock"))
+
+
 @app.route("/api/secretary/org", methods=["POST"])
 def secretary_org_save():
     """기관 층 저장(관리자). 내규 업로드와 같은 토큰을 쓰고, GitHub 연동 시 저장소에 커밋한다."""
+    with _SEC_SAVE_LOCK:
+        return _secretary_org_save()
+
+
+def _secretary_org_save():
     ok, why = _upload_authorized()
     if not ok:
         return jsonify({"success": False, "error": why}), 401
@@ -2367,6 +2481,11 @@ _SEC_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 @app.route("/api/secretary/config", methods=["POST"])
 def secretary_config_save():
     """기관 설정 저장(관리자) — 기관명·서비스 이름·색·명칭·규정명 매핑·기관 휴일."""
+    with _SEC_SAVE_LOCK:
+        return _secretary_config_save()
+
+
+def _secretary_config_save():
     ok, why = _upload_authorized()
     if not ok:
         return jsonify({"success": False, "error": why}), 401
@@ -2951,7 +3070,7 @@ def secretary_draft_hwpx():
     """문서 초안(텍스트) → 한글(.hwpx) 파일. 줄마다 한 문단."""
     body = request.get_json(silent=True) or request.form or {}      # 화면은 폼 전송(파일명 유지), JSON 도 받음
     title = _sec_clean_str(body.get("title"), 80)
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(body.get("text") or ""))[:20000]
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]", "", str(body.get("text") or ""))[:20000]
     if not text.strip():
         return jsonify({"success": False, "error": "초안 내용이 비어 있습니다."}), 400
     try:
@@ -2986,9 +3105,36 @@ _SEC_AUDIT_DEFAULT = {
 }
 
 
+def _sec_num(v, default: float) -> float:
+    """설정의 금액·비율 — '100,000'·'10만'·'30%'·'0.3' 을 숫자로. 못 읽으면 기본값."""
+    t = str(v if v is not None else "").replace(",", "").replace(" ", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", t)
+    if not m:
+        return default
+    n = float(m.group())
+    if t[m.end():].startswith("만"):
+        n *= 10000
+    elif t[m.end():].startswith("%"):
+        n /= 100
+    return n
+
+
 def _sec_audit_cfg() -> dict:
+    """사전 감사 설정 = 기본값 + 기관 설정 audit. 손으로 고친 설정('100,000'·'30%')이 감사 전체를 멈추지 않게 다듬는다."""
     cfg = dict(_SEC_AUDIT_DEFAULT)
     cfg.update((_sec_config().get("audit") or {}))
+    caps = cfg.get("lodging_caps") if isinstance(cfg.get("lodging_caps"), list) else _SEC_AUDIT_DEFAULT["lodging_caps"]
+    cfg["lodging_caps"] = [{**c, "cap": int(_sec_num(c.get("cap"), 0))} for c in caps
+                           if isinstance(c, dict) and _sec_num(c.get("cap"), 0) > 0]
+    r = _sec_num(cfg.get("lodging_extra_ratio"), _SEC_AUDIT_DEFAULT["lodging_extra_ratio"])
+    cfg["lodging_extra_ratio"] = r / 100 if r > 1 else max(0.0, r)            # '30' 도 30% 로
+    for k in ("trip_procs", "lodging_basis"):
+        if not isinstance(cfg.get(k), list):
+            cfg[k] = _SEC_AUDIT_DEFAULT[k]
+    for k in ("card_basis", "draft_required"):
+        if not isinstance(cfg.get(k), dict):
+            cfg[k] = _SEC_AUDIT_DEFAULT[k]
+    cfg["draft_required"] = {k: v for k, v in cfg["draft_required"].items() if isinstance(v, dict) and isinstance(v.get("fields", []), list)}
     return cfg
 
 
@@ -3321,27 +3467,47 @@ def _sec_sent_diff(a: str, b: str) -> list:
     return out[:6]
 
 
+_SEC_DIFF_CACHE: dict = {}                # (이전본, 개정본 해시) → 조문 비교 결과 — 같은 비교를 다시 하지 않는다
+
+
 def _sec_reg_diff(old: str, new: str) -> dict:
+    import hashlib
+    key = hashlib.sha1((old or "").encode("utf-8", "replace") + b"\0" + (new or "").encode("utf-8", "replace")).hexdigest()
+    if key not in _SEC_DIFF_CACHE:
+        if len(_SEC_DIFF_CACHE) > 32:
+            _SEC_DIFF_CACHE.clear()
+        _SEC_DIFF_CACHE[key] = _sec_reg_diff_uncached(old, new)
+    return json.loads(json.dumps(_SEC_DIFF_CACHE[key]))     # 부르는 쪽이 고쳐도 기억한 값은 그대로
+
+
+def _sec_reg_diff_uncached(old: str, new: str) -> dict:
     import difflib
     A, B = _sec_arts(old), _sec_arts(new)
     norm = lambda s: re.sub(r"\s+|<[^>]*>", "", s or "")   # noqa: E731 — 개정 표시(<개정 …>)·공백 차이는 무시
+    nA = {no: norm(a["body"]) for no, a in A.items()}       # 조문마다 한 번만 정규화
+    nB = {no: norm(b["body"]) for no, b in B.items()}
     changed, added, removed, moved = {}, [], [], {}
     for no, a in A.items():
         b = B.get(no)
-        if b and norm(a["body"]) == norm(b["body"]):
+        if b and nA[no] == nB[no]:
             continue
         # 같은 번호가 없거나 내용이 크게 다르면 → 다른 번호로 옮겨 갔는지 본다(조문 신설·삭제로 번호가 밀린 경우)
         best, score = None, 0.0
+        sm = difflib.SequenceMatcher(None, autojunk=False)
+        sm.set_seq2(nA[no][:1500])                            # 옛 조문을 기준 쪽에 두고 새 조문들과 견준다(기준 쪽 색인은 한 번만)
         for no2, b2 in B.items():
-            if no2 == no:
+            if no2 == no or b2["title"] != a["title"]:      # 옮겨 간 조문은 제목이 같을 때만 인정한다 — 다른 제목은 견주지 않는다
                 continue
-            r = difflib.SequenceMatcher(None, norm(a["body"])[:1500], norm(b2["body"])[:1500], autojunk=False).ratio()
+            sm.set_seq1(nB[no2][:1500])
+            if sm.real_quick_ratio() <= max(score, 0.85 - 1e-9) or sm.quick_ratio() <= max(score, 0.85 - 1e-9):
+                continue                                      # 위 한계로도 기준에 못 미치면 정밀 비교를 건너뛴다
+            r = sm.ratio()
             if r > score:
                 best, score = no2, r
-        same = difflib.SequenceMatcher(None, norm(a["body"])[:1500], norm(b["body"])[:1500], autojunk=False).ratio() if b else 0
+        same = difflib.SequenceMatcher(None, nA[no][:1500], nB[no][:1500], autojunk=False).ratio() if b else 0
         if best and score >= 0.85 and score > same + 0.1 and a["title"] == B[best]["title"]:
             moved[no] = best
-            if norm(a["body"]) != norm(B[best]["body"]):
+            if nA[no] != nB[best]:
                 changed[no] = {"to": best, "title": a["title"], "old": a["body"], "new": B[best]["body"],
                                "sents": _sec_sent_diff(a["body"], B[best]["body"])}
         elif b:
@@ -3351,7 +3517,8 @@ def _sec_reg_diff(old: str, new: str) -> dict:
             removed.append({"no": no, "title": a["title"]})
     targets = set(moved.values()) | {c["to"] for c in changed.values()}
     for no, b in B.items():
-        if no not in A and no not in targets:
+        # 새 번호이거나, 원래 조문이 다른 번호로 옮겨 가 그 자리에 들어온 신설 조문(제50조 신설로 옛 제50조가 제51조로)
+        if no not in targets and (no not in A or no in moved):
             added.append({"no": no, "title": b["title"]})
     return {"changed": changed, "moved": moved, "added": added, "removed": removed}
 
@@ -3525,7 +3692,7 @@ def secretary_impact():
 SEC_INS_FILE = os.environ.get("SECRETARY_INSIGHTS_FILE", "").strip() or os.path.join(SEC_DIR, "insights.json")
 _SEC_KV_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL") or "").strip().rstrip("/")
 _SEC_KV_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN") or "").strip()
-_SEC_INS_LOCK = threading.Lock()
+_SEC_INS_LOCK = _FileLock(lambda: SEC_INS_FILE + ".lock")    # 작업자 프로세스끼리도(세던 숫자가 덮여 사라지지 않게)
 _SEC_INS_HITS: dict = {}
 _SEC_AUDIT_KINDS = ("due", "soon", "lodge", "pay", "no-fare", "no-lodge", "out", "draft")
 
@@ -3588,7 +3755,7 @@ def _sec_kv(cmds: list) -> list:
                 pre = key.rstrip("*")
                 out.append([k for k in db if k.startswith(pre)])
         if dirty:
-            tmp = SEC_INS_FILE + ".tmp"
+            tmp = f"{SEC_INS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(db, f, ensure_ascii=False)
             os.replace(tmp, SEC_INS_FILE)
@@ -3774,9 +3941,13 @@ def _sec_erp_presets() -> dict:
     return (_sec_read_json(SEC_ERP_PRESETS_PATH, {}) or {}).get("presets") or {}
 
 
+# 반복 안에 또 반복이 든 묶음 — '(a+)+'·'(\s*\S+)*' 처럼 글이 길어지면 시간이 곱으로 느는 꼴(ERP 탭이 멈춤)
+_SEC_RX_NESTED = re.compile(r"\((?:[^()\\]|\\.)*(?:[+*]|\{\d+,\d*\})(?:[^()\\]|\\.)*\)(?:[+*]|\{\d+,\d*\})")
+
+
 def _sec_rx_ok(rx: str) -> bool:
-    """확장(JS)에서 쓸 정규식 — 파이썬으로도 컴파일되고 지나치게 길지 않은 것만."""
-    if not rx or len(rx) > 200:
+    """확장(JS)에서 쓸 정규식 — 파이썬으로도 컴파일되고 지나치게 길지 않으며, 반복을 겹친 꼴이 아닌 것만."""
+    if not rx or len(rx) > 200 or _SEC_RX_NESTED.search(rx):
         return False
     try:
         re.compile(rx)
