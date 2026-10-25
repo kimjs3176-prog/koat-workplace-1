@@ -322,7 +322,9 @@ function normCase(c){
     sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{}),
     // AI 결과를 사람이 어떻게 처리했는지(확인·고침·버림)와 낸 문서 — 인계받은 사람도 이어서 보게
     aiLog:(Array.isArray(c.aiLog)?c.aiLog:[]).slice(-100).filter(x=>x&&AI_KIND[x.k]&&AI_ST[x.st]).map(x=>({k:x.k, st:x.st, at:D.test(x.at||'')?x.at:'', label:str(x.label,80)})),
-    draftAi:Object.fromEntries(Object.entries(obj(c.draftAi)).filter(([,v])=>v&&AI_ST[v.st]).slice(0,20).map(([k,v])=>[String(k).slice(0,40), {k:str(v.k,40), st:v.st, at:D.test(v.at||'')?v.at:'', text:str(v.text,4000)}])),
+    draftAi:Object.fromEntries(Object.entries(obj(c.draftAi)).filter(([,v])=>v&&AI_ST[v.st]).slice(0,20).map(([k,v])=>[String(k).slice(0,40), {k:str(v.k,40), st:v.st, at:D.test(v.at||'')?v.at:'', text:str(v.text,4000), ...(typeof v.prev==='string'?{prev:v.prev.slice(0,4000)}:{}),
+      lines:(Array.isArray(v.lines)?v.lines:[]).slice(0,10).filter(l=>l&&typeof l==='object').map(l=>({text:str(l.text,200), src:(Array.isArray(l.src)?l.src:[]).slice(0,6).map(x=>str(x,8)), ok:!!l.ok, why:str(l.why,80)})),
+      sources:(Array.isArray(v.sources)?v.sources:[]).slice(0,12).filter(x=>x&&typeof x==='object').map(x=>({id:str(x.id,8), kind:str(x.kind,20)}))}])),
     outs:(Array.isArray(c.outs)?c.outs:[]).slice(-50).filter(x=>x&&D.test(x.at||'')).map(x=>({at:x.at, key:str(x.key,40), ai:!!x.ai})),
     datesAi:Object.fromEntries(Object.entries(obj(c.datesAi)).filter(([,v])=>Array.isArray(v)).slice(0,6).map(([k,v])=>[String(k).slice(0,40), v.slice(0,20).map(x=>str(x,40))]))};
 }
@@ -1155,7 +1157,7 @@ function openDraft(key){
   const rcFields=pendOnly=>{ const cc=caseNow(); if(!cc) return []; const src=receiptDraftSrc(key, cc), rs=receipts(cc), dai=cc.datesAi||{};
     const fromDates=f=>f.auto==='period'?[...(dai.start||[]), ...(dai.end||[])]:f.auto==='start'?(dai.start||[]):[];
     const rids=f=>me.rv[f.k]!==undefined && me.vals[f.k]===me.rv[f.k]?(src[f.k]||[]):me.av[f.k]!==undefined && me.vals[f.k]===me.av[f.k]?fromDates(f):[];
-    return (d.fields||[]).map(f=>({f, rids:[...new Set(rids(f))].filter(id=>{ const r=rs.find(x=>x.id===id); return r&&r.ai&&(!pendOnly||(r.aiSt||'pending')==='pending'); })})).filter(x=>x.rids.length); };
+    return (d.fields||[]).map(f=>({f, rids:[...new Set(rids(f))].filter(id=>{ const r=rs.find(x=>x.id===id); return r?r.ai&&(!pendOnly||(r.aiSt||'pending')==='pending'):Object.values(dai).some(v=>(v||[]).includes(id)); })})).filter(x=>x.rids.length); };
   const persist=fk=>{ const x=me.ai[fk]; if(!me.cid||!x) return;
     updateCaseById(me.cid, cc=>{ cc.draftAi=cc.draftAi||{};
       if(x.st==='rejected'){ aiLogPush(cc, 'draft', 'rejected', d.title, x.at); delete cc.draftAi[key]; }
@@ -1164,7 +1166,9 @@ function openDraft(key){
         sources:(x.sources||[]).slice(0,12)}; }); };
   const norm=t=>String(t||'').replace(/\s+/g,' ').trim();
   const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return; x.st=norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st, null, 1, x.at); persist(fk); };
-  const confirmRc=rids=>{ if(!me.cid||!rids.length) return; updateCaseById(me.cid, cc=>{ receipts(cc).filter(r=>rids.includes(r.id)).forEach(r=>setReceiptAi(r,'confirm')); }); };
+  const confirmRc=rids=>{ if(!me.cid||!rids.length) return; updateCaseById(me.cid, cc=>{ receipts(cc).filter(r=>rids.includes(r.id)).forEach(r=>setReceiptAi(r,'confirm'));
+    const have=new Set(receipts(cc).map(r=>r.id));                     // 지워진 영수증에서 온 날짜는 사람이 확인했으니 출처 표시만 지운다
+    Object.keys(cc.datesAi||{}).forEach(k=>{ cc.datesAi[k]=(cc.datesAi[k]||[]).filter(id=>have.has(id)||!rids.includes(id)); if(!cc.datesAi[k].length) delete cc.datesAi[k]; }); }); };
   const panel=fk=>{ const el=body.querySelector(`[data-ap="${fk}"]`); if(!el) return; const x=me.ai[fk];
     if(!x||x.st==='rejected'){ el.innerHTML=''; return; }
     if(x.busy){ el.innerHTML='<div class="assist-loading sm"><div class="spinner"></div><span>이 건 자료로 초안을 만드는 중...</span></div>'; return; }
@@ -1430,7 +1434,12 @@ function bind(panel){
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id);
           if(r&&r.ai&&(r.aiSt||'pending')==='pending'){ aiLogPush(c, 'receipt', 'rejected', r.vendor||r.name); aiEvent('receipt','rejected', null, 1, r.aiAt); }
-          c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
+          c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id);
+          // 이 영수증에서 온 기준일: 사람이 확인하기 전이면 날짜도 비운다(확인 안 된 AI 날짜가 출처 없이 문서로 나가지 않게), 확인했으면 출처 표시만 지운다
+          const pend=r&&r.ai&&(r.aiSt||'pending')==='pending', cleared=[];
+          Object.keys(c.datesAi||{}).forEach(k=>{ const ids=(c.datesAi[k]||[]).filter(x=>x!==D.id); if(ids.length===(c.datesAi[k]||[]).length) return;
+            if(ids.length) c.datesAi[k]=ids; else { delete c.datesAi[k]; if(pend && c.dates){ delete c.dates[k]; cleared.push(k); } } });
+          if(cleared.length) toast('지운 영수증(AI 인식, 확인 전)에서 온 기준일도 비웠습니다. 기준일을 다시 넣어 주세요.', 4200); }); render(); break;
       case 'rcok': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id); if(r) setReceiptAi(r, (r.aiSt||'pending')==='pending'?'confirm':'undo'); }); render(); break;
       case 'audit': runAudit(); break;
       case 'auack': case 'audis': updateCase(c=>{ const au=c.audit; if(!au) return; au.ack=au.ack||{}; au.dis=au.dis||{};
