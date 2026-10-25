@@ -313,13 +313,17 @@ function normCase(c){
     id:str(r.id,40)||uid(), name:str(r.name,60), date:D.test(r.date||'')?r.date:'', end_date:D.test(r.end_date||'')?r.end_date:'',
     amount:Math.max(0,Math.round(Number(r.amount)||0)), vendor:str(r.vendor,80), kind:str(r.kind,20), payment:str(r.payment,20),
     nights:Math.max(0,Math.round(Number(r.nights)||0)), route:str(r.route,80), items:str(r.items,200), note:str(r.note,200),
-    confidence:str(r.confidence,10), ai:!!r.ai, region:str(r.region,40), thumb:/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.thumb||'')?r.thumb:undefined }));
+    confidence:str(r.confidence,10), ai:!!r.ai, ...(r.ai?{aiSt:['ok','edited'].includes(r.aiSt)?r.aiSt:'pending', aiAt:D.test(r.aiAt||'')?r.aiAt:'', edited:!!r.edited}:{}), region:str(r.region,40), thumb:/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.thumb||'')?r.thumb:undefined }));
   const drafts={}; for(const [k,v] of Object.entries(obj(c.drafts))){ const o={}; for(const [f,x] of Object.entries(obj(v))) if(typeof x==='string') o[String(f).slice(0,40)]=x.slice(0,4000); drafts[String(k).slice(0,40)]=o; }
   return {id:str(c.id,40), procId:str(c.procId,48), title:str(c.title,120), created:D.test(c.created||'')?c.created:today(), updated:Number(c.updated)||Date.now(),
     query:str(c.query,200), dates, checks:flags(c.checks), pchecks:flags(c.pchecks), checkAt:{}, note:str(c.note,2000), drafts, receipts,
     status:c.status==='done'?'done':'open', doneAt:D.test(c.doneAt||'')?c.doneAt:undefined,
     // 단계 키 — 다른 판의 절차로 만든 체크도 가져온 뒤 단계에 맞춰 다시 붙일 수 있게
-    sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{})};
+    sk:keys(c.sk), pk:keys(c.pk), ...(typeof c.schedId==='string'&&c.schedId?{schedId:c.schedId.slice(0,40)}:{}),
+    // AI 결과를 사람이 어떻게 처리했는지(확인·고침·버림)와 낸 문서 — 인계받은 사람도 이어서 보게
+    aiLog:(Array.isArray(c.aiLog)?c.aiLog:[]).slice(-100).filter(x=>x&&AI_KIND[x.k]&&AI_ST[x.st]).map(x=>({k:x.k, st:x.st, at:D.test(x.at||'')?x.at:'', label:str(x.label,80)})),
+    draftAi:Object.fromEntries(Object.entries(obj(c.draftAi)).filter(([,v])=>v&&AI_ST[v.st]).slice(0,20).map(([k,v])=>[String(k).slice(0,40), {k:str(v.k,40), st:v.st, at:D.test(v.at||'')?v.at:'', text:str(v.text,4000)}])),
+    outs:(Array.isArray(c.outs)?c.outs:[]).slice(-50).filter(x=>x&&D.test(x.at||'')).map(x=>({at:x.at, key:str(x.key,40), ai:!!x.ai}))};
 }
 // 같은 절차의 진행 건 중 이번 기준일과 어긋나지 않는 건은 이어서 쓴다(같은 물음을 다시 해도 건이 늘지 않게) —
 // 빈 칸만 채우고, 이미 있는 날짜와 두 달 넘게 떨어지면 다른 건으로 본다
@@ -615,7 +619,7 @@ function procView(){
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
   return regAnsBox()+aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
-    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${caseNote}</div>`+
+    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${pitHtml}${auditHtml(p, c)}${aiLedgerHtml(c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
 
@@ -765,7 +769,7 @@ function manageView(){
     `<div class="sec-row"><button class="sec-btn primary" data-a="newproc">＋ 새 절차 만들기</button>`+
     `<button class="sec-btn ghost" data-a="reload">↻ 기관 절차 새로고침</button></div>`+
     `<div class="sec-card">${rows}${hidRows}</div>`+
-    aiKeyCard()+healthCard()+impactCard()+insightsCard()+mappingCard()+packCard()+configCard()+
+    aiKeyCard()+healthCard()+impactCard()+aiReportCard()+insightsCard()+mappingCard()+packCard()+configCard()+
     `<div class="sec-hint">규정·지침이 개정되면: 근거 조문은 내규 원문(업로드 반영)에서 자동으로 최신본을 보여 줍니다. 근거 규정이 개정된 절차에는 '재확인 필요'가 표시되니, 원문과 대조한 뒤 <b>수정</b>해 기관 층으로 다시 저장하세요.</div>`;
 }
 
@@ -1105,37 +1109,139 @@ function draftAuto(d, c, p){
   return out;
 }
 function fmtLong(s){ const [y,m,d]=String(s).split('-').map(Number); if(!y) return s; const w='일월화수목금토'[new Date(y,m-1,d).getDay()]; return `${y}. ${m}. ${d}.(${w})`; }
+// AI 초안 자료 — 이 건에 사람이 적거나 넣은 것(메모·일정·처음 적은 상황·기준일·증빙). AI 는 이 안의 사실로만 쓴다
+function draftSources(c){
+  if(!c) return [];
+  const src=[];
+  if(String(c.note||'').trim()) src.push({kind:'이 건 메모', text:c.note});
+  const sc=c.schedId&&scheds().find(x=>x.id===c.schedId);
+  if(sc) src.push({kind:'일정', text:[sc.title, fmtLong(sc.date)+(sc.end&&sc.end!==sc.date?' ~ '+fmtLong(sc.end):'')+(sc.time?' '+sc.time:''), sc.memo].filter(Boolean).join('\n')});
+  if(String(c.query||'').trim()) src.push({kind:'처음 적은 상황', text:c.query});
+  const ds=c.dates||{}, p=getProc(c.procId);
+  const dl=((p&&p.dates)||[]).filter(x=>ds[x.k]).map(x=>`${x.l} ${fmtLong(ds[x.k])}`); if(dl.length) src.push({kind:'기준일', text:dl.join('\n')});
+  const rs=receipts(c).filter(r=>r.vendor||r.route||r.items);
+  if(rs.length) src.push({kind:'증빙', text:rs.map(r=>[r.date&&fmtLong(r.date), r.kind, r.vendor, r.route, r.items].filter(Boolean).join(' ')).join('\n')});
+  return src;
+}
 function openDraft(key){
   const d=allDrafts()[key]; if(!d){ toast('초안 서식을 찾을 수 없습니다.'); return; }
   const c=(S.view==='proc')?curCase():null; const p=getProc(S.procId);
   const saved=(c&&c.drafts&&c.drafts[key])||{};
-  const vals=Object.assign({}, draftAuto(d,c,p), receiptDraftVals(key, c), saved);   // 기준일·증빙에서 자동 → 저장한 값 우선
-  S._draft={key, vals};
+  const rv=receiptDraftVals(key, c);
+  const vals=Object.assign({}, draftAuto(d,c,p), rv, saved);   // 기준일·증빙에서 자동 → 저장한 값 우선
+  // 이 초안의 AI 초안(확인 대기·확인함)은 처리 이력에서 이어받는다
+  // ('이력에 저장'을 누르지 않고 닫았어도 AI 초안 글은 칸에 되살린다 — 확인 대기 표시만 남고 글이 빠진 채 확인·반출되지 않게)
+  const ai={}; const da=c&&(c.draftAi||{})[key];
+  if(da&&da.k&&da.st!=='rejected'){ ai[da.k]={text:da.text||'', st:da.st, at:da.at}; if(saved[da.k]===undefined && da.text) vals[da.k]=da.text; }
+  const me=S._draft={key, vals, rv, ai, cid:c?c.id:null, lastOut:null};
+  const fl=k=>((d.fields||[]).find(f=>f.k===k)||{}).l||k;
+  const aiBtn=f=>f.ai&&f.multi?(aiOn()?`<button class="sec-mini primary" type="button" data-da="aidraft" data-k="${esc(f.k)}" title="이 건 메모·일정·증빙에 적힌 사실로만 줄을 만들고 줄마다 근거 자료를 붙입니다">✦ AI 초안</button>`
+    :`<span class="sec-sub" title="관리 화면의 '내 AI 키' 또는 기관 AI 키가 있으면 켜집니다">✦ AI 초안은 AI 키가 있으면 켜집니다</span>`):'';
   const body=modal('secDraftModal','📝 '+esc(d.title)+' 초안');
-  body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<label class="sec-f"><span>${esc(f.l)}</span>`+
-      (f.multi?`<textarea data-dk="${esc(f.k)}" rows="3" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+`</label>`).join('')+`</div>`+
-    `<div class="sec-draft-p"><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
+  body.innerHTML=`<div class="sec-draft"><div class="sec-draft-f">`+(d.fields||[]).map(f=>`<div class="sec-f"><span class="sec-f-h">${esc(f.l)} <span class="sec-aitag" data-tag="${esc(f.k)}" hidden></span>${aiBtn(f)}</span>`+
+      (f.multi?`<textarea data-dk="${esc(f.k)}" rows="${f.ai?5:3}" aria-label="${esc(f.l)}" placeholder="${esc(f.ph||'')}">${esc(vals[f.k]||'')}</textarea>`:`<input data-dk="${esc(f.k)}" aria-label="${esc(f.l)}" value="${esc(vals[f.k]||'')}" placeholder="${esc(f.ph||'')}">`)+
+      (f.ai&&f.multi?`<div class="sec-aidraft" data-ap="${esc(f.k)}"></div>`:'')+`</div>`).join('')+`</div>`+
+    `<div class="sec-draft-p"><div id="secDraftAi"></div><div class="sec-draft-ph">미리보기 <span class="sec-sub">비워 둔 칸은 ○○로 남습니다</span></div><pre id="secDraftOut" class="sec-draft-out"></pre>`+
     `<div class="sec-row">${EMBED?`<button class="sec-btn primary" data-da="erp" title="ERP에서 마지막으로 누른 입력란에 넣습니다(넣을 수 없는 편집기는 복사해 두니 Ctrl+V)">📥 ERP에 넣기</button>`:''}<button class="sec-btn ${EMBED?'':'primary'}" data-da="copy">📋 복사</button>${(S.kd||{}).available?'':`<button class="sec-btn" data-da="hwpx">📄 한글(.hwpx)</button>`}<button class="sec-btn ghost" data-da="txt">⬇ 텍스트</button>${c?`<button class="sec-btn ghost" data-da="keep">이력에 저장</button>`:''}</div>`+
     `<div id="secFormsRow">${formsRow(key)}</div>`+
     `<div class="sec-hint">ERP·한글 기안문 본문에 붙여넣어 쓰세요. 원본 서식이 필요한 문서는 절차 화면의 📎 서식에서 여세요.</div></div></div>`;
-  const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, S._draft.vals); };
-  body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ S._draft.vals[el.dataset.dk]=el.value; out(); }));
+  const out=()=>{ const o=document.getElementById('secDraftOut'); if(o) o.textContent=fillTemplate(d.template, me.vals); };
+  const caseNow=()=>me.cid?cases().find(x=>x.id===me.cid)||null:null;
+  // 영수증에서 온 칸 가운데 값이 그대로이고 AI 인식값인 것 — pendOnly 면 확인 대기인 영수증만
+  const rcFields=pendOnly=>{ const cc=caseNow(); if(!cc) return []; const src=receiptDraftSrc(key, cc), rs=receipts(cc);
+    return (d.fields||[]).filter(f=>src[f.k] && me.rv[f.k]!==undefined && me.vals[f.k]===me.rv[f.k])
+      .map(f=>({f, rids:src[f.k].filter(id=>{ const r=rs.find(x=>x.id===id); return r&&r.ai&&(!pendOnly||(r.aiSt||'pending')==='pending'); })})).filter(x=>x.rids.length); };
+  const persist=fk=>{ const x=me.ai[fk]; if(!me.cid||!x) return;
+    updateCaseById(me.cid, cc=>{ cc.draftAi=cc.draftAi||{};
+      if(x.st==='rejected'){ aiLogPush(cc, 'draft', 'rejected', d.title, x.at); delete cc.draftAi[key]; }
+      else cc.draftAi[key]={k:fk, st:x.st, at:x.at, text:String(x.text||'').slice(0,4000)}; }); };
+  const norm=t=>String(t||'').replace(/\s+/g,' ').trim();
+  const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return; x.st=norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st, null, 1, x.at); persist(fk); };
+  const confirmRc=rids=>{ if(!me.cid||!rids.length) return; updateCaseById(me.cid, cc=>{ receipts(cc).filter(r=>rids.includes(r.id)).forEach(r=>setReceiptAi(r,'confirm')); }); };
+  const panel=fk=>{ const el=body.querySelector(`[data-ap="${fk}"]`); if(!el) return; const x=me.ai[fk];
+    if(!x||x.st==='rejected'){ el.innerHTML=''; return; }
+    if(x.busy){ el.innerHTML='<div class="assist-loading sm"><div class="spinner"></div><span>이 건 자료로 초안을 만드는 중...</span></div>'; return; }
+    const sn=id=>((x.sources||[]).find(s_=>s_.id===id)||{}).kind||id;
+    const drop=(x.lines||[]).filter(l=>!l.ok);
+    const dropHtml=drop.length?`<div class="sec-sub">근거를 확인하지 못해 넣지 않은 줄: ${drop.map(l=>`“${esc(l.text)}”(${esc(l.why)})`).join(', ')}</div>`:'';
+    const missHtml=(x.missing||[]).length?`<div class="sec-sub">더 적으면 좋은 것: ${x.missing.map(esc).join(' · ')}</div>`:'';
+    if(x.st==='none'){ el.innerHTML=`<div class="sec-aid warn"><b>✦ 근거를 확인한 줄이 없어 채우지 않았습니다.</b> 이 건 메모에 한 일·결과를 몇 줄 적은 뒤 다시 해 보세요.${dropHtml}${missHtml}</div>`; return; }
+    if(x.st==='pending'){ el.innerHTML=`<div class="sec-aid"><div class="sec-aid-h">✦ AI 초안 — 확인 대기 <span class="sec-sub">줄마다 가져온 자료를 표시했습니다. 원래 자료와 대조해 고친 뒤 확인하세요.</span></div>`+
+        ((x.lines||[]).some(l=>l.ok)?`<ol class="sec-aid-l">${x.lines.filter(l=>l.ok).map(l=>`<li>${esc(l.text)} <span class="sec-sub">← ${l.src.map(sn).map(esc).join(' · ')}</span></li>`).join('')}</ol>`:'')+dropHtml+missHtml+
+        `<div class="sec-row"><button class="sec-mini primary" type="button" data-da="aiok" data-k="${esc(fk)}">✓ 확인(지금 내용으로 씀)</button><button class="sec-mini" type="button" data-da="aino" data-k="${esc(fk)}">✕ 버리기${x.prev!==undefined?'(원래 내용으로)':''}</button></div></div>`; return; }
+    el.innerHTML=`<div class="sec-sub">✓ 사람이 확인한 AI 초안${x.st==='edited'?'(고쳐 씀)':''}</div>`; };
+  const refreshAi=()=>{ const pend=rcFields(true), used=rcFields(false);
+    body.querySelectorAll('[data-tag]').forEach(t=>{ const k=t.dataset.tag, x=me.ai[k];
+      const txt=pend.some(y=>y.f.k===k)?'✦ AI 인식값 · 확인 대기':used.some(y=>y.f.k===k)?'✓ AI 인식값 · 사람 확인':x&&x.st==='pending'?'✦ AI 초안 · 확인 대기':x&&(x.st==='ok'||x.st==='edited')?'✓ AI 초안 · 사람 확인':'';
+      t.hidden=!txt; t.textContent=txt; t.classList.toggle('wait', /대기/.test(txt)); });
+    const box=document.getElementById('secDraftAi'); if(!box) return;
+    box.innerHTML=pend.length?`<div class="sec-rc-ck warn">✦ AI가 영수증에서 읽은 값이 아직 확인되지 않았습니다(${pend.map(y=>esc(y.f.l)).join(' · ')}). 영수증과 대조했으면 <button class="sec-mini primary" type="button" data-da="airc">✓ 증빙 값 확인함</button></div>`:''; };
+  // 문서로 내보내기 전 — 확인 대기인 AI 결과가 들어 있으면 한 번 더 확인을 받고, 낸 문서를 기록한다
+  const gate=()=>{
+    Object.entries(me.ai).forEach(([fk,x])=>{ if(x&&x.st==='ok'&&norm(me.vals[fk])!==norm(x.text)){ x.st='edited'; aiEvent('draft','edited','ok', 1, x.at); persist(fk); } });
+    const pend=rcFields(true).map(y=>({label:`${y.f.l}: ${String(me.vals[y.f.k]||'').slice(0,40)} — AI 영수증 인식`, rids:y.rids}))
+      .concat(Object.entries(me.ai).filter(([,x])=>x&&x.st==='pending').map(([fk])=>({label:`${fl(fk)} — AI 초안`, fk})));
+    if(pend.length){
+      if(!confirm('이 문서에 사람이 아직 확인하지 않은 AI 결과가 있습니다.\n\n'+pend.map(x=>'· '+x.label).join('\n')+
+        '\n\n영수증·메모 같은 원래 자료와 대조해 확인했으면 [확인]을 누르세요. 확인한 것으로 기록하고 내보냅니다.')) return false;
+      confirmRc([...new Set(pend.flatMap(x=>x.rids||[]))]); pend.filter(x=>x.fk).forEach(x=>aiOk(x.fk));
+    }
+    const sent=fillTemplate(d.template, me.vals);
+    if(sent!==me.lastOut){ me.lastOut=sent;
+      const hasAi=Object.values(me.ai).some(x=>x&&(x.st==='ok'||x.st==='edited')) || rcFields(false).length>0;
+      aiEvent('output', hasAi?'ai':'plain');
+      if(me.cid) updateCaseById(me.cid, cc=>{ (cc.outs=cc.outs||[]).push({at:today(), key, ai:hasAi}); cc.outs=cc.outs.slice(-50); }); }
+    refreshAi(); Object.keys(me.ai).forEach(panel); if(S.view==='proc') render();
+    return true; };
+  const aiDraftRun=async fk=>{
+    const f=(d.fields||[]).find(x=>x.k===fk); const sources=draftSources(caseNow());
+    if(!f) return;
+    if(!sources.length){ toast('초안을 만들 자료가 없습니다 — 이 건 메모에 한 일·결과를 몇 줄 적거나 일정·증빙을 넣어 주세요.', 4800); return; }
+    const fields={}; (d.fields||[]).forEach(g=>{ if(g.k!==fk && String(me.vals[g.k]||'').trim()) fields[g.l]=String(me.vals[g.k]).slice(0,300); });
+    const prior=me.ai[fk]; me.ai[fk]=Object.assign({}, prior||{}, {busy:true}); panel(fk);
+    try{ const r=await fetch('/api/secretary/ai/draft',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({draft:d.title, field:f.l, fields, sources})});
+      const res=await r.json(); if(!res.success) throw new Error(res.error||'AI 초안을 만들지 못했습니다.');
+      if(S._draft!==me) return;                            // 그사이 창을 닫거나 다른 초안을 열었으면 손대지 않는다
+      const good=(res.lines||[]).filter(l=>l.ok);
+      if(!good.length){ me.ai[fk]=prior&&prior.st!=='none'?prior:{st:'none', lines:res.lines||[], missing:res.missing||[], sources:res.sources||[]};
+        if(prior&&prior.st!=='none') toast('근거를 확인한 줄이 없어 바꾸지 않았습니다.', 3600); panel(fk); return; }
+      const cur=String(me.vals[fk]||'');
+      if(cur.trim() && !confirm(`'${f.l}'에 적힌 내용을 AI 초안으로 바꿀까요?\n(✕ 버리기를 누르면 지금 내용으로 돌아옵니다)`)){ me.ai[fk]=prior; panel(fk); return; }
+      // 앞 AI 초안은 기록으로 옮긴다 — 확인 대기인 채 새 초안으로 바꿨으면 사람이 버린 것으로 센다(기관 숫자에 대기로 남지 않게)
+      if(me.cid) updateCaseById(me.cid, cc=>{ const old=(cc.draftAi||{})[key]; if(!old) return;
+        if(old.st==='pending'){ aiLogPush(cc, 'draft', 'rejected', d.title, old.at); aiEvent('draft','rejected', null, 1, old.at); }
+        else aiLogPush(cc, 'draft', old.st, d.title, old.at); });
+      const text=good.map(l=>l.text).join('\n');
+      me.vals[fk]=text; const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=text; out();
+      me.ai[fk]={text, prev:cur, st:'pending', at:today(), lines:res.lines, missing:res.missing||[], sources:res.sources||[]};
+      aiEvent('draft','made'); persist(fk);
+    }catch(e){ if(S._draft===me){ me.ai[fk]=prior; toast(e.message||'AI 초안을 만들지 못했습니다.', 4200); } }
+    panel(fk); refreshAi(); };
+  body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ me.vals[el.dataset.dk]=el.value; out(); refreshAi(); }));
   body.addEventListener('change', e=>{ const el=e.target; if(el.dataset.da!=='ffile') return; const f=el.files&&el.files[0]; el.value=''; if(f) formsUpload(key, d, f); });
-  body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const txt=fillTemplate(d.template, S._draft.vals);
-    if(b.dataset.da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
-    else if(b.dataset.da==='erp'){ S._lastInsert=txt;
+  body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const da=b.dataset.da;
+    if(['copy','erp','hwpx','txt','fgen','fgian','fmine'].includes(da) && !gate()) return;
+    const txt=fillTemplate(d.template, me.vals);
+    if(da==='copy'){ (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast('복사했습니다.')).catch(()=>{ const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast('복사했습니다.');}catch(_){} ta.remove(); }); }
+    else if(da==='erp'){ S._lastInsert=txt;
       toExt({type:'insert', text:txt, draft:key}); }
-    else if(b.dataset.da==='hwpx'){ downloadHwpx(d.title, txt); }
-    else if(b.dataset.da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
-    else if(b.dataset.da==='fgen'){ formsGenerate(d, S._draft.vals); }
-    else if(b.dataset.da==='fgian'){ formsGian(d, S._draft.vals); }
-    else if(b.dataset.da==='fmine'){ formsFill(key, d, S._draft.vals); }
-    else if(b.dataset.da==='fforget'){ myForms(key, null); document.getElementById('secFormsRow').innerHTML=formsRow(key); toast('이 초안의 내 서식을 지웠습니다.'); }
+    else if(da==='hwpx'){ downloadHwpx(d.title, txt); }
+    else if(da==='txt'){ const blob=new Blob([txt],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=d.title.replace(/[\\/:*?"<>|]/g,'')+'.txt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000); }
+    else if(da==='fgen'){ formsGenerate(d, me.vals); }
+    else if(da==='fgian'){ formsGian(d, me.vals); }
+    else if(da==='fmine'){ formsFill(key, d, me.vals); }
+    else if(da==='fforget'){ myForms(key, null); document.getElementById('secFormsRow').innerHTML=formsRow(key); toast('이 초안의 내 서식을 지웠습니다.'); }
+    else if(da==='aidraft'){ aiDraftRun(b.dataset.k); }
+    else if(da==='aiok'){ aiOk(b.dataset.k); panel(b.dataset.k); refreshAi(); if(S.view==='proc') render(); }
+    else if(da==='aino'){ const fk=b.dataset.k, x=me.ai[fk]; if(!x) return;
+      if(x.prev!==undefined){ me.vals[fk]=x.prev; const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=x.prev; out(); }
+      const was=x.st; x.st='rejected'; aiEvent('draft','rejected', was, 1, x.at); persist(fk); panel(fk); refreshAi(); if(S.view==='proc') render(); }
+    else if(da==='airc'){ confirmRc([...new Set(rcFields(true).flatMap(y=>y.rids))]); refreshAi(); if(S.view==='proc') render(); toast('영수증 인식값을 확인한 것으로 기록했습니다.'); }
     // 초안 창을 연 건에 저장한다(그사이 확장 패널이 다른 ERP 화면의 건으로 넘어가도 섞이지 않게)
-    else if(b.dataset.da==='keep'){ const ok=updateCaseById(c.id, cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, S._draft.vals); });
+    else if(da==='keep'){ const ok=updateCaseById(c.id, cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, me.vals); });
       toast(ok?'처리 이력에 초안 입력값을 저장했습니다.':'저장하지 못했습니다 — 이 건이 지워졌거나 저장 공간이 부족합니다.'); }
   });
-  out();
+  out(); refreshAi(); Object.keys(ai).forEach(panel);
 }
 
 // ── 원문 보기 패널(규정 전문·서식) ──────────────────────────────────────
@@ -1312,10 +1418,23 @@ function bind(panel){
       case 'regask': askRegs(S.query, true); break;
       case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
-      case 'rcdel': updateCase(c=>{ c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
+      case 'rcdel': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id);
+          if(r&&r.ai&&(r.aiSt||'pending')==='pending'){ aiLogPush(c, 'receipt', 'rejected', r.vendor||r.name); aiEvent('receipt','rejected', null, 1, r.aiAt); }
+          c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
+      case 'rcok': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id); if(r) setReceiptAi(r, (r.aiSt||'pending')==='pending'?'confirm':'undo'); }); render(); break;
       case 'audit': runAudit(); break;
-      case 'auack': updateCase(c=>{ if(!c.audit) return; c.audit.ack=c.audit.ack||{}; c.audit.ack[D.id]=!c.audit.ack[D.id]; if(!c.audit.ack[D.id]) delete c.audit.ack[D.id]; }); render(); break;
+      case 'auack': case 'audis': updateCase(c=>{ const au=c.audit; if(!au) return; au.ack=au.ack||{}; au.dis=au.dis||{};
+          const f=(au.findings||[]).find(x=>x.id===D.id); const before=auditSt(au, D.id);
+          const box=a==='auack'?au.ack:au.dis, other=a==='auack'?au.dis:au.ack;
+          if(box[D.id]) delete box[D.id]; else { box[D.id]=true; delete other[D.id]; }
+          if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before, 1, f.at||au.at); } }); render(); break;
       case 'impact': openImpact(D.reg); break;
+      case 'aiscope': S.aiRepScope=D.v; render(); break;
+      case 'airef': S.aiRep=null; render(); break;
+      case 'aicopy': { const org=S.aiRepScope!=='local' && S.aiRep && S.aiRep.months;
+        const r=(org?S.aiRep.months:aiLocalMonths()).find(x=>x.month===D.m); if(!r) break;
+        const t=aiReportText(r, org?'기관 전체, 익명 통계':'이 브라우저 처리 이력 기준');
+        (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast('월간 보고 문구를 복사했습니다.')).catch(()=>prompt('보고 문구를 복사하세요.', t)); break; }
       case 'sharetg': _lsPut(LS_SHARE, !canShare(true)); render(); toast(canShare(true)?'기관 통계에 익명으로 기여합니다.':'이제 기관 통계로 아무것도 보내지 않습니다.'); break;
       case 'insrj': promoteReason(D.id, D.t); break;
       case 'insdel': deleteReason(D.id, D.t); break;
@@ -1362,7 +1481,8 @@ function bind(panel){
     else if(a==='packfile') readJsonFile(el, packRead);
     else if(a==='rcfile'){ const fs=[...(el.files||[])].filter(f=>/^image\//.test(f.type)); el.value=''; if(fs.length) addReceipts(fs); }
     else if(a==='rcf'){ const k=el.dataset.k; let v=el.value; if(k==='amount'||k==='nights') v=Number(String(v).replace(/[^\d]/g,''))||0;
-      updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===el.dataset.id); if(r){ r[k]=v; if(k!=='note') r.edited=true; } }); render(); }
+      updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===el.dataset.id); if(r){ const was=r[k]; r[k]=v;
+        if(k!=='note' && String(was??'')!==String(v??'')){ r.edited=true; if(r.ai && r.aiSt==='ok'){ r.aiSt='edited'; aiEvent('receipt','edited','ok', 1, r.aiAt); } } } }); render(); }
     else if(a==='es' && (el.type==='checkbox'||el.tagName==='SELECT')){ editorField(el); if(el.dataset.k==='dlref') render(); }
     else if(a==='himport') readJsonFile(el, d=>{ if(!d||!Array.isArray(d.cases)){ toast('처리 이력 파일이 아닙니다.'); return; }
       const cur=cases(); const ids=new Set(cur.map(c=>c.id)); const add=d.cases.map(normCase).filter(c=>c&&!ids.has(c.id)); saveCases(add.concat(cur));
@@ -1738,6 +1858,78 @@ const RC_KINDS=['운임','숙박','식비','회의비','물품','기타'];
 const RC_PAY=['법인카드','개인카드','현금','기타','알수없음'];
 const RC_RE=/영수증|매출전표|세금계산서|승차권|탑승권|증빙|거래명세서/;
 function wantsReceipts(p){ return (p.steps||[]).some(s=>(s.docs||[]).some(d=>RC_RE.test(d))) || ['corp-card','event','daily-expense'].includes(p.id); }
+// ── AI 산출물 기록 — AI가 만든 결과(영수증 인식·감사 지적·문서 초안)를 사람이 확인·고침·버림 중 어떻게 처리했는지 ─────
+// 건마다 남기고(처리 이력·인계), 기관 집단 지식을 켜 두었으면 월별 익명 숫자로도 보낸다(내용·금액은 보내지 않음).
+// 확인 대기인 AI 결과는 문서로 내보낼 때(복사·한글·ERP) 한 번 더 확인을 받는다 — 사람이 확인한 것만 산출물에 들어간다.
+const AI_KIND={receipt:'영수증 인식', audit:'감사 지적', draft:'문서 초안'};
+const AI_ST={pending:'확인 대기', ok:'확인 후 그대로', edited:'고쳐서 사용', rejected:'버림'};
+// at: 그 AI 결과를 만든 날 — 다음 달에 확인·되돌려도 만든 달의 숫자에 더하고 뺀다(만듦과 판단이 같은 달에 맞게)
+function aiEvent(kind, st, prev, n, at){
+  if(!canShare()) return;
+  const month=/^\d{4}-\d{2}/.test(at||'')?String(at).slice(0,7):'';
+  fetch('/api/secretary/insights/event',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1, ...(month?{month}:{})})})
+    .then(()=>{ S.aiRep=null; }).catch(()=>{});             // 관리 화면의 기관 숫자는 다음에 열 때 다시 불러온다
+}
+function aiLogPush(c, k, st, label, at){ (c.aiLog=c.aiLog||[]).push({k, st, at:at||today(), label:String(label||'').slice(0,80)}); c.aiLog=c.aiLog.slice(-100); }
+// 영수증 AI 값: confirm(사람 확인 — 고친 적이 있으면 '고쳐서') · undo(확인 취소)
+function setReceiptAi(r, how){
+  if(!r||!r.ai) return; const before=r.aiSt||'pending';
+  const after=how==='confirm'?(r.edited?'edited':'ok'):'pending';
+  if(after===before) return; r.aiSt=after; aiEvent('receipt', after, before, 1, r.aiAt);
+}
+// 이 건의 AI 결과 목록 [{k, st, at, label}]
+function aiItems(c){
+  if(!c) return [];
+  const out=receipts(c).filter(r=>r.ai).map(r=>({k:'receipt', st:r.aiSt||'pending', at:r.aiAt||c.created, label:r.vendor||r.name}));
+  const a=c.audit; if(a) (a.findings||[]).filter(f=>f.source==='ai').forEach(f=>out.push({k:'audit', st:auditSt(a, f.id), at:f.at||a.at, label:f.title}));
+  Object.entries(c.draftAi||{}).forEach(([key,d])=>{ if(d&&d.st) out.push({k:'draft', st:d.st, at:d.at||c.created, label:(allDrafts()[key]||{}).title||key}); });
+  return out.concat(c.aiLog||[]);
+}
+function aiLedgerHtml(c){
+  const its=aiItems(c), outs=(c&&c.outs)||[]; if(!its.length && !outs.some(o=>o.ai)) return '';
+  const by=k=>{ const xs=its.filter(x=>x.k===k); if(!xs.length) return '';
+    const n=st=>xs.filter(x=>x.st===st).length;
+    return `<span class="sec-doc ai">${AI_KIND[k]} ${xs.length} <span class="sec-sub">(${[['ok','그대로'],['edited','고침'],['rejected','버림'],['pending','대기']].filter(([st])=>n(st)).map(([st,l])=>`${l} ${n(st)}`).join(' · ')})</span></span>`; };
+  const pend=its.filter(x=>x.st==='pending').length;
+  return `<div class="sec-card sec-ailog"><div class="sec-card-h">✦ 이 건의 AI 결과 <span class="sec-sub">AI가 만든 결과를 사람이 확인한 것만 문서에 들어갑니다</span></div>`+
+    `<div class="sec-ailog-r">${['receipt','audit','draft'].map(by).join('')}${outs.length?`<span class="sec-doc">낸 문서 ${outs.length} <span class="sec-sub">(AI 반영 ${outs.filter(o=>o.ai).length})</span></span>`:''}</div>`+
+    (pend?`<div class="sec-rc-ck warn">확인 대기 ${pend}건 — 증빙의 ✓ 확인, 감사 지적의 ✓/✕, 초안 창의 ✓ 확인으로 처리하세요. 확인하지 않은 채 문서로 내보내려 하면 한 번 더 묻습니다.</div>`:'')+`</div>`;
+}
+// 월별 AI 산출물 보고 — 기관 전체(익명 통계, 집단 지식 저장소가 있을 때) 또는 이 브라우저의 처리 이력
+function aiMonth(mo){ const z=()=>({made:0, ok:0, edited:0, rejected:0, pending:0}); return {month:mo, receipt:z(), audit:z(), draft:z(), output:{plain:0, ai:0}}; }
+function aiLocalMonths(){
+  const m={}; const get=mo=>m[mo]=m[mo]||aiMonth(mo);
+  cases().forEach(c=>{
+    aiItems(c).forEach(x=>{ const mo=String(x.at||'').slice(0,7); if(!/^\d{4}-\d{2}$/.test(mo)||!AI_KIND[x.k]) return; const r=get(mo)[x.k]; r.made++; r[x.st]=(r[x.st]||0)+1; });
+    (c.outs||[]).forEach(o=>{ get(String(o.at).slice(0,7)).output[o.ai?'ai':'plain']++; }); });
+  return Object.values(m).sort((a,b)=>a.month<b.month?1:-1).slice(0,12);
+}
+function aiReportText(r, scope){
+  const ks=['receipt','audit','draft']; const sum=st=>ks.reduce((a,k)=>a+((r[k]||{})[st]||0),0);
+  const made=sum('made'), used=sum('ok')+sum('edited'), outs=(r.output.ai||0)+(r.output.plain||0); const [y,mo]=r.month.split('-');
+  return `${y}년 ${+mo}월 서무비서 AI 활용 실적(${scope})\n`+
+    `○ AI가 만든 결과 ${made}건(${ks.filter(k=>(r[k]||{}).made).map(k=>`${AI_KIND[k]} ${r[k].made}건`).join(', ')||'없음'})\n`+
+    `○ 담당자가 확인해 업무에 쓴 결과 ${used}건(그대로 ${sum('ok')}건 · 고쳐서 ${sum('edited')}건)${made?`, 사용률 ${Math.round(used/made*100)}%`:''} · 버림 ${sum('rejected')}건 · 확인 대기 ${sum('pending')}건\n`+
+    `○ 낸 문서(복사·한글·ERP 넣기) ${outs}건 중 AI 결과가 들어간 문서 ${r.output.ai||0}건 — 모두 담당자 확인을 거쳐 반출`;
+}
+function aiReportCard(){
+  const head=`<div class="sec-card-h">✦ AI 산출물 보고(월별) <span class="sec-sub">AI가 만든 결과(영수증 인식·감사 지적·문서 초안)를 담당자가 확인·고침·버린 건수와, AI 결과가 들어간 문서 수</span></div>`;
+  if(S.insights.available && !S.aiRep){ S.aiRep={loading:true};
+    fetch('/api/secretary/insights/ai').then(r=>r.json()).then(d=>{ S.aiRep=d.success&&d.available?d:{none:true, error:d.error}; if(S.view==='manage') render(); }).catch(()=>{ S.aiRep={none:true}; if(S.view==='manage') render(); }); }
+  const org=S.insights.available && S.aiRep && !S.aiRep.loading && !S.aiRep.none;
+  const scope=S.aiRepScope==='local'||!org?'local':'org';
+  const rows=scope==='org'?(S.aiRep.months||[]):aiLocalMonths();
+  const ks=['receipt','audit','draft']; const sum=(r,st)=>ks.reduce((a,k)=>a+((r[k]||{})[st]||0),0);
+  const tabs=`<div class="sec-row"><button class="sec-mini ${scope==='org'?'on':''}" data-a="aiscope" data-v="org" ${org?'':'disabled title="기관 집단 지식 저장소가 있으면 켜집니다"'}>기관 전체(익명 통계)</button><button class="sec-mini ${scope==='local'?'on':''}" data-a="aiscope" data-v="local">이 브라우저의 처리 이력</button>${S.insights.available&&S.aiRep&&S.aiRep.loading?'<span class="sec-sub">불러오는 중...</span>':''}${org&&scope==='org'?'<button class="sec-mini" data-a="airef" title="기관 숫자 다시 불러오기">↻ 새로고침</button>':''}</div>`;
+  if(!rows.length) return `<div class="sec-card">${head}${tabs}<div class="sec-hint">아직 기록이 없습니다. 영수증 AI 인식, AI 감사, 문서 초안의 ✦ AI 초안을 쓰고 담당자가 확인하면 쌓입니다.${scope==='org'?' 기관 전체 숫자는 담당자가 기관 통계 기여를 켜 둔 경우에만 모입니다.':''}</div></div>`;
+  return `<div class="sec-card">${head}${tabs}<div class="sec-airep"><div class="sec-airep-r h"><span>월</span><span>AI 결과</span><span>그대로</span><span>고쳐서</span><span>버림</span><span>대기</span><span>낸 문서(AI)</span><span></span></div>`+
+    rows.map(r=>{ const made=sum(r,'made');
+      return `<div class="sec-airep-r"><b>${esc(r.month)}</b><span>${made}</span><span>${sum(r,'ok')}</span><span>${sum(r,'edited')}</span><span>${sum(r,'rejected')}</span><span>${sum(r,'pending')}</span>`+
+        `<span>${(r.output.ai||0)+(r.output.plain||0)} (${r.output.ai||0})</span><button class="sec-mini" data-a="aicopy" data-m="${esc(r.month)}" title="월간 보고 문구 복사">📋 보고 문구</button>`+
+        `<span class="sec-sub sec-airep-k">${ks.filter(k=>(r[k]||{}).made).map(k=>`${AI_KIND[k]} ${r[k].made}`).join(' · ')||'—'}</span></div>`; }).join('')+`</div>`+
+    `<div class="sec-hint">'그대로·고쳐서'는 담당자가 원래 자료와 대조해 확인한 결과입니다. 확인 대기인 AI 결과는 문서로 내보낼 때 한 번 더 확인을 받으므로, 낸 문서에는 확인된 결과만 들어갑니다.</div></div>`;
+}
 function receipts(c){ return (c&&c.receipts)||[]; }
 function won(n){ return (Number(n)||0).toLocaleString('ko-KR'); }
 function imgToJpeg(file, max, q){
@@ -1762,7 +1954,7 @@ async function addReceipts(files){
         const big=await imgToJpeg(f, 1600, .85);
         const resp=await fetch('/api/secretary/ai/receipt',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({image:big, context:p.title, year})});
         const d=await resp.json();
-        if(d.success){ Object.assign(r, d.receipt, {ai:true}); } else { r.note=d.error||'인식하지 못했습니다 — 직접 입력하세요.'; }
+        if(d.success){ Object.assign(r, d.receipt, {ai:true, aiSt:'pending', aiAt:today()}); aiEvent('receipt','made'); } else { r.note=d.error||'인식하지 못했습니다 — 직접 입력하세요.'; }
       }
     }catch(e){ r.note='이미지를 읽지 못했습니다 — 직접 입력하세요.'; }
     if(!updateCaseById(cid, c=>{ (c.receipts=c.receipts||[]).push(r); })) toast('증빙을 저장하지 못했습니다(브라우저 저장 공간 확인).');
@@ -1812,7 +2004,9 @@ function receiptHtml(p, c){
       `<label><span>결제</span><select data-a="rcf" data-id="${esc(r.id)}" data-k="payment">${RC_PAY.map(k=>`<option ${r.payment===k?'selected':''}>${k}</option>`).join('')}</select></label>`+
       (r.kind==='숙박'?`<label><span>숙박 지역</span><select data-a="rcf" data-id="${esc(r.id)}" data-k="region"><option value="">선택</option>${lodgingCaps().map(x=>`<option ${r.region===x.name?'selected':''} value="${esc(x.name)}">${esc(x.name)} (${won(x.cap)})</option>`).join('')}</select></label>`+
         `<label><span>박수</span><input inputmode="numeric" value="${r.nights?esc(r.nights):''}" data-a="rcf" data-id="${esc(r.id)}" data-k="nights" placeholder="1"></label>`:'')+
-    `</div><div class="sec-rc-m">${r.ai?`<span class="sec-layer org" title="AI가 읽은 값 — 확인 후 고쳐 주세요">✦ AI ${r.confidence==='high'?'인식':'인식(확인 필요)'}</span>`:''}`+
+    `</div><div class="sec-rc-m">${r.ai?((r.aiSt||'pending')==='pending'
+        ?`<span class="sec-layer org" title="AI가 읽은 값 — 영수증과 대조해 고친 뒤 확인을 누르세요">✦ AI 인식${r.confidence==='high'?'':'(확신 낮음)'} · 확인 대기</span><button class="sec-mini primary" data-a="rcok" data-id="${esc(r.id)}" title="영수증과 대조했습니다 — 이 값을 문서에 씁니다">✓ 확인</button>`
+        :`<span class="sec-layer" title="AI가 읽고 사람이 확인한 값">✓ AI 인식 · 사람 확인${r.aiSt==='edited'?'(고침)':''}</span><button class="sec-mini" data-a="rcok" data-id="${esc(r.id)}">되돌리기</button>`):''}`+
       `${r.route?`<span class="sec-sub">${esc(r.route)}</span>`:''}${r.items?`<span class="sec-sub">${esc(r.items)}</span>`:''}`+
       `<button class="sec-x" data-a="rcdel" data-id="${esc(r.id)}" aria-label="증빙 삭제">✕</button></div></div>`).join('');
   const checks=receiptChecks(p, c);
@@ -1823,6 +2017,13 @@ function receiptHtml(p, c){
     (rs.length?`<div class="sec-rc-list">${rows}</div>`+
       `<div class="sec-rc-sum">합계 <b>${won(total)}원</b> `+Object.entries(sums).map(([k,v])=>`<span class="sec-doc">${esc(k)} ${won(v)}원</span>`).join('')+`</div>`+
       `<div class="sec-rc-chk">`+checks.map(([lv,t])=>`<div class="sec-rc-ck ${lv}">${lv==='ok'?'✓':lv==='warn'?'⚠':'ℹ'} ${esc(t)}</div>`).join('')+`</div>`:'')+`</div>`;
+}
+// 초안 칸마다 어느 영수증에서 온 값인지 — 확인 대기인 AI 인식값이 문서에 들어가는지 가려낸다
+function receiptDraftSrc(key, c){
+  const rs=receipts(c); const ids=f=>rs.filter(f).map(r=>r.id); const o={};
+  if(key==='travel-settle'){ o.fare=ids(r=>r.kind==='운임'); o.lodging=ids(r=>r.kind==='숙박'); o.card=ids(r=>r.payment&&r.payment!=='알수없음'); o.evid=ids(()=>true); }
+  if(key==='card-evidence'){ if(rs[0]){ o.place=[rs[0].id]; o.date=[rs[0].id]; } o.amount=ids(()=>true); }
+  return o;
 }
 // 초안 자동 채움 — 증빙에서 운임·숙박 합계, 증빙 목록, 사용일·장소·금액
 function receiptDraftVals(key, c){
@@ -1968,7 +2169,9 @@ function auditInput(p, c){
     receipts:receipts(c).map(r=>{ const o=Object.assign({}, r); delete o.thumb; delete o.name; return o; })};
 }
 function auditSig(inp){ const x=JSON.stringify(inp); let h=0; for(let i=0;i<x.length;i++) h=(h*31+x.charCodeAt(i))|0; return String(h); }
-function auditOpen(c){ const a=c&&c.audit; if(!a) return []; return (a.findings||[]).filter(f=>!(a.ack||{})[f.id]); }
+function auditOpen(c){ const a=c&&c.audit; if(!a) return []; return (a.findings||[]).filter(f=>!(a.ack||{})[f.id] && !(a.dis||{})[f.id]); }
+// AI 지적의 사람 판단: 확인·반영함(ok) · 해당 없음(rejected) · 아직(pending)
+function auditSt(a, id){ return (a.ack||{})[id]?'ok':(a.dis||{})[id]?'rejected':'pending'; }
 async function runAudit(){
   const p=getProc(S.procId); if(!p) return; const c=ensureCase(); if(!c){ toast('처리 이력을 저장하지 못했습니다(브라우저 저장 공간 확인).'); return; }
   const inp=auditInput(p, c); const sig=auditSig(inp); const id=c.id;
@@ -1976,9 +2179,21 @@ async function runAudit(){
   S.auditBusy=id; render();
   try{ const r=await fetch('/api/secretary/audit',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({procedure:proc, case:inp, today:today(), ai:!!aiOn()})});
     const d=await r.json(); if(!d.success) throw new Error(d.error||'감사하지 못했습니다.');
-    const prev=(c.audit&&c.audit.ack)||{};
-    updateCaseById(id, x=>{ x.audit={at:today(), sig, findings:d.findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
-      ack:Object.fromEntries(Object.entries(prev).filter(([k])=>d.findings.some(f=>f.id===k)))}; });
+    updateCaseById(id, x=>{
+      // AI 지적 id 는 순서(ai-0, ai-1…)라 다시 감사하면 다른 지적이 같은 id 를 받을 수 있다 — 같은 id·같은 제목일 때만 같은 지적으로 이어받는다
+      const old=x.audit, oldF=(old&&old.findings)||[];
+      const same=f=>{ const o=oldF.find(g=>g.id===f.id); return !!o && (f.source!=='ai' || (o.source==='ai' && o.title===f.title)); };
+      const keepIds=new Set(d.findings.filter(same).map(f=>f.id));
+      // 사라지거나 다른 지적으로 바뀐 앞 AI 지적은 기록으로 옮긴다 — 확인 대기였으면 쓰이지 않은 것('버림')으로(기관 숫자에 대기로 남지 않게)
+      oldF.filter(f=>f.source==='ai' && !keepIds.has(f.id)).forEach(f=>{ const st=auditSt(old, f.id), at=f.at||old.at;
+        if(st==='pending'){ aiLogPush(x, 'audit', 'rejected', f.title, at); aiEvent('audit','rejected', null, 1, at); }
+        else aiLogPush(x, 'audit', st, f.title, at); });
+      // 이어받은 AI 지적은 처음 만든 날을 지킨다(판단을 만든 달에 세게) · 새 AI 지적만 '만듦'으로 센다
+      const findings=d.findings.map(f=>f.source==='ai'&&keepIds.has(f.id)?Object.assign({}, f, {at:(oldF.find(g=>g.id===f.id)||{}).at||old.at}):f);
+      const nAi=findings.filter(f=>f.source==='ai'&&!keepIds.has(f.id)).length; if(nAi) aiEvent('audit','made',null,nAi);
+      const keep=o=>Object.fromEntries(Object.entries(o||{}).filter(([k])=>keepIds.has(k)));
+      x.audit={at:today(), sig, findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
+      ack:keep(old&&old.ack), dis:keep(old&&old.dis)}; });
     toast(d.findings.length?`지적 ${d.findings.length}건 — 높음 ${d.counts.high} · 보통 ${d.counts.medium} · 참고 ${d.counts.low}`:'걸리는 항목이 없습니다.');
   }catch(e){ toast(e.message||'감사 서버에 연결하지 못했습니다.'); }
   S.auditBusy=null; render();
@@ -1997,11 +2212,14 @@ function auditHtml(p, c){
       (a.ai_error?`<div class="sec-rc-ck info">✦ ${esc(a.ai_error)} 규칙 점검 결과만 보여 드립니다.</div>`:'')+
       (fs.length?`<div class="sec-au-sum">${esc(a.at)} 감사 · 남은 지적 <b>${open.length}</b>/${fs.length}건${a.ai_used?' · ✦ AI 감사 포함':''}${a.summary?` — ${esc(a.summary)}`:''}</div>`+
         `<div class="sec-au-list">`+fs.map(f=>{ const [lb,cls]=SEV[f.severity]||SEV.low; const done=!!ack[f.id];
-          return `<div class="sec-au ${cls}${done?' done':''}"><div class="sec-au-h"><span class="sec-au-sev ${cls}">${lb}</span><b class="sec-au-t">${esc(f.title)}</b>`+
+          const no=!!(a.dis||{})[f.id];
+          return `<div class="sec-au ${cls}${done||no?' done':''}"><div class="sec-au-h"><span class="sec-au-sev ${cls}">${lb}</span><b class="sec-au-t">${esc(f.title)}</b>`+
             `<span class="sec-au-src">${f.source==='ai'?'✦ AI':'규칙'}</span></div>`+
             (f.detail?`<div class="sec-au-d">${esc(f.detail)}</div>`:'')+(f.fix?`<div class="sec-au-fix">→ ${esc(f.fix)}</div>`:'')+
             `<div class="sec-au-a">`+(f.basis?`<button class="sec-mini" data-a="openreg" data-reg="${esc(f.basis.reg)}" data-art="${esc(f.basis.art||'')}" data-q="${esc(f.basis.q||'')}">📖 ${esc(basisLabel(f.basis))}</button>`:(f.source==='ai'?'<span class="sec-sub">근거 조문 없음 — 참고만 하세요</span>':''))+
-            `<button class="sec-mini ${done?'':'primary'}" data-a="auack" data-id="${esc(f.id)}">${done?'↩ 되돌리기':'✓ 확인·조치함'}</button></div></div>`; }).join('')+`</div>`
+            (no?'':`<button class="sec-mini ${done?'':'primary'}" data-a="auack" data-id="${esc(f.id)}">${done?'↩ 되돌리기':'✓ 확인·조치함'}</button>`)+
+            // AI 지적은 사람이 '맞지 않음'도 고를 수 있다 — 버린 지적도 AI 결과 기록에 남는다
+            (f.source==='ai'&&!done?`<button class="sec-mini" data-a="audis" data-id="${esc(f.id)}" title="원문과 대조해 보니 이 건에 맞지 않는 지적">${no?'↩ 되돌리기':'✕ 해당 없음'}</button>`:'')+`</div></div>`; }).join('')+`</div>`
       :`<div class="sec-rc-ck ok">✓ ${esc(a.at)} 감사에서 걸리는 항목이 없습니다.${a.ai_used&&a.summary?' '+esc(a.summary):''}</div>`);
   }
   return `<div class="sec-card sec-audit"><div class="sec-card-h">🔍 결재 전 사전 감사 ${intro}</div>${body}<div class="sec-row">${btn}<span class="sec-sub">감사는 결재를 대신하지 않습니다. 지적의 📖 근거를 열어 원문을 확인하세요.</span></div></div>`;
@@ -2086,7 +2304,7 @@ function canShare(ignoreAvail){ return (ignoreAvail||S.insights.available) && _l
 function shareToggle(){
   if(!S.insights.available) return '';
   const on=canShare();
-  return `<div class="sec-share"><span>👥 <b>기관 집단 지식</b> — 완료한 건의 처리 일수·기한을 넘긴 단계·감사 항목 종류를 <b>익명 숫자로만</b> 기관 통계에 보탭니다. 이름·금액·메모·초안·영수증은 보내지 않습니다.</span>`+
+  return `<div class="sec-share"><span>👥 <b>기관 집단 지식</b> — 완료한 건의 처리 일수·기한을 넘긴 단계·감사 항목 종류와, AI 결과를 사람이 확인·고침·버린 횟수를 <b>익명 숫자로만</b> 기관 통계에 보탭니다. 이름·금액·메모·초안·영수증은 보내지 않습니다.</span>`+
     `<button class="sec-btn sm ${on?'':'primary'}" data-a="sharetg" aria-pressed="${on}">${on?'기여 중 — 끄기':'꺼짐 — 켜기'}</button></div>`;
 }
 function caseFacts(c, p){

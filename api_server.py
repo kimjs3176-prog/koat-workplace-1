@@ -2458,7 +2458,8 @@ def _secretary_org_save():
         drafts[k] = {"title": _sec_clean_str(d.get("title"), 60) or k,
                      "template": _sec_clean_str(d.get("template"), 4000),
                      "fields": [{"k": _sec_clean_str(f.get("k"), 24), "l": _sec_clean_str(f.get("l"), 40),
-                                 "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {})}
+                                 "ph": _sec_clean_str(f.get("ph"), 80), **({"multi": True} if f.get("multi") else {}),
+                                 **({"ai": True} if f.get("ai") else {})}
                                 for f in (d.get("fields") or [])[:20] if isinstance(f, dict) and f.get("k")]}
     data = {"version": 1, "layer": "org", "updated": _sec_stamp_now(),
             "updated_by": _sec_clean_str(body.get("editor"), 40),
@@ -2812,6 +2813,94 @@ def secretary_ai_receipt():
         "confidence": data.get("confidence") if data.get("confidence") in ("high", "medium", "low") else "low",
     }
     return jsonify({"success": True, "receipt": rc, "provider": _sec_ai_provider()})
+
+
+# ── AI 문서 초안(한 칸) — 이 건의 자료(메모·일정·증빙·상황 문장)에 적힌 사실만으로, 줄마다 근거 자료를 달아 쓴다 ──
+#   검증: 줄마다 근거 자료 번호가 있어야 하고, 줄의 숫자는 근거 자료(또는 이미 적은 칸)에 있어야 하며, 줄의 내용 말(틀 말 제외) 60% 이상이 근거 자료에 있어야 한다.
+#   확인되지 않은 줄은 채우지 않고 따로 보여 준다. 채운 내용은 사람이 고치고 '확인'해야 문서로 나간다(화면).
+_SEC_DRAFT_SYSTEM = (
+    "당신은 한국 공공기관 직원의 업무 문서 작성을 돕습니다. 주어진 '자료'(메모·일정·증빙·상황 문장)에 실제로 적힌 사실만으로 "
+    "문서의 한 칸(예: 출장결과보고서의 주요 내용)을 공문 문체의 짧은 줄로 정리합니다. "
+    "줄마다 그 내용을 가져온 자료 번호(src)를 반드시 붙이고, 자료에 없는 사람·기관·숫자·날짜·결과를 지어내지 마세요. "
+    "자료로 채울 수 없는 내용은 lines 에 넣지 말고 missing 에 '무엇을 더 적어야 하는지' 짧게 적습니다. "
+    "줄은 '○○ 사업 추진 현황 협의', '△△ 현장 점검 결과 이상 없음 확인'처럼 명사형으로 끝내고, 줄머리 기호(-, ·, 1.)는 붙이지 않습니다."
+)
+_SEC_DRAFT_STRIP = re.compile(r"(했음|하였음|하였다|했다|함|임|됨|하고|하여|해서|에서|으로|에게|까지|부터|이며|과|와|을|를|이|가|은|는|의|에|로|및|도)$")
+# 공문 줄의 틀 말(무엇을 했는지가 아니라 문장 모양) — 근거를 셀 때 빼야 '세종 출장' 한 낱말로 '사업 최종 승인' 같은 줄이 통과하지 않는다
+_SEC_DRAFT_FRAME = {"협의", "논의", "확인", "실시", "진행", "추진", "참석", "참여", "관련", "결과", "내용", "사항", "방문", "보고", "검토",
+                    "요청", "공유", "설명", "예정", "완료", "현황", "계획", "대한", "위한", "통해", "따른", "등", "및", "기타"}
+
+
+def _sec_draft_line_ok(line: str, cited: str, known: str) -> tuple[bool, str]:
+    """AI 초안 한 줄 검증 — (통과, 이유).
+
+    · 줄의 숫자는 모두 근거 자료(또는 이미 적은 칸)에 있어야 한다.
+    · 줄의 '내용 말'(틀 말을 뺀 2자 이상 낱말)의 60% 이상이 근거 자료에 있어야 한다 — 한 낱말만 겹친다고 통과하지 않게.
+    """
+    nums = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", line)}
+    have = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", cited + " " + known)}
+    if nums - have:
+        return False, "근거 자료에 없는 숫자(" + ", ".join(sorted(nums - have))[:40] + ")"
+    flat = re.sub(r"\s+", "", cited + " " + known)
+    words = {_SEC_DRAFT_STRIP.sub("", w) for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", line)}
+    words = {w for w in words if len(w) >= 2 and w not in _SEC_DRAFT_FRAME and not w.isdigit()}
+    if not words:
+        return False, "근거 자료에서 온 내용 말이 없음"
+    hit = [w for w in words if w in flat or (len(w) >= 3 and w[:-1] in flat)]
+    if len(hit) < max(1, -(-len(words) * 3 // 5)):                     # 60% 이상(올림)
+        miss = sorted(set(words) - set(hit))
+        return False, "근거 자료에 없는 말(" + ", ".join(miss)[:40] + ")"
+    return True, ""
+
+
+@app.route("/api/secretary/ai/draft", methods=["POST"])
+def secretary_ai_draft():
+    """{draft, field, fields:{칸 이름: 값}, sources:[{kind, text}]} → {lines:[{text, src, ok, why}], missing, sources}"""
+    if not _sec_ai_provider():
+        return jsonify({"success": False, "need_key": True, "error": "AI 초안이 설정되어 있지 않습니다."}), 503
+    if not _sec_ai_rate_ok():
+        return jsonify({"success": False, "error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요."}), 429
+    body = request.get_json(silent=True) or {}
+    title, field = _sec_clean_str(body.get("draft"), 60), _sec_clean_str(body.get("field"), 40)
+    fields = body.get("fields") if isinstance(body.get("fields"), dict) else {}
+    fields = {_sec_clean_str(k, 40): _sec_clean_str(v, 300) for k, v in list(fields.items())[:12] if _sec_clean_str(v, 300)}
+    srcs = []
+    for x in (body.get("sources") if isinstance(body.get("sources"), list) else [])[:12]:
+        if isinstance(x, dict) and _sec_clean_str(x.get("text"), 1500):
+            srcs.append({"id": f"S{len(srcs) + 1}", "kind": _sec_clean_str(x.get("kind"), 20) or "자료",
+                         "text": _sec_clean_str(x.get("text"), 1500)})
+    if not title or not field:
+        return jsonify({"success": False, "error": "문서와 칸 이름이 필요합니다."}), 400
+    if not srcs:
+        return jsonify({"success": False, "error": "초안을 만들 자료가 없습니다 — 이 건 메모에 한 일·결과를 몇 줄 적거나 일정·증빙을 넣어 주세요."}), 400
+    ids = [x["id"] for x in srcs]
+    schema = {"type": "object", "properties": {
+        "lines": {"type": "array", "items": {"type": "object", "properties": {
+            "text": {"type": "string"}, "src": {"type": "array", "items": {"type": "string", "enum": ids}}},
+            "required": ["text", "src"], "additionalProperties": False}},
+        "missing": {"type": "array", "items": {"type": "string"}}},
+        "required": ["lines", "missing"], "additionalProperties": False}
+    text = (f"[문서] {title}\n[쓸 칸] {field}\n[이미 적은 칸]\n" + ("\n".join(f"- {k}: {v}" for k, v in fields.items()) or "(없음)")
+            + "\n\n[자료]\n" + "\n\n".join(f"[{x['id']}] ({x['kind']})\n{x['text']}" for x in srcs))
+    try:
+        data = _sec_ai_json(_SEC_DRAFT_SYSTEM, text, schema)
+    except _SecAIError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    by = {x["id"]: x for x in srcs}
+    known = " ".join(fields.values())
+    lines = []
+    for ln in (data.get("lines") or [])[:10]:
+        if not isinstance(ln, dict):
+            continue
+        t = re.sub(r"^\s*(?:[-·•○□*]|\d+[.)])\s*", "", _sec_clean_str(ln.get("text"), 200))
+        src = [i for i in dict.fromkeys(ln.get("src") or []) if i in by]
+        if not t:
+            continue
+        ok, why = _sec_draft_line_ok(t, " ".join(by[i]["text"] for i in src), known) if src else (False, "근거 자료 표시 없음")
+        lines.append({"text": t, "src": src, "ok": ok, "why": why})
+    return jsonify({"success": True, "lines": lines,
+                    "missing": [_sec_clean_str(m, 120) for m in (data.get("missing") or [])[:5] if _sec_clean_str(m, 120)],
+                    "sources": [{"id": x["id"], "kind": x["kind"]} for x in srcs], "provider": _sec_ai_provider()})
 
 
 _SEC_UNDERSTAND_SYSTEM = (
@@ -3762,16 +3851,88 @@ def _sec_kv(cmds: list) -> list:
         return out
 
 
-def _sec_ins_rate_ok() -> bool:
+def _sec_ins_rate_ok(store: dict | None = None, limit: int = 60) -> bool:
+    store = _SEC_INS_HITS if store is None else store
     ip = _client_ip()
     now = time.time()
-    hits = [t for t in _SEC_INS_HITS.get(ip, []) if now - t < 3600]
-    if len(hits) >= 60:
-        _SEC_INS_HITS[ip] = hits
+    hits = [t for t in store.get(ip, []) if now - t < 3600]
+    if len(hits) >= limit:
+        store[ip] = hits
         return False
-    _SEC_INS_HITS[ip] = hits + [now]
-    _rate_prune(_SEC_INS_HITS, 3600)
+    store[ip] = hits + [now]
+    _rate_prune(store, 3600)
     return True
+
+
+# ── AI 산출물 기록 — AI 가 만든 결과(영수증 인식·감사 지적·보고서 초안)를 사람이 어떻게 처리했는지 월별 익명 숫자로 ──
+#   made(만듦) · ok(확인 후 그대로) · edited(고쳐서) · rejected(버림). 확인 대기 = made − ok − edited − rejected.
+#   output 은 문서 산출물(복사·한글·ERP 넣기)을 낸 횟수 — ai(AI 결과가 들어간 문서) · plain(AI 결과 없음).
+#   기관 사무실은 한 IP 로 나가는 일이 많아 사건 기록보다 넉넉히(시간당 300) 받는다. 로그인 없는 익명 기록이므로
+#   숫자는 '담당자 화면이 보낸 자기 보고'이다 — 한 요청의 크기와 속도만 막고, 정확한 실적은 처리 이력(건별 기록)으로 확인한다.
+_SEC_AI_KINDS = {"receipt": ("made", "ok", "edited", "rejected"), "audit": ("made", "ok", "edited", "rejected"),
+                 "draft": ("made", "ok", "edited", "rejected"), "output": ("plain", "ai")}
+_SEC_AIEV_HITS: dict = {}
+
+
+def _sec_ai_month() -> str:
+    return datetime.now(_KST).strftime("%Y-%m")
+
+
+def _sec_ai_event(b: dict):
+    """{type:'ai', kind, st, prev?, n?} → 이번 달 숫자. prev 는 사람이 판단을 바꿨을 때(확인 → 되돌리기 등) 앞 상태를 하나 뺀다."""
+    if not _sec_ins_rate_ok(_SEC_AIEV_HITS, 300):
+        return jsonify({"success": False, "error": "요청이 너무 많습니다."}), 429
+    kind, st, prev = str(b.get("kind") or ""), str(b.get("st") or ""), str(b.get("prev") or "")
+    allowed = _SEC_AI_KINDS.get(kind)
+    if not allowed or (st not in allowed and st != "pending") or (prev and (prev not in allowed or prev == "made")):
+        return jsonify({"success": False, "error": "kind·st 가 올바르지 않습니다."}), 400
+    # 한 번에 여러 건은 감사 한 번의 AI 지적 수(최대 12)까지만 — 익명 기록이라 한 요청으로 숫자를 크게 부풀리지 못하게
+    n = _sec_int(b.get("n"), 1, 1, 12) if kind == "audit" and st == "made" else 1
+    # 판단(확인·고침·버림·되돌리기)은 그 결과를 만든 달에 센다 — 다음 달에 확인해도 만든 달의 '대기'가 줄도록.
+    # 화면이 보낸 달은 이번 달부터 2년 안일 때만 받는다(엉뚱한 달 숫자를 만들지 않게)
+    month, now = str(b.get("month") or ""), _sec_ai_month()
+    y, m_ = (int(now[:4]), int(now[5:]))
+    oldest = f"{y - 2:04d}-{m_:02d}"
+    if not (re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month) and oldest <= month <= now):
+        month = now
+    key = f"sec:ai:{month}"
+    cmds = [["HINCRBY", key, f"{kind}:{st}", n]] if st != "pending" else []
+    if prev:
+        cmds.append(["HINCRBY", key, f"{kind}:{prev}", -1])
+    if not cmds:
+        return jsonify({"success": True})
+    try:
+        _sec_kv(cmds)
+    except Exception as e:
+        print(f"[secretary] AI 산출물 기록 실패: {e}")
+        return jsonify({"success": False, "error": "기록하지 못했습니다."}), 502
+    return jsonify({"success": True})
+
+
+def _sec_ai_month_summary(h: dict) -> dict:
+    h = {k: int(v) for k, v in (h or {}).items() if str(v).lstrip("-").isdigit()}
+    out = {}
+    for kind, sts in _SEC_AI_KINDS.items():
+        out[kind] = {s: max(0, h.get(f"{kind}:{s}", 0)) for s in sts}
+        if "made" in sts:
+            o = out[kind]
+            o["pending"] = max(0, o["made"] - o["ok"] - o["edited"] - o["rejected"])
+    return out
+
+
+@app.route("/api/secretary/insights/ai")
+def secretary_insights_ai():
+    """AI 산출물 월별 보고(관리 화면) — 최근 12개월."""
+    if not _sec_ins_backend():
+        return jsonify({"success": True, "available": False})
+    try:
+        keys = sorted((k for k in (_sec_kv([["KEYS", "sec:ai:*"]])[0] or []) if re.match(r"^sec:ai:\d{4}-\d{2}$", k)), reverse=True)[:12]
+        res = _sec_kv([["HGETALL", k] for k in keys]) if keys else []
+    except Exception as e:
+        print(f"[secretary] AI 산출물 보고 조회 실패: {e}")
+        return jsonify({"success": True, "available": False, "error": "저장소에 연결하지 못했습니다."})
+    return jsonify({"success": True, "available": True, "backend": _sec_ins_backend(),
+                    "months": [{"month": k[7:], **_sec_ai_month_summary(h)} for k, h in zip(keys, res)]})
 
 
 _SEC_PII = [(re.compile(r"(?<!\d)\d{2,3}[-. ]?\d{3,4}[-. ]?\d{4}(?!\d)"), "○○○"),             # 전화번호
@@ -3794,9 +3955,12 @@ def _sec_pid_ok(pid: str) -> bool:
 
 @app.route("/api/secretary/insights/event", methods=["POST"])
 def secretary_insights_event():
-    """익명 사건 기록. {type:'done'|'reject', procedure, days?, late?:[단계], ontime?:[단계], audit?:[종류], text?}"""
+    """익명 사건 기록. {type:'done'|'reject', procedure, days?, late?:[단계], ontime?:[단계], audit?:[종류], text?}
+    또는 AI 산출물 기록 {type:'ai', kind, st, prev?, n?}(절차와 상관없이 월별 숫자)."""
     if not _sec_ins_backend():
         return jsonify({"success": False, "error": "집단 지식 저장소가 설정되지 않았습니다."}), 503
+    if (request.get_json(silent=True) or {}).get("type") == "ai":
+        return _sec_ai_event(request.get_json(silent=True) or {})
     if not _sec_ins_rate_ok():
         return jsonify({"success": False, "error": "요청이 너무 많습니다."}), 429
     b = request.get_json(silent=True) or {}
