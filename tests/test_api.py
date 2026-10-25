@@ -392,3 +392,33 @@ def test_ai_report_check_is_atomic_under_concurrent_requests(monkeypatch, tmp_pa
     assert sorted(codes) == [200] + [409] * 9
     with app.test_client() as c:
         assert c.get("/api/secretary/insights/ai").get_json()["months"][0]["draft"]["ok"] == 1
+
+
+def test_ai_report_rejects_prev_on_made_and_output(client, monkeypatch, tmp_path):
+    # '만듦'·낸 문서 기록에 prev 를 붙여 숫자를 음수로 만들거나 검사를 건너뛰는 요청은 받지 않는다
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
+    assert ev(kind="draft", st="made", prev="rejected").status_code == 400
+    assert ev(kind="output", st="plain", prev="ai").status_code == 400
+    assert ev(kind="draft", st="ok").status_code == 409                       # 여전히 만든 것 없이 확인은 불가
+    d = client.get("/api/secretary/insights/ai").get_json()
+    assert d["months"] == [] or all(v >= 0 for m in d["months"] for k in ("draft", "output") for v in m[k].values())
+
+
+def test_audit_survives_malformed_ai_basis_and_receipt_rejects_impossible_date(client, monkeypatch):
+    monkeypatch.setattr(api_server, "_sec_ai_provider", lambda: "claude")
+    monkeypatch.setattr(api_server, "_sec_ai_rate_ok", lambda: True)
+    proc = json.loads(json.dumps(api_server._sec_read_json(api_server.SEC_COMMON_PATH, {})["procedures"][0]))
+    monkeypatch.setattr(api_server, "_sec_ai_json", lambda *a, **k: {"summary": "", "findings": [
+        {"severity": "high", "title": "근거 칸이 목록", "detail": "", "basis": ["x"], "fix": ""}]})
+    r = client.post("/api/secretary/audit", json={"procedure": proc, "case": {"dates": {"start": "2026-01-01"}}, "ai": True, "today": "2026-10-25"})
+    d = r.get_json()
+    assert r.status_code == 200 and d["ai_used"]
+    ai = [f for f in d["findings"] if f["source"] == "ai"]
+    assert ai[0]["basis"] is None and ai[0]["severity"] == "low"                 # 근거 없는 지적은 참고로
+    monkeypatch.setattr(api_server, "_sec_ai_json", lambda *a, **k: {"date": "2026-13-45", "end_date": "2026-02-30", "amount": 1000})
+    import base64
+    png = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+    rc = client.post("/api/secretary/ai/receipt", json={"image": png}).get_json()["receipt"]
+    assert rc["date"] == "" and rc["end_date"] == ""

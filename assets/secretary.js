@@ -326,6 +326,16 @@ function normCase(c){
       lines:(Array.isArray(v.lines)?v.lines:[]).slice(0,10).filter(l=>l&&typeof l==='object').map(l=>({text:str(l.text,200), src:(Array.isArray(l.src)?l.src:[]).slice(0,6).map(x=>str(x,8)), ok:!!l.ok, why:str(l.why,80)})),
       sources:(Array.isArray(v.sources)?v.sources:[]).slice(0,12).filter(x=>x&&typeof x==='object').map(x=>({id:str(x.id,8), kind:str(x.kind,20)}))}])),
     outs:(Array.isArray(c.outs)?c.outs:[]).slice(-50).filter(x=>x&&D.test(x.at||'')).map(x=>({at:x.at, key:str(x.key,40), ai:!!x.ai})),
+    // 사전 감사 결과(사람 판단 포함) — 인계받은 사람이 앞 담당자의 확인·해당 없음을 보고, 다시 감사해도 두 번 세지 않게
+    ...(c.audit&&typeof c.audit==='object'&&Array.isArray(c.audit.findings)?{audit:(a=>{ const ids=new Set();
+      const findings=a.findings.slice(0,40).filter(f=>f&&typeof f==='object'&&str(f.id,60)&&!ids.has(f.id)&&ids.add(f.id)).map(f=>({id:str(f.id,60),
+        severity:['high','medium','low'].includes(f.severity)?f.severity:'low', title:str(f.title,120), detail:str(f.detail,400), fix:str(f.fix,200),
+        source:f.source==='ai'?'ai':'rule', ...(D.test(f.at||'')?{at:f.at}:{}),
+        basis:f.basis&&typeof f.basis==='object'?Object.fromEntries(['reg','art','q'].filter(k=>f.basis[k]).map(k=>[k,str(f.basis[k],80)])):null}));
+      const flags2=o=>Object.fromEntries(Object.entries(obj(o)).filter(([k,v])=>v&&ids.has(k)).map(([k])=>[k,true]));
+      const order={high:0,medium:1,low:2}, counts={high:0,medium:0,low:0}; findings.forEach(f=>counts[f.severity]++);
+      return {at:D.test(a.at||'')?a.at:today(), sig:str(a.sig,20), findings:findings.sort((x,y)=>order[x.severity]-order[y.severity]), counts,
+        summary:str(a.summary,300), ai_used:!!a.ai_used, ai_error:str(a.ai_error,200), ack:flags2(a.ack), dis:flags2(a.dis)}; })(c.audit)}:{}),
     datesAi:Object.fromEntries(Object.entries(obj(c.datesAi)).filter(([,v])=>Array.isArray(v)).slice(0,6).map(([k,v])=>[String(k).slice(0,40), v.slice(0,20).map(x=>str(x,40))]))};
 }
 // 같은 절차의 진행 건 중 이번 기준일과 어긋나지 않는 건은 이어서 쓴다(같은 물음을 다시 해도 건이 늘지 않게) —
@@ -1137,7 +1147,7 @@ function openDraft(key){
   // ('이력에 저장'을 누르지 않고 닫았어도 AI 초안 글은 칸에 되살린다 — 확인 대기 표시만 남고 글이 빠진 채 확인·반출되지 않게)
   const ai={}; const da=c&&(c.draftAi||{})[key];
   if(da&&da.k&&da.st!=='rejected'){ ai[da.k]={text:da.text||'', st:da.st, at:da.at, ...(typeof da.prev==='string'?{prev:da.prev}:{}), lines:da.lines||null, sources:da.sources||[]};
-    if(saved[da.k]===undefined && da.text) vals[da.k]=da.text; }
+    if(da.text && (saved[da.k]===undefined || (da.st==='pending' && typeof da.prev==='string' && saved[da.k]===da.prev))) vals[da.k]=da.text; }
   const me=S._draft={key, vals, rv, av, ai, cid:c?c.id:null, lastOut:null};
   const fl=k=>((d.fields||[]).find(f=>f.k===k)||{}).l||k;
   const aiBtn=f=>f.ai&&f.multi?(aiOn()?`<button class="sec-mini primary" type="button" data-da="aidraft" data-k="${esc(f.k)}" title="이 건 메모·일정·증빙에 적힌 사실로만 줄을 만들고 줄마다 근거 자료를 붙입니다">✦ AI 초안</button>`
@@ -1165,7 +1175,10 @@ function openDraft(key){
         lines:(x.lines||[]).slice(0,10).map(l=>({text:String(l.text||'').slice(0,200), src:(l.src||[]).slice(0,6), ok:!!l.ok, why:String(l.why||'').slice(0,80)})),
         sources:(x.sources||[]).slice(0,12)}; }); };
   const norm=t=>String(t||'').replace(/\s+/g,' ').trim();
-  const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return; x.st=norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st, null, 1, x.at); persist(fk); };
+  // 지금 칸에 AI가 쓴 줄이 하나라도 남아 있는지 — 다 바꿔 썼으면 AI 결과를 쓴 것이 아니다
+  const aiLeft=(fk,x)=>{ const cur=norm(me.vals[fk]); return String(x.text||'').split('\n').map(norm).some(l=>l.length>=4 && cur.includes(l)); };
+  const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return;
+    x.st=!aiLeft(fk,x)?'rejected':norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st, null, 1, x.at); persist(fk); };
   const confirmRc=rids=>{ if(!me.cid||!rids.length) return; updateCaseById(me.cid, cc=>{ receipts(cc).filter(r=>rids.includes(r.id)).forEach(r=>setReceiptAi(r,'confirm'));
     const have=new Set(receipts(cc).map(r=>r.id));                     // 지워진 영수증에서 온 날짜는 사람이 확인했으니 출처 표시만 지운다
     Object.keys(cc.datesAi||{}).forEach(k=>{ cc.datesAi[k]=(cc.datesAi[k]||[]).filter(id=>have.has(id)||!rids.includes(id)); if(!cc.datesAi[k].length) delete cc.datesAi[k]; }); }); };
@@ -1183,13 +1196,14 @@ function openDraft(key){
     el.innerHTML=`<div class="sec-sub">✓ 사람이 확인한 AI 초안${x.st==='edited'?'(고쳐 씀)':''}</div>`; };
   const refreshAi=()=>{ const pend=rcFields(true), used=rcFields(false);
     body.querySelectorAll('[data-tag]').forEach(t=>{ const k=t.dataset.tag, x=me.ai[k];
-      const txt=pend.some(y=>y.f.k===k)?'✦ AI 인식값 · 확인 대기':used.some(y=>y.f.k===k)?'✓ AI 인식값 · 사람 확인':x&&x.st==='pending'?'✦ AI 초안 · 확인 대기':x&&(x.st==='ok'||x.st==='edited')?'✓ AI 초안 · 사람 확인':'';
+      const txt=pend.some(y=>y.f.k===k)?'✦ AI 인식값 · 확인 대기':used.some(y=>y.f.k===k)?'✓ AI 인식값 · 사람 확인':x&&x.st==='pending'&&aiLeft(k,x)?'✦ AI 초안 · 확인 대기':x&&(x.st==='ok'||x.st==='edited')&&aiLeft(k,x)?'✓ AI 초안 · 사람 확인':'';
       t.hidden=!txt; t.textContent=txt; t.classList.toggle('wait', /대기/.test(txt)); });
     const box=document.getElementById('secDraftAi'); if(!box) return;
     box.innerHTML=pend.length?`<div class="sec-rc-ck warn">✦ AI가 영수증에서 읽은 값이 아직 확인되지 않았습니다(${pend.map(y=>esc(y.f.l)).join(' · ')}). 영수증과 대조했으면 <button class="sec-mini primary" type="button" data-da="airc">✓ 증빙 값 확인함</button></div>`:''; };
   // 문서로 내보내기 전 — 확인 대기인 AI 결과가 들어 있으면 한 번 더 확인을 받고, 낸 문서를 기록한다
   const gate=()=>{
     Object.entries(me.ai).forEach(([fk,x])=>{ if(x&&x.st==='ok'&&norm(me.vals[fk])!==norm(x.text)){ x.st='edited'; aiEvent('draft','edited','ok', 1, x.at); persist(fk); } });
+    Object.entries(me.ai).forEach(([fk,x])=>{ if(x&&x.st==='pending'&&!aiLeft(fk,x)) aiOk(fk); });   // AI 줄이 하나도 안 남았으면 '버림'으로
     const pend=rcFields(true).map(y=>({label:`${y.f.l}: ${String(me.vals[y.f.k]||'').slice(0,40)} — AI 영수증 인식`, rids:y.rids}))
       .concat(Object.entries(me.ai).filter(([,x])=>x&&x.st==='pending').map(([fk])=>({label:`${fl(fk)} — AI 초안`, fk})));
     if(pend.length){
@@ -1200,7 +1214,6 @@ function openDraft(key){
     const sent=fillTemplate(d.template, me.vals);
     if(sent!==me.lastOut){ me.lastOut=sent;
       // AI 초안은 지금 칸에 AI가 쓴 줄이 하나라도 남아 있을 때만 'AI가 들어간 문서'로 센다(사람이 다 바꿔 썼으면 아님)
-      const aiLeft=(fk,x)=>{ const cur=norm(me.vals[fk]); return String(x.text||'').split('\n').map(norm).some(l=>l.length>=4 && cur.includes(l)); };
       const hasAi=Object.entries(me.ai).some(([fk,x])=>x&&(x.st==='ok'||x.st==='edited')&&aiLeft(fk,x)) || rcFields(false).length>0;
       aiEvent('output', hasAi?'ai':'plain');
       if(me.cid) updateCaseById(me.cid, cc=>{ (cc.outs=cc.outs||[]).push({at:today(), key, ai:hasAi}); cc.outs=cc.outs.slice(-50); }); }
@@ -1231,7 +1244,8 @@ function openDraft(key){
     }catch(e){ if(S._draft===me){ me.ai[fk]=prior; toast(e.message||'AI 초안을 만들지 못했습니다.', 4200); } }
     panel(fk); refreshAi(); };
   body.querySelectorAll('[data-dk]').forEach(el=>el.addEventListener('input',()=>{ me.vals[el.dataset.dk]=el.value; out(); refreshAi(); }));
-  body.addEventListener('change', e=>{ const el=e.target; if(el.dataset.da!=='ffile') return; const f=el.files&&el.files[0]; el.value=''; if(f) formsUpload(key, d, f); });
+  // 서식 파일을 올려 바로 채우는 것도 문서를 내는 일 — 확인 대기 AI 결과가 있으면 한 번 더 묻고 낸 문서로 기록한다
+  body.addEventListener('change', e=>{ const el=e.target; if(el.dataset.da!=='ffile') return; const f=el.files&&el.files[0]; el.value=''; if(f && gate()) formsUpload(key, d, f); });
   body.addEventListener('click', e=>{ const b=e.target.closest('[data-da]'); if(!b) return; const da=b.dataset.da;
     if(['copy','erp','hwpx','txt','fgen','fgian','fmine'].includes(da) && !gate()) return;
     const txt=fillTemplate(d.template, me.vals);
@@ -1249,6 +1263,8 @@ function openDraft(key){
     // 버리기: AI 초안 앞의 내용으로 되돌린다(앞 내용을 모르는 옛 기록이면 칸을 비운다 — AI 글이 남은 채 'AI 없음'으로 나가지 않게)
     else if(da==='aino'){ const fk=b.dataset.k, x=me.ai[fk]; if(!x) return;
       const back=typeof x.prev==='string'?x.prev:''; me.vals[fk]=back; { const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=back; } out();
+      // 이력에 저장해 둔 초안 값도 앞 내용으로 — 저장 없이 닫았다 다시 열 때 버린 AI 글이 표시 없이 되살아나지 않게
+      if(me.cid) updateCaseById(me.cid, cc=>{ if(cc.drafts&&cc.drafts[key]&&fk in cc.drafts[key]) cc.drafts[key][fk]=back; });
       const was=x.st; x.st='rejected'; aiEvent('draft','rejected', was, 1, x.at); persist(fk); panel(fk); refreshAi(); if(S.view==='proc') render(); }
     else if(da==='airc'){ confirmRc([...new Set(rcFields(true).flatMap(y=>y.rids))]); refreshAi(); if(S.view==='proc') render(); toast('영수증 인식값을 확인한 것으로 기록했습니다.'); }
     // 초안 창을 연 건에 저장한다(그사이 확장 패널이 다른 ERP 화면의 건으로 넘어가도 섞이지 않게)
@@ -1434,6 +1450,7 @@ function bind(panel){
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id);
           if(r&&r.ai&&(r.aiSt||'pending')==='pending'){ aiLogPush(c, 'receipt', 'rejected', r.vendor||r.name); aiEvent('receipt','rejected', null, 1, r.aiAt); }
+          else if(r&&r.ai) aiLogPush(c, 'receipt', r.aiSt, r.vendor||r.name, r.aiAt);   // 확인한 AI 결과는 지워도 이 건 기록에 남긴다(이미 문서로 나갔을 수 있음)
           c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id);
           // 이 영수증에서 온 기준일: 사람이 확인하기 전이면 날짜도 비운다(확인 안 된 AI 날짜가 출처 없이 문서로 나가지 않게), 확인했으면 출처 표시만 지운다
           const pend=r&&r.ai&&(r.aiSt||'pending')==='pending', cleared=[];
@@ -2204,7 +2221,8 @@ async function runAudit(){
     updateCaseById(id, x=>{
       // AI 지적 id 는 순서(ai-0, ai-1…)라 다시 감사하면 다른 지적이 같은 id 를 받을 수 있다 — 같은 id·같은 제목일 때만 같은 지적으로 이어받는다
       const old=x.audit, oldF=(old&&old.findings)||[];
-      const same=f=>{ const o=oldF.find(g=>g.id===f.id); return !!o && (f.source!=='ai' || (o.source==='ai' && o.title===f.title)); };
+      const sameT=(a,b)=>String(a||'').replace(/\s+/g,'')===String(b||'').replace(/\s+/g,'');   // 서버 id 와 같게 띄어쓰기는 보지 않는다
+      const same=f=>{ const o=oldF.find(g=>g.id===f.id); return !!o && (f.source!=='ai' || (o.source==='ai' && sameT(o.title, f.title))); };
       const keepIds=new Set(d.findings.filter(same).map(f=>f.id));
       // 사라지거나 다른 지적으로 바뀐 앞 AI 지적은 기록으로 옮긴다 — 확인 대기였으면 쓰이지 않은 것('버림')으로(기관 숫자에 대기로 남지 않게)
       oldF.filter(f=>f.source==='ai' && !keepIds.has(f.id)).forEach(f=>{ const st=auditSt(old, f.id), at=f.at||old.at;

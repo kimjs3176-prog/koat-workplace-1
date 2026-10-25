@@ -2798,7 +2798,10 @@ def secretary_ai_receipt():
     # 응답 정리: 날짜 형식·금액 범위·열거값을 다시 확인한다(AI 출력은 데이터로만 다룬다)
     def _d(v):
         v = str(v or "").strip()
-        return v if re.match(r"^\d{4}-\d{2}-\d{2}$", v) else ""
+        try:                                   # 형식만이 아니라 실제 있는 날짜인지(13월·45일 같은 잘못 읽은 값은 비움)
+            return datetime.strptime(v, "%Y-%m-%d").strftime("%Y-%m-%d") if re.match(r"^\d{4}-\d{2}-\d{2}$", v) else ""
+        except ValueError:
+            return ""
     def _i(v, hi):
         try:
             return max(0, min(hi, int(v)))
@@ -3445,7 +3448,8 @@ def secretary_audit():
                 for i, f in enumerate((data.get("findings") or [])[:12]):
                     if not isinstance(f, dict) or not _sec_clean_str(f.get("title")):
                         continue
-                    b = by_name.get(f.get("basis"))
+                    basis = f.get("basis")
+                    b = by_name.get(basis) if isinstance(basis, str) else None   # 근거 칸 형식이 틀려도 감사 전체를 멈추지 않고 그 지적만 '근거 없음'으로
                     sev = f.get("severity") if f.get("severity") in ("high", "medium", "low") else "low"
                     if not b:
                         sev = "low"                     # 근거 조문이 없는 지적은 참고 수준으로만
@@ -3891,7 +3895,9 @@ def _sec_ai_event(b: dict):
         return jsonify({"success": False, "error": "요청이 너무 많습니다."}), 429
     kind, st, prev = str(b.get("kind") or ""), str(b.get("st") or ""), str(b.get("prev") or "")
     allowed = _SEC_AI_KINDS.get(kind)
-    if not allowed or (st not in allowed and st != "pending") or (prev and (prev not in allowed or prev == "made")):
+    # prev(앞 판단 빼기)는 판단을 바꿀 때만 — '만듦'·낸 문서 기록에 붙여 숫자를 음수로 만들거나 검사를 건너뛰지 못하게
+    if not allowed or (st not in allowed and st != "pending") or (prev and (prev not in allowed or prev == "made"
+                                                                             or st == "made" or "made" not in allowed)):
         return jsonify({"success": False, "error": "kind·st 가 올바르지 않습니다."}), 400
     # 한 번에 여러 건은 감사 한 번의 AI 지적 수(최대 12)까지만 — 익명 기록이라 한 요청으로 숫자를 크게 부풀리지 못하게
     n = _sec_int(b.get("n"), 1, 1, 12) if kind == "audit" and st == "made" else 1
