@@ -20,8 +20,15 @@ def main():
     ap.add_argument("--version", default="", help="버전(예: 1.0.1)")
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
     a = ap.parse_args()
+    # 기관 설정의 ERP 화면 규칙(바탕 묶음 + 기관 맞춤)도 넣는다 — 웹 화면에서 받는 zip 과 같게(서버에 닿기 전에도 동작)
     try:
-        data, man = build_zip(a.server, a.erp, a.name, a.version)
+        from api_server import _sec_erp_profile
+        profile = _sec_erp_profile()
+    except Exception as e:  # noqa: BLE001 — 규칙 없이도 기본 규칙으로 동작하므로 알리고 계속
+        print(f"! 기관 ERP 화면 규칙을 읽지 못해 기본 규칙만 넣습니다: {e}", file=sys.stderr)
+        profile = None
+    try:
+        data, man = build_zip(a.server, a.erp, a.name, a.version, profile=profile)
     except ValueError as e:
         raise SystemExit(str(e))
     os.makedirs(a.out, exist_ok=True)

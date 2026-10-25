@@ -106,9 +106,10 @@ chrome.windows.onFocusChanged.addListener((id) => { if (winType[id] === "normal"
 
 // 패널 열기(+ 물을 말). ERP 가 띄운 작은 창(팝업)에는 옆 패널이 없으므로 원래 창의 옆 패널에서 연다.
 // 주의: sidePanel.open 앞에 await 를 두면 클릭(사용자 동작)으로 인정되지 않아 열리지 않는다.
-function openPanel(tab, q, kind) {
+// hint: 창 종류를 아직 모를 때(워커가 막 깨어남) 내용 스크립트가 알려 준 '팝업 창인지'
+function openPanel(tab, q, kind, hint) {
   if (q) chrome.storage.session.set({ pendingAsk: { tabId: tab.id, q, ts: Date.now(), kind: kind || "" } }).catch(() => {});
-  const popup = winType[tab.windowId] && winType[tab.windowId] !== "normal";
+  const popup = tab.windowId in winType ? winType[tab.windowId] !== "normal" : !!hint;
   const panelWin = popup && lastNormalWin != null ? lastNormalWin : tab.windowId;
   const opened = PANEL_FALLBACK ? panelWindow(tab)
     : chrome.sidePanel.open(popup && lastNormalWin != null ? { windowId: lastNormalWin } : { tabId: tab.id })
@@ -137,7 +138,8 @@ const hostMatch = (pat, url) => {
   try {
     const u = new URL(url); const m = String(pat).match(/^(\*|https?):\/\/([^/]+)/); if (!m) return false;
     if (m[1] !== "*" && m[1] + ":" !== u.protocol) return false;
-    const h = m[2].toLowerCase(), host = u.host.toLowerCase();
+    // 주소 규칙에 포트가 없으면 포트와 상관없이 맞춘다(Chrome 주소 규칙과 같게 — https://erp.x.kr:8443 도 'https://erp.x.kr/*')
+    const h = m[2].toLowerCase(), host = (h.includes(":") ? u.host : u.hostname).toLowerCase();
     return h.startsWith("*.") ? host === h.slice(2) || host.endsWith(h.slice(1)) : h === host;
   } catch (e) { return false; }
 };
@@ -229,6 +231,9 @@ async function notifyDue() {
   if (notified === key) return;                          // 같은 날 같은 목록은 한 번만
   await chrome.storage.local.set({ notified: key });
   const over = items.filter((x) => x.date < today);
+  // 한 건의 기한뿐이면 알림을 눌렀을 때 그 건을 바로 연다(여러 건이면 업무 달력)
+  const ids = [...new Set(items.map((x) => x.caseId))];
+  await chrome.storage.local.set({ notifyCase: ids.length === 1 && !String(ids[0]).startsWith("sch:") ? ids[0] : "" });
   chrome.notifications.create("sec-due", {
     type: "list", iconUrl: "icons/128.png", priority: 1,
     title: over.length ? `서무비서 — 기한 지난 일 ${over.length}건` : `서무비서 — 오늘·내일 기한 ${items.length}건`,
@@ -237,9 +242,11 @@ async function notifyDue() {
   });
 }
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === "sec-due") { updateBadge(); notifyDue(); getMeta(); } });
-chrome.notifications.onClicked.addListener(async () => {
+chrome.notifications.onClicked.addListener(async (id) => {
+  chrome.notifications.clear(id).catch(() => {});
   const { server } = await settings();
-  if (server) chrome.tabs.create({ url: server + "/?view=cal" });
+  const { notifyCase } = await chrome.storage.local.get("notifyCase");
+  if (server) chrome.tabs.create({ url: server + (notifyCase ? "/?case=" + encodeURIComponent(notifyCase) : "/?view=cal") });
 });
 function ensureAlarm() { chrome.alarms.create("sec-due", { periodInMinutes: 60, delayInMinutes: 1 }); }
 chrome.runtime.onInstalled.addListener(ensureAlarm);
@@ -247,6 +254,17 @@ chrome.runtime.onStartup.addListener(() => { ensureAlarm(); updateBadge(); });
 
 // ── 주소창: '서무' + 띄어쓰기 + 상황 ────────────────────────────────────
 chrome.omnibox.setDefaultSuggestion({ description: "서무비서에 묻기: %s" });
+// 입력하는 동안 등록 절차 이름을 제안한다(받아 둔 절차 목록만 쓰고 서버에 묻지 않음).
+// 이 이벤트가 쉬던 워커를 Enter 전에 깨워 창 정보(lastNormalWin)를 되살려 두므로, 처음 쓸 때도 웹 탭으로 새지 않는다.
+const omniEsc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
+chrome.omnibox.onInputChanged.addListener((text, suggest) => {
+  const q = String(text || "").replace(/\s+/g, "");
+  if (!q) return;
+  chrome.storage.local.get("meta").then(({ meta }) => {
+    const ps = ((meta && meta.data && meta.data.procedures) || []).filter((p) => p.title && (String(p.title).replace(/\s+/g, "").includes(q) || String(p.q || "").replace(/\s+/g, "").includes(q)));
+    suggest(ps.slice(0, 6).map((p) => ({ content: p.q || p.title, description: omniEsc(`${p.icon || "🗂"} ${p.title}`) })));
+  }).catch(() => {});
+});
 chrome.omnibox.onInputEntered.addListener((text) => {
   const q = String(text || "").trim().slice(0, 200);
   if (!q) return;
@@ -269,10 +287,12 @@ chrome.storage.onChanged.addListener((ch, area) => {
   if (ch.notify) updateBadge().catch(() => {});
   if (ch.guard) {
     const on = ch.guard.newValue !== false;
-    for (const [id, st] of Object.entries(state)) if (st && st.guard) {
-      st.guard.enabled = on; chrome.tabs.sendMessage(Number(id), { type: "guard", guard: st.guard }).catch(() => {});
-    }
-    saveState();
+    stateReady.then(() => {                                // 설정 저장이 워커를 깨웠으면 되살린 상태에 반영해야 한다
+      for (const [id, st] of Object.entries(state)) if (st && st.guard) {
+        st.guard.enabled = on; chrome.tabs.sendMessage(Number(id), { type: "guard", guard: st.guard }).catch(() => {});
+      }
+      saveState();
+    });
   }
 });
 
@@ -369,7 +389,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     }
     });
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
-    openPanel(sender.tab, m.q || "");
+    openPanel(sender.tab, m.q || "", "", m.popup);
   } else if (m.type === "getContext") {                   // 패널이 열릴 때 현재 탭 상태 요청
     stateReady.then(() => chrome.storage.session.get("pendingAsk")).then(({ pendingAsk }) => {
       // 방금 누른 🗂·칩의 물음 — 패널이 다른 탭(예: ERP 팝업 창의 원래 창)에 있어도 10초 안이면 받는다

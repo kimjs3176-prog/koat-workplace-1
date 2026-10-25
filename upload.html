@@ -469,7 +469,7 @@ var _status=null, _names=[], _uploaded=[], _queue=[], _mgmtSelected=new Set(), _
 
 /* ── utilities ── */
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
-  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function fmtSize(n){return n<1024?n+'B':n<1048576?(n/1024).toFixed(1)+'KB':(n/1048576).toFixed(1)+'MB';}
 function $(id){return document.getElementById(id);}
 
@@ -887,10 +887,9 @@ function renderManagement(){
   }
 
   body.innerHTML=list.map(function(u){
-    var slugEnc=encodeURIComponent(u.slug);
     var checked=_mgmtSelected.has(u.slug);
     return '<tr data-slug="'+esc(u.slug)+'">'
-      +'<td data-label=""><input type="checkbox" class="q-check" '+(checked?'checked':'')+' onchange="toggleMgmtItem(\''+esc(u.slug).replace(/'/g,"\\'")+'\',this.checked)"></td>'
+      +'<td data-label=""><input type="checkbox" class="q-check" '+(checked?'checked':'')+' data-slug="'+esc(u.slug)+'"></td>'
       +'<td data-label="구분"><span class="mgmt-cat">'+esc(u.category||'기타')+'</span></td>'
       +'<td data-label="규정명"><div class="mgmt-title">'+esc(u.title)+'</div>'
       +(u.searchable?'':'<span class="no-search">본문 검색 불가</span>')
@@ -902,11 +901,17 @@ function renderManagement(){
       +'<td data-label="작업"><div class="mgmt-acts">'
       +'<a href="'+esc(u.html||'#')+'" target="_blank">전문보기</a>'
       +'<a href="/?reg='+encodeURIComponent(u.title)+'">원문</a>'
-      +'<button onclick="removeUpload(\''+slugEnc+'\',\''+esc(u.title).replace(/'/g,"\\'")+'\')">되돌리기</button>'
+      +'<button type="button" class="mgmt-revert" data-slug="'+esc(u.slug)+'" data-title="'+esc(u.title)+'">되돌리기</button>'
       +'</div></td></tr>';
   }).join('');
   updateBottomBar();
 }
+// 목록의 체크·되돌리기 — 규정명·slug 를 onclick 글자 속에 넣지 않고 data 속성으로 넘긴다(제목의 따옴표·역슬래시로 스크립트가 끼어들지 않게)
+document.addEventListener('DOMContentLoaded',function(){
+  var mb=$('mgmtBody'); if(!mb) return;
+  mb.addEventListener('change',function(e){ var t=e.target; if(t.classList&&t.classList.contains('q-check')) toggleMgmtItem(t.getAttribute('data-slug'),t.checked); });
+  mb.addEventListener('click',function(e){ var b=e.target.closest&&e.target.closest('.mgmt-revert'); if(b) removeUpload(encodeURIComponent(b.getAttribute('data-slug')),b.getAttribute('data-title')); });
+});
 
 function toggleMgmtItem(slug,checked){
   if(checked) _mgmtSelected.add(slug);

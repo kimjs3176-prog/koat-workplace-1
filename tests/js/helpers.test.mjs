@@ -46,6 +46,19 @@ test("parseDates: 상대·절대 날짜와 지난 일의 연도", () => {
   assert.deepEqual(plain(T.parseDates("다음 주 화요일 세종", "2026-10-08").dates), ["2026-10-13"]);
 });
 
+test("parseDates: 박·해 넘김·숫자(금액·시간·분수)·'N일 전까지'", () => {
+  const D = (q, base) => plain(T.parseDates(q, base).dates);
+  assert.deepEqual(D("어제 2박 3일 출장 다녀왔어요", "2026-10-25"), ["2026-10-22", "2026-10-24"]);        // 어제 = 돌아온 날
+  assert.deepEqual(D("10월 5일부터 2박 3일에 걸쳐 출장", "2026-10-25"), ["2026-10-05", "2026-10-07"]);   // '3일에'는 날짜가 아님
+  assert.deepEqual(D("다음 주 화요일부터 2박 3일 출장 가요", "2026-10-25"), ["2026-10-27", "2026-10-29"]);
+  assert.deepEqual(D("12월 28일부터 1월 3일까지 출장", "2026-07-10"), ["2026-12-28", "2027-01-03"]);
+  assert.deepEqual(D("12/28~1/3 출장", "2026-07-10"), ["2026-12-28", "2027-01-03"]);
+  assert.deepEqual(D("12월 28일부터 1월 3일까지 다녀왔어요", "2027-01-05"), ["2026-12-28", "2027-01-03"]);
+  for (const q of ["숙박비 7.5만원 넘으면?", "숙박비 1/2 감액되나요", "초과근무 2.5시간 했어요", "출장 3일 전까지 신청해야 하나요?"]) assert.deepEqual(D(q, "2026-10-25"), [], q);
+  assert.deepEqual(D("v1.4 업데이트 후 10/5 출장", "2026-10-25"), ["2026-10-05"]);
+  assert.deepEqual(D("3일 전에 다녀왔어요", "2026-10-25"), ["2026-10-22"]);
+});
+
 test("reconcileCase: 단계를 끼우거나 순서를 바꿔도 체크가 같은 단계에 남는다", () => {
   const p0 = { steps: [{ t: "a", k: "s1" }, { t: "b", k: "s2" }, { t: "c", k: "s3" }], pitfalls: [{ t: "x" }, { t: "y" }] };
   const c = { checks: { 0: true, 2: true }, checkAt: { 2: "2026-10-03" }, pchecks: { p1: true, r9: true } };
@@ -193,4 +206,18 @@ test("parseSchedText: 공문식 날짜 '11. 3.(화) ~ 5.(목)'·'2026.11.3.~11.5
   assert.deepEqual(((r) => [r.title, r.end])(P("2026. 11. 3.(화) ~ 4.(수) 교육")), ["교육", "2026-11-04"]);
   assert.equal(P("11월 3일부터 5일까지 세종 출장").title, "세종 출장");
   assert.equal(P("확장 1.4.6 배포").date, "");                          // 판 번호는 날짜가 아님
+});
+
+test("parseIcs: TZID 시각·DURATION·취소된 모임", () => {
+  const ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART;TZID=America/New_York:20261105T090000\r\nSUMMARY:HQ\r\nEND:VEVENT\r\n" +
+    "BEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=\"Eastern Standard Time\":20260705T090000\r\nSUMMARY:W\r\nEND:VEVENT\r\n" +
+    "BEGIN:VEVENT\r\nUID:c\r\nDTSTART;VALUE=DATE:20261110\r\nDURATION:P2D\r\nSUMMARY:dur\r\nEND:VEVENT\r\n" +
+    "BEGIN:VEVENT\r\nUID:d\r\nSTATUS:CANCELLED\r\nDTSTART;VALUE=DATE:20261112\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR";
+  const ev = plain(T.parseIcs(ics));
+  const loc = (u) => { const d = new Date(u); return [`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`, `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`]; };
+  assert.deepEqual([ev[0].date, ev[0].time], loc(Date.UTC(2026, 10, 5, 14, 0)));      // 11월 뉴욕은 UTC-5
+  assert.deepEqual([ev[1].date, ev[1].time], loc(Date.UTC(2026, 6, 5, 13, 0)));       // 7월(서머타임)은 UTC-4 — Outlook 이름도
+  assert.deepEqual([ev[2].date, ev[2].end], ["2026-11-10", "2026-11-11"]);            // 종일 2일
+  assert.equal(ev[3].cancelled, true); assert.equal(ev[0].cancelled, false);
+  assert.equal(plain(T.parseIcs("METHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTART:20261101\r\nEND:VEVENT"))[0].cancelled, true);
 });

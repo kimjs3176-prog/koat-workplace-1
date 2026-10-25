@@ -72,3 +72,19 @@ test("점검 보강: 영문 칸 이름 경계·작성 시각 제외·안내문 �
 test("readDates: 이름으로 못 가린 같은 줄 두 날짜 → 시작·끝", () => {
   assert.deepEqual(plain(C.readDates([{ label: "출장", value: "2026-10-01", row: 3 }, { label: "출장", value: "2026-10-09", row: 3 }])), { start: "2026-10-01", end: "2026-10-09" });
 });
+
+test("readDates: 한 이름이 앞뒤를 다 가리키면('출발일 ~ 도착일') 화면 순서대로", () => {
+  assert.deepEqual(plain(C.readDates([{ label: "출발일 ~ 도착일", value: "2026-10-01", row: 0 }, { label: "출발일 ~ 도착일", value: "2026-10-03", row: 0 }])),
+    { start: "2026-10-01", end: "2026-10-03" });
+  const r = C.evaluate([{ t: "정산", check: { kind: "deadline", ref: "end", days: 14 } }],
+    { fields: [{ label: "시작일~종료일", value: "2026-10-01", row: 0 }, { label: "시작일~종료일", value: "2026-10-03", row: 0 }] }, "2026-10-16");
+  assert.equal(r[0].ok, true); assert.ok(!r.extra);                            // 10.3 + 14 = 10.17 — 아직 기한 안
+});
+
+test("readTimes: 오전·오후, '3시간'(걸린 시간)은 시각이 아님, 뒤집힌 시각은 판정 안 함", () => {
+  assert.deepEqual(plain(C.readTimes([{ label: "근무시간", value: "오전 09:00 ~ 오후 06:00", row: 0 }])), { from: 540, to: 1080 });
+  assert.deepEqual(plain(C.readTimes([{ label: "총 근무시간", value: "3시간", row: 0 }, { label: "시작", value: "18:00", row: 1 }, { label: "종료", value: "21:00", row: 2 }])),
+    { from: 1080, to: 1260 });
+  const r = C.evaluate([{ t: "공동", check: { kind: "span", from: "10:30", to: "15:30" } }], { fields: [{ label: "근무시간", value: "09:00 ~ 06:00", row: 0 }] }, "2026-10-21");
+  assert.equal(r[0], null);
+});

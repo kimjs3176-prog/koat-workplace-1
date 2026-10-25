@@ -7,6 +7,8 @@
 (() => {
   if (window.__secLoaded) return; window.__secLoaded = true;
   const TOP = window === window.top;
+  // ERP 가 띄운 작은 창(주소·도구 막대 없음)인지 — 워커가 막 깨어나 창 종류를 모를 때 패널을 원래 창에 열도록 알린다
+  const isPopup = () => { try { return !!window.toolbar && window.toolbar.visible === false; } catch (e) { return false; } };
   // 🗂 버튼을 그릴 프레임: 보통은 맨 위. 맨 위가 <frameset>(온나라 등 옛 구조)이면 그 안의 가장 큰 프레임
   function uiFrame() {
     if (TOP) return !(document.body && document.body.tagName === "FRAMESET");
@@ -235,7 +237,7 @@
   // 첨부파일 이름(예: 출장증빙서식_2026-09-22.xlsx)은 화면 제목이 아니다
   const FILE_RX = /\.(xlsx?|hwpx?|hwp|pdf|docx?|pptx?|zip|jpe?g|png|gif|txt|csv)\)?$/i;
   function candidates() {
-    const out = [document.title || ""];
+    const out = [(document.title || "").trim().slice(0, 80)];      // 기관 정규식을 긴 글에 돌리지 않게(제목 후보도 40자까지)
     const els = document.querySelectorAll(SEL);
     for (let i = 0; i < els.length && out.length < 60; i++) {
       const el = els[i];
@@ -302,10 +304,10 @@
       .x{margin-left:6px;color:#888;font-size:12px}
     </style><div class="w"><button class="c" type="button"></button><button class="b" type="button" title="서무비서 열기 (Alt+Shift+S)" aria-label="서무비서 열기">🗂</button></div>`;
     const chip = sh.querySelector(".c");
-    sh.querySelector(".b").addEventListener("click", () => chrome.runtime.sendMessage({ type: "open", q: chipQ }).catch(() => {}));
+    sh.querySelector(".b").addEventListener("click", () => chrome.runtime.sendMessage({ type: "open", q: chipQ, popup: isPopup() }).catch(() => {}));
     chip.addEventListener("click", (e) => {
       if (e.target.classList && e.target.classList.contains("x")) { chip.style.display = "none"; chip.dataset.closed = "1"; return; }
-      chrome.runtime.sendMessage({ type: "open", q: chipQ }).catch(() => {});
+      chrome.runtime.sendMessage({ type: "open", q: chipQ, popup: isPopup() }).catch(() => {});
     });
     host._chip = chip;
     document.body.appendChild(host);

@@ -137,7 +137,8 @@
   function show(btn, label) {
     // 같은 출처면 맨 위 창에 띄운다(안쪽 프레임이 작아도 카드가 잘리지 않게)
     let doc = document;
-    try { if (window.top !== window && window.top.document.body) doc = window.top.document; } catch (e) { doc = document; }
+    // 맨 위가 <frameset> 이면 그 안에 붙인 div 는 그려지지 않는다(상신만 막히고 카드가 안 보임) — 그때는 버튼이 있는 창에
+    try { const tb = window.top !== window && window.top.document.body; if (tb && tb.tagName !== "FRAMESET") doc = window.top.document; } catch (e) { doc = document; }
     const host = doc.createElement("div");
     host.id = "koat-sec-guard";
     const sh = host.attachShadow({ mode: "open" });
