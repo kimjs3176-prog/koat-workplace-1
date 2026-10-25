@@ -296,3 +296,28 @@ def test_ai_output_monthly_report(client, monkeypatch, tmp_path):
 def test_draft_field_ai_flag_kept_in_data():
     procs = api_server._sec_read_json(api_server.SEC_COMMON_PATH, {})
     assert any(f.get("ai") for f in procs["drafts"]["trip-report"]["fields"])
+
+
+def test_ai_draft_line_needs_most_content_words_in_source():
+    # 한 낱말만 겹친다고 근거로 보지 않는다 — '세종'만 같고 '승인·예산 확보'는 자료에 없는 줄은 채우지 않는다
+    src = "세종 농식품부 방문, 스마트팜 실증사업 추진 현황 협의"
+    ok = api_server._sec_draft_line_ok
+    assert ok("스마트팜 실증사업 추진 현황 협의함", src, "")[0]
+    assert ok("농식품부 방문하여 실증사업 현황 확인", src, "")[0]
+    bad = ok("세종 사업 최종 승인 및 예산 확보 완료", src, "")
+    assert not bad[0] and "승인" in bad[1]
+    assert not ok("관련 협의 진행", src, "")[0]                     # 틀 말뿐인 줄
+
+
+def test_ai_review_counts_in_month_result_was_made(client, monkeypatch, tmp_path):
+    # 지난달에 만든 AI 결과를 이번 달에 확인하면 지난달 숫자에 더한다(지난달 '대기'가 줄어든다). 엉뚱한 달은 이번 달로
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    monkeypatch.setattr(api_server, "_sec_ai_month", lambda: "2026-11")
+    ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
+    ev(kind="receipt", st="made", month="2026-10")
+    ev(kind="receipt", st="ok", month="2026-10")
+    ev(kind="receipt", st="made", month="2031-01")              # 미래 달 → 이번 달
+    months = {m["month"]: m for m in client.get("/api/secretary/insights/ai").get_json()["months"]}
+    assert months["2026-10"]["receipt"]["ok"] == 1 and months["2026-10"]["receipt"]["pending"] == 0
+    assert months["2026-11"]["receipt"]["made"] == 1 and "2031-01" not in months

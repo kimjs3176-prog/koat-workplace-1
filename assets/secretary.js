@@ -1130,8 +1130,10 @@ function openDraft(key){
   const rv=receiptDraftVals(key, c);
   const vals=Object.assign({}, draftAuto(d,c,p), rv, saved);   // 기준일·증빙에서 자동 → 저장한 값 우선
   // 이 초안의 AI 초안(확인 대기·확인함)은 처리 이력에서 이어받는다
-  const ai={}; const da=c&&(c.draftAi||{})[key]; if(da&&da.k&&da.st!=='rejected') ai[da.k]={text:da.text||'', st:da.st, at:da.at};
-  const me=S._draft={key, vals, rv, ai, cid:c?c.id:null, outLogged:false};
+  // ('이력에 저장'을 누르지 않고 닫았어도 AI 초안 글은 칸에 되살린다 — 확인 대기 표시만 남고 글이 빠진 채 확인·반출되지 않게)
+  const ai={}; const da=c&&(c.draftAi||{})[key];
+  if(da&&da.k&&da.st!=='rejected'){ ai[da.k]={text:da.text||'', st:da.st, at:da.at}; if(saved[da.k]===undefined && da.text) vals[da.k]=da.text; }
+  const me=S._draft={key, vals, rv, ai, cid:c?c.id:null, lastOut:null};
   const fl=k=>((d.fields||[]).find(f=>f.k===k)||{}).l||k;
   const aiBtn=f=>f.ai&&f.multi?(aiOn()?`<button class="sec-mini primary" type="button" data-da="aidraft" data-k="${esc(f.k)}" title="이 건 메모·일정·증빙에 적힌 사실로만 줄을 만들고 줄마다 근거 자료를 붙입니다">✦ AI 초안</button>`
     :`<span class="sec-sub" title="관리 화면의 '내 AI 키' 또는 기관 AI 키가 있으면 켜집니다">✦ AI 초안은 AI 키가 있으면 켜집니다</span>`):'';
@@ -1154,7 +1156,7 @@ function openDraft(key){
       if(x.st==='rejected'){ aiLogPush(cc, 'draft', 'rejected', d.title, x.at); delete cc.draftAi[key]; }
       else cc.draftAi[key]={k:fk, st:x.st, at:x.at, text:String(x.text||'').slice(0,4000)}; }); };
   const norm=t=>String(t||'').replace(/\s+/g,' ').trim();
-  const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return; x.st=norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st); persist(fk); };
+  const aiOk=fk=>{ const x=me.ai[fk]; if(!x||x.st!=='pending') return; x.st=norm(me.vals[fk])===norm(x.text)?'ok':'edited'; aiEvent('draft', x.st, null, 1, x.at); persist(fk); };
   const confirmRc=rids=>{ if(!me.cid||!rids.length) return; updateCaseById(me.cid, cc=>{ receipts(cc).filter(r=>rids.includes(r.id)).forEach(r=>setReceiptAi(r,'confirm')); }); };
   const panel=fk=>{ const el=body.querySelector(`[data-ap="${fk}"]`); if(!el) return; const x=me.ai[fk];
     if(!x||x.st==='rejected'){ el.innerHTML=''; return; }
@@ -1176,7 +1178,7 @@ function openDraft(key){
     box.innerHTML=pend.length?`<div class="sec-rc-ck warn">✦ AI가 영수증에서 읽은 값이 아직 확인되지 않았습니다(${pend.map(y=>esc(y.f.l)).join(' · ')}). 영수증과 대조했으면 <button class="sec-mini primary" type="button" data-da="airc">✓ 증빙 값 확인함</button></div>`:''; };
   // 문서로 내보내기 전 — 확인 대기인 AI 결과가 들어 있으면 한 번 더 확인을 받고, 낸 문서를 기록한다
   const gate=()=>{
-    Object.entries(me.ai).forEach(([fk,x])=>{ if(x&&x.st==='ok'&&norm(me.vals[fk])!==norm(x.text)){ x.st='edited'; aiEvent('draft','edited','ok'); persist(fk); } });
+    Object.entries(me.ai).forEach(([fk,x])=>{ if(x&&x.st==='ok'&&norm(me.vals[fk])!==norm(x.text)){ x.st='edited'; aiEvent('draft','edited','ok', 1, x.at); persist(fk); } });
     const pend=rcFields(true).map(y=>({label:`${y.f.l}: ${String(me.vals[y.f.k]||'').slice(0,40)} — AI 영수증 인식`, rids:y.rids}))
       .concat(Object.entries(me.ai).filter(([,x])=>x&&x.st==='pending').map(([fk])=>({label:`${fl(fk)} — AI 초안`, fk})));
     if(pend.length){
@@ -1184,7 +1186,8 @@ function openDraft(key){
         '\n\n영수증·메모 같은 원래 자료와 대조해 확인했으면 [확인]을 누르세요. 확인한 것으로 기록하고 내보냅니다.')) return false;
       confirmRc([...new Set(pend.flatMap(x=>x.rids||[]))]); pend.filter(x=>x.fk).forEach(x=>aiOk(x.fk));
     }
-    if(!me.outLogged){ me.outLogged=true;
+    const sent=fillTemplate(d.template, me.vals);
+    if(sent!==me.lastOut){ me.lastOut=sent;
       const hasAi=Object.values(me.ai).some(x=>x&&(x.st==='ok'||x.st==='edited')) || rcFields(false).length>0;
       aiEvent('output', hasAi?'ai':'plain');
       if(me.cid) updateCaseById(me.cid, cc=>{ (cc.outs=cc.outs||[]).push({at:today(), key, ai:hasAi}); cc.outs=cc.outs.slice(-50); }); }
@@ -1229,7 +1232,7 @@ function openDraft(key){
     else if(da==='aiok'){ aiOk(b.dataset.k); panel(b.dataset.k); refreshAi(); if(S.view==='proc') render(); }
     else if(da==='aino'){ const fk=b.dataset.k, x=me.ai[fk]; if(!x) return;
       if(x.prev!==undefined){ me.vals[fk]=x.prev; const ta=body.querySelector(`[data-dk="${fk}"]`); if(ta) ta.value=x.prev; out(); }
-      const was=x.st; x.st='rejected'; aiEvent('draft','rejected', was); persist(fk); panel(fk); refreshAi(); if(S.view==='proc') render(); }
+      const was=x.st; x.st='rejected'; aiEvent('draft','rejected', was, 1, x.at); persist(fk); panel(fk); refreshAi(); if(S.view==='proc') render(); }
     else if(da==='airc'){ confirmRc([...new Set(rcFields(true).flatMap(y=>y.rids))]); refreshAi(); if(S.view==='proc') render(); toast('영수증 인식값을 확인한 것으로 기록했습니다.'); }
     // 초안 창을 연 건에 저장한다(그사이 확장 패널이 다른 ERP 화면의 건으로 넘어가도 섞이지 않게)
     else if(da==='keep'){ const ok=updateCaseById(c.id, cc=>{ cc.drafts=cc.drafts||{}; cc.drafts[key]=Object.assign({}, me.vals); });
@@ -1413,7 +1416,7 @@ function bind(panel){
       case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id);
-          if(r&&r.ai&&(r.aiSt||'pending')==='pending'){ aiLogPush(c, 'receipt', 'rejected', r.vendor||r.name); aiEvent('receipt','rejected'); }
+          if(r&&r.ai&&(r.aiSt||'pending')==='pending'){ aiLogPush(c, 'receipt', 'rejected', r.vendor||r.name); aiEvent('receipt','rejected', null, 1, r.aiAt); }
           c.receipts=(c.receipts||[]).filter(r=>r.id!==D.id); }); render(); break;
       case 'rcok': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id); if(r) setReceiptAi(r, (r.aiSt||'pending')==='pending'?'confirm':'undo'); }); render(); break;
       case 'audit': runAudit(); break;
@@ -1421,7 +1424,7 @@ function bind(panel){
           const f=(au.findings||[]).find(x=>x.id===D.id); const before=auditSt(au, D.id);
           const box=a==='auack'?au.ack:au.dis, other=a==='auack'?au.dis:au.ack;
           if(box[D.id]) delete box[D.id]; else { box[D.id]=true; delete other[D.id]; }
-          if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before); } }); render(); break;
+          if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before, 1, au.at); } }); render(); break;
       case 'impact': openImpact(D.reg); break;
       case 'aiscope': S.aiRepScope=D.v; render(); break;
       case 'aicopy': { const org=S.aiRepScope!=='local' && S.aiRep && S.aiRep.months;
@@ -1475,7 +1478,7 @@ function bind(panel){
     else if(a==='rcfile'){ const fs=[...(el.files||[])].filter(f=>/^image\//.test(f.type)); el.value=''; if(fs.length) addReceipts(fs); }
     else if(a==='rcf'){ const k=el.dataset.k; let v=el.value; if(k==='amount'||k==='nights') v=Number(String(v).replace(/[^\d]/g,''))||0;
       updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===el.dataset.id); if(r){ const was=r[k]; r[k]=v;
-        if(k!=='note' && String(was??'')!==String(v??'')){ r.edited=true; if(r.ai && r.aiSt==='ok'){ r.aiSt='edited'; aiEvent('receipt','edited','ok'); } } } }); render(); }
+        if(k!=='note' && String(was??'')!==String(v??'')){ r.edited=true; if(r.ai && r.aiSt==='ok'){ r.aiSt='edited'; aiEvent('receipt','edited','ok', 1, r.aiAt); } } } }); render(); }
     else if(a==='es' && (el.type==='checkbox'||el.tagName==='SELECT')){ editorField(el); if(el.dataset.k==='dlref') render(); }
     else if(a==='himport') readJsonFile(el, d=>{ if(!d||!Array.isArray(d.cases)){ toast('처리 이력 파일이 아닙니다.'); return; }
       const cur=cases(); const ids=new Set(cur.map(c=>c.id)); const add=d.cases.map(normCase).filter(c=>c&&!ids.has(c.id)); saveCases(add.concat(cur));
@@ -1856,17 +1859,19 @@ function wantsReceipts(p){ return (p.steps||[]).some(s=>(s.docs||[]).some(d=>RC_
 // 확인 대기인 AI 결과는 문서로 내보낼 때(복사·한글·ERP) 한 번 더 확인을 받는다 — 사람이 확인한 것만 산출물에 들어간다.
 const AI_KIND={receipt:'영수증 인식', audit:'감사 지적', draft:'문서 초안'};
 const AI_ST={pending:'확인 대기', ok:'확인 후 그대로', edited:'고쳐서 사용', rejected:'버림'};
-function aiEvent(kind, st, prev, n){
+// at: 그 AI 결과를 만든 날 — 다음 달에 확인·되돌려도 만든 달의 숫자에 더하고 뺀다(만듦과 판단이 같은 달에 맞게)
+function aiEvent(kind, st, prev, n, at){
   if(!canShare()) return;
+  const month=/^\d{4}-\d{2}/.test(at||'')?String(at).slice(0,7):'';
   fetch('/api/secretary/insights/event',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1})}).catch(()=>{});
+    body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1, ...(month?{month}:{})})}).catch(()=>{});
 }
 function aiLogPush(c, k, st, label, at){ (c.aiLog=c.aiLog||[]).push({k, st, at:at||today(), label:String(label||'').slice(0,80)}); c.aiLog=c.aiLog.slice(-100); }
 // 영수증 AI 값: confirm(사람 확인 — 고친 적이 있으면 '고쳐서') · undo(확인 취소)
 function setReceiptAi(r, how){
   if(!r||!r.ai) return; const before=r.aiSt||'pending';
   const after=how==='confirm'?(r.edited?'edited':'ok'):'pending';
-  if(after===before) return; r.aiSt=after; aiEvent('receipt', after, before);
+  if(after===before) return; r.aiSt=after; aiEvent('receipt', after, before, 1, r.aiAt);
 }
 // 이 건의 AI 결과 목록 [{k, st, at, label}]
 function aiItems(c){

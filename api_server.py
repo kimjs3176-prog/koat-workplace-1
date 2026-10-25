@@ -2816,7 +2816,7 @@ def secretary_ai_receipt():
 
 
 # ── AI 문서 초안(한 칸) — 이 건의 자료(메모·일정·증빙·상황 문장)에 적힌 사실만으로, 줄마다 근거 자료를 달아 쓴다 ──
-#   검증: 줄마다 근거 자료 번호가 있어야 하고, 줄의 숫자는 근거 자료(또는 이미 적은 칸)에 있어야 하며, 근거 자료와 겹치는 낱말이 있어야 한다.
+#   검증: 줄마다 근거 자료 번호가 있어야 하고, 줄의 숫자는 근거 자료(또는 이미 적은 칸)에 있어야 하며, 줄의 내용 말(틀 말 제외) 60% 이상이 근거 자료에 있어야 한다.
 #   확인되지 않은 줄은 채우지 않고 따로 보여 준다. 채운 내용은 사람이 고치고 '확인'해야 문서로 나간다(화면).
 _SEC_DRAFT_SYSTEM = (
     "당신은 한국 공공기관 직원의 업무 문서 작성을 돕습니다. 주어진 '자료'(메모·일정·증빙·상황 문장)에 실제로 적힌 사실만으로 "
@@ -2825,19 +2825,31 @@ _SEC_DRAFT_SYSTEM = (
     "자료로 채울 수 없는 내용은 lines 에 넣지 말고 missing 에 '무엇을 더 적어야 하는지' 짧게 적습니다. "
     "줄은 '○○ 사업 추진 현황 협의', '△△ 현장 점검 결과 이상 없음 확인'처럼 명사형으로 끝내고, 줄머리 기호(-, ·, 1.)는 붙이지 않습니다."
 )
-_SEC_DRAFT_STRIP = re.compile(r"(했음|하였음|함|임|됨|하고|하여|해서|에서|으로|에게|까지|부터|이며|과|와|을|를|이|가|은|는|의|에|로|및|도)$")
+_SEC_DRAFT_STRIP = re.compile(r"(했음|하였음|하였다|했다|함|임|됨|하고|하여|해서|에서|으로|에게|까지|부터|이며|과|와|을|를|이|가|은|는|의|에|로|및|도)$")
+# 공문 줄의 틀 말(무엇을 했는지가 아니라 문장 모양) — 근거를 셀 때 빼야 '세종 출장' 한 낱말로 '사업 최종 승인' 같은 줄이 통과하지 않는다
+_SEC_DRAFT_FRAME = {"협의", "논의", "확인", "실시", "진행", "추진", "참석", "참여", "관련", "결과", "내용", "사항", "방문", "보고", "검토",
+                    "요청", "공유", "설명", "예정", "완료", "현황", "계획", "대한", "위한", "통해", "따른", "등", "및", "기타"}
 
 
 def _sec_draft_line_ok(line: str, cited: str, known: str) -> tuple[bool, str]:
-    """AI 초안 한 줄 검증 — (통과, 이유)."""
+    """AI 초안 한 줄 검증 — (통과, 이유).
+
+    · 줄의 숫자는 모두 근거 자료(또는 이미 적은 칸)에 있어야 한다.
+    · 줄의 '내용 말'(틀 말을 뺀 2자 이상 낱말)의 60% 이상이 근거 자료에 있어야 한다 — 한 낱말만 겹친다고 통과하지 않게.
+    """
     nums = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", line)}
     have = {n.replace(",", "") for n in re.findall(r"\d[\d,]*", cited + " " + known)}
     if nums - have:
         return False, "근거 자료에 없는 숫자(" + ", ".join(sorted(nums - have))[:40] + ")"
+    flat = re.sub(r"\s+", "", cited + " " + known)
     words = {_SEC_DRAFT_STRIP.sub("", w) for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", line)}
-    flat = re.sub(r"\s+", "", cited)
-    if not any(len(w) >= 2 and w in flat for w in words):
-        return False, "근거 자료와 겹치는 말이 없음"
+    words = {w for w in words if len(w) >= 2 and w not in _SEC_DRAFT_FRAME and not w.isdigit()}
+    if not words:
+        return False, "근거 자료에서 온 내용 말이 없음"
+    hit = [w for w in words if w in flat or (len(w) >= 3 and w[:-1] in flat)]
+    if len(hit) < max(1, -(-len(words) * 3 // 5)):                     # 60% 이상(올림)
+        miss = sorted(set(words) - set(hit))
+        return False, "근거 자료에 없는 말(" + ", ".join(miss)[:40] + ")"
     return True, ""
 
 
@@ -3874,7 +3886,14 @@ def _sec_ai_event(b: dict):
     if not allowed or (st not in allowed and st != "pending") or (prev and (prev not in allowed or prev == "made")):
         return jsonify({"success": False, "error": "kind·st 가 올바르지 않습니다."}), 400
     n = _sec_int(b.get("n"), 1, 1, 50)
-    key = f"sec:ai:{_sec_ai_month()}"
+    # 판단(확인·고침·버림·되돌리기)은 그 결과를 만든 달에 센다 — 다음 달에 확인해도 만든 달의 '대기'가 줄도록.
+    # 화면이 보낸 달은 이번 달부터 2년 안일 때만 받는다(엉뚱한 달 숫자를 만들지 않게)
+    month, now = str(b.get("month") or ""), _sec_ai_month()
+    y, m_ = (int(now[:4]), int(now[5:]))
+    oldest = f"{y - 2:04d}-{m_:02d}"
+    if not (re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month) and oldest <= month <= now):
+        month = now
+    key = f"sec:ai:{month}"
     cmds = [["HINCRBY", key, f"{kind}:{st}", n]] if st != "pending" else []
     if prev:
         cmds.append(["HINCRBY", key, f"{kind}:{prev}", -1])
