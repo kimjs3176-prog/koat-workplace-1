@@ -1427,7 +1427,7 @@ function bind(panel){
           const f=(au.findings||[]).find(x=>x.id===D.id); const before=auditSt(au, D.id);
           const box=a==='auack'?au.ack:au.dis, other=a==='auack'?au.dis:au.ack;
           if(box[D.id]) delete box[D.id]; else { box[D.id]=true; delete other[D.id]; }
-          if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before, 1, au.at); } }); render(); break;
+          if(f&&f.source==='ai'){ const after=auditSt(au, D.id); if(after!==before) aiEvent('audit', after, before, 1, f.at||au.at); } }); render(); break;
       case 'impact': openImpact(D.reg); break;
       case 'aiscope': S.aiRepScope=D.v; render(); break;
       case 'airef': S.aiRep=null; render(); break;
@@ -1882,7 +1882,7 @@ function setReceiptAi(r, how){
 function aiItems(c){
   if(!c) return [];
   const out=receipts(c).filter(r=>r.ai).map(r=>({k:'receipt', st:r.aiSt||'pending', at:r.aiAt||c.created, label:r.vendor||r.name}));
-  const a=c.audit; if(a) (a.findings||[]).filter(f=>f.source==='ai').forEach(f=>out.push({k:'audit', st:auditSt(a, f.id), at:a.at, label:f.title}));
+  const a=c.audit; if(a) (a.findings||[]).filter(f=>f.source==='ai').forEach(f=>out.push({k:'audit', st:auditSt(a, f.id), at:f.at||a.at, label:f.title}));
   Object.entries(c.draftAi||{}).forEach(([key,d])=>{ if(d&&d.st) out.push({k:'draft', st:d.st, at:d.at||c.created, label:(allDrafts()[key]||{}).title||key}); });
   return out.concat(c.aiLog||[]);
 }
@@ -2179,15 +2179,21 @@ async function runAudit(){
   S.auditBusy=id; render();
   try{ const r=await fetch('/api/secretary/audit',{method:'POST',headers:aiHeaders({'Content-Type':'application/json'}),body:JSON.stringify({procedure:proc, case:inp, today:today(), ai:!!aiOn()})});
     const d=await r.json(); if(!d.success) throw new Error(d.error||'감사하지 못했습니다.');
-    const prev=(c.audit&&c.audit.ack)||{}, prevDis=(c.audit&&c.audit.dis)||{};
-    const keep=o=>Object.fromEntries(Object.entries(o).filter(([k])=>d.findings.some(f=>f.id===k)));
-    const nAi=d.findings.filter(f=>f.source==='ai').length; if(nAi) aiEvent('audit','made',null,nAi);
     updateCaseById(id, x=>{
-      // 다시 감사하면 앞 감사의 AI 지적 가운데 사람이 판단한 것은 기록으로 옮겨 둔다(건별 AI 결과에서 사라지지 않게)
-      const old=x.audit; if(old) (old.findings||[]).filter(f=>f.source==='ai' && !d.findings.some(g=>g.id===f.id)).forEach(f=>{
-        const st=auditSt(old, f.id); if(st!=='pending') aiLogPush(x, 'audit', st, f.title, old.at); });
-      x.audit={at:today(), sig, findings:d.findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
-      ack:keep(prev), dis:keep(prevDis)}; });
+      // AI 지적 id 는 순서(ai-0, ai-1…)라 다시 감사하면 다른 지적이 같은 id 를 받을 수 있다 — 같은 id·같은 제목일 때만 같은 지적으로 이어받는다
+      const old=x.audit, oldF=(old&&old.findings)||[];
+      const same=f=>{ const o=oldF.find(g=>g.id===f.id); return !!o && (f.source!=='ai' || (o.source==='ai' && o.title===f.title)); };
+      const keepIds=new Set(d.findings.filter(same).map(f=>f.id));
+      // 사라지거나 다른 지적으로 바뀐 앞 AI 지적은 기록으로 옮긴다 — 확인 대기였으면 쓰이지 않은 것('버림')으로(기관 숫자에 대기로 남지 않게)
+      oldF.filter(f=>f.source==='ai' && !keepIds.has(f.id)).forEach(f=>{ const st=auditSt(old, f.id), at=f.at||old.at;
+        if(st==='pending'){ aiLogPush(x, 'audit', 'rejected', f.title, at); aiEvent('audit','rejected', null, 1, at); }
+        else aiLogPush(x, 'audit', st, f.title, at); });
+      // 이어받은 AI 지적은 처음 만든 날을 지킨다(판단을 만든 달에 세게) · 새 AI 지적만 '만듦'으로 센다
+      const findings=d.findings.map(f=>f.source==='ai'&&keepIds.has(f.id)?Object.assign({}, f, {at:(oldF.find(g=>g.id===f.id)||{}).at||old.at}):f);
+      const nAi=findings.filter(f=>f.source==='ai'&&!keepIds.has(f.id)).length; if(nAi) aiEvent('audit','made',null,nAi);
+      const keep=o=>Object.fromEntries(Object.entries(o||{}).filter(([k])=>keepIds.has(k)));
+      x.audit={at:today(), sig, findings, counts:d.counts, summary:d.summary||'', ai_used:!!d.ai_used, ai_error:d.ai_error||'',
+      ack:keep(old&&old.ack), dis:keep(old&&old.dis)}; });
     toast(d.findings.length?`지적 ${d.findings.length}건 — 높음 ${d.counts.high} · 보통 ${d.counts.medium} · 참고 ${d.counts.low}`:'걸리는 항목이 없습니다.');
   }catch(e){ toast(e.message||'감사 서버에 연결하지 못했습니다.'); }
   S.auditBusy=null; render();
