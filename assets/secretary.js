@@ -1416,6 +1416,7 @@ function bind(panel){
       case 'calics': calIcs(); break;
       case 'aiask': aiUnderstand(S.query, true); break;
       case 'regask': askRegs(S.query, true); break;
+      case 'aijudge': aiQaJudge(D.id, D.v); render(); break;
       case 'aikey': openAiKey(); break;
       case 'aiopen': openWithDates(D.id, S.query); break;
       case 'rcdel': updateCase(c=>{ const r=(c.receipts||[]).find(x=>x.id===D.id);
@@ -1871,6 +1872,27 @@ function aiEvent(kind, st, prev, n, at){
     body:JSON.stringify({type:'ai', kind, st, prev:prev&&prev!=='pending'?prev:'', n:n||1, ...(month?{month}:{})})})
     .then(()=>{ S.aiRep=null; }).catch(()=>{});             // 관리 화면의 기관 숫자는 다음에 열 때 다시 불러온다
 }
+// 규정 답변·절차 안내 — 건에 묶이지 않는 화면 안내라 이 브라우저에 따로 남긴다(물음 글은 이 브라우저에만, 기관 숫자에는 건수만).
+// 담당자가 원문과 대조해 '맞음(ok)·틀림(rejected)'을 누르고, 누르지 않은 것은 '판단 안 함(pending)'으로 남는다.
+const AI_QA={reg:'규정 답변', plan:'절차 안내'};
+const LS_AIQA='koat_sec_aiqa';             // [{id, k, st, at, label}] — 최근 300건
+function aiQaAll(){ const a=_ls(LS_AIQA, []); return Array.isArray(a)?a.filter(x=>x&&AI_QA[x.k]&&['pending','ok','rejected'].includes(x.st)):[]; }
+function aiQaGet(id){ return id?aiQaAll().find(x=>x.id===id)||null:null; }
+function aiQaMade(k, label){
+  const x={id:uid(), k, st:'pending', at:today(), label:String(label||'').slice(0,80)};
+  _lsPut(LS_AIQA, aiQaAll().concat([x]).slice(-300)); aiEvent(k, 'made'); return x.id;
+}
+// 같은 판단을 다시 누르면 되돌린다(판단 안 함)
+function aiQaJudge(id, st){
+  const all=aiQaAll(); const x=all.find(y=>y.id===id); if(!x||!['ok','rejected'].includes(st)) return;
+  const before=x.st; x.st=before===st?'pending':st; _lsPut(LS_AIQA, all); aiEvent(x.k, x.st, before, 1, x.at);
+}
+function aiQaHtml(id, what){
+  const x=aiQaGet(id); if(!x) return '';
+  const b=(v,l,t)=>`<button class="sec-mini${x.st===v?' on':''}" data-a="aijudge" data-id="${esc(id)}" data-v="${v}" title="${t}">${x.st===v?'↩ ':''}${l}</button>`;
+  return `<div class="sec-ai-judge"><span class="sec-sub">${x.st==='pending'?`이 ${what} 맞았나요? 원문과 대조해 판단해 주세요`:`담당자 판단: ${x.st==='ok'?'맞음':'틀림'} — 월별 AI 보고에 들어갑니다`}</span>`+
+    b('ok','👍 맞음','원문과 대조해 보니 맞는 안내')+b('rejected','👎 틀림','원문과 다르거나 이 상황에 맞지 않는 안내')+`</div>`;
+}
 function aiLogPush(c, k, st, label, at){ (c.aiLog=c.aiLog||[]).push({k, st, at:at||today(), label:String(label||'').slice(0,80)}); c.aiLog=c.aiLog.slice(-100); }
 // 영수증 AI 값: confirm(사람 확인 — 고친 적이 있으면 '고쳐서') · undo(확인 취소)
 function setReceiptAi(r, how){
@@ -1897,12 +1919,13 @@ function aiLedgerHtml(c){
     (pend?`<div class="sec-rc-ck warn">확인 대기 ${pend}건 — 증빙의 ✓ 확인, 감사 지적의 ✓/✕, 초안 창의 ✓ 확인으로 처리하세요. 확인하지 않은 채 문서로 내보내려 하면 한 번 더 묻습니다.</div>`:'')+`</div>`;
 }
 // 월별 AI 산출물 보고 — 기관 전체(익명 통계, 집단 지식 저장소가 있을 때) 또는 이 브라우저의 처리 이력
-function aiMonth(mo){ const z=()=>({made:0, ok:0, edited:0, rejected:0, pending:0}); return {month:mo, receipt:z(), audit:z(), draft:z(), output:{plain:0, ai:0}}; }
+function aiMonth(mo){ const z=()=>({made:0, ok:0, edited:0, rejected:0, pending:0}); return {month:mo, receipt:z(), audit:z(), draft:z(), reg:z(), plan:z(), output:{plain:0, ai:0}}; }
 function aiLocalMonths(){
   const m={}; const get=mo=>m[mo]=m[mo]||aiMonth(mo);
   cases().forEach(c=>{
     aiItems(c).forEach(x=>{ const mo=String(x.at||'').slice(0,7); if(!/^\d{4}-\d{2}$/.test(mo)||!AI_KIND[x.k]) return; const r=get(mo)[x.k]; r.made++; r[x.st]=(r[x.st]||0)+1; });
     (c.outs||[]).forEach(o=>{ get(String(o.at).slice(0,7)).output[o.ai?'ai':'plain']++; }); });
+  aiQaAll().forEach(x=>{ const mo=String(x.at||'').slice(0,7); if(!/^\d{4}-\d{2}$/.test(mo)) return; const r=get(mo)[x.k]; r.made++; r[x.st]++; });
   return Object.values(m).sort((a,b)=>a.month<b.month?1:-1).slice(0,12);
 }
 function aiReportText(r, scope){
@@ -1911,10 +1934,17 @@ function aiReportText(r, scope){
   return `${y}년 ${+mo}월 서무비서 AI 활용 실적(${scope})\n`+
     `○ AI가 만든 결과 ${made}건(${ks.filter(k=>(r[k]||{}).made).map(k=>`${AI_KIND[k]} ${r[k].made}건`).join(', ')||'없음'})\n`+
     `○ 담당자가 확인해 업무에 쓴 결과 ${used}건(그대로 ${sum('ok')}건 · 고쳐서 ${sum('edited')}건)${made?`, 사용률 ${Math.round(used/made*100)}%`:''} · 버림 ${sum('rejected')}건 · 확인 대기 ${sum('pending')}건\n`+
-    `○ 낸 문서(복사·한글·ERP 넣기) ${outs}건 중 AI 결과가 들어간 문서 ${r.output.ai||0}건 — 모두 담당자 확인을 거쳐 반출`;
+    `○ 낸 문서(복사·한글·ERP 넣기) ${outs}건 중 AI 결과가 들어간 문서 ${r.output.ai||0}건 — 모두 담당자 확인을 거쳐 반출`+aiQaText(r);
+}
+// 규정 답변·절차 안내 판단 — 맞음 비율은 담당자가 판단한 것 가운데서만 센다
+function aiQaText(r){
+  const qs=Object.keys(AI_QA).filter(k=>(r[k]||{}).made); if(!qs.length) return '';
+  const sum=st=>qs.reduce((a,k)=>a+((r[k]||{})[st]||0),0); const ok=sum('ok'), no=sum('rejected'), seen=ok+no;
+  return `\n○ AI 안내 ${sum('made')}건(${qs.map(k=>`${AI_QA[k]} ${r[k].made}건`).join(', ')}) — 담당자 판단 맞음 ${ok}건 · 틀림 ${no}건 · 판단 안 함 ${Math.max(0,sum('made')-seen)}건`+
+    (seen?`, 판단한 것 중 맞음 ${Math.round(ok/seen*100)}%`:'');
 }
 function aiReportCard(){
-  const head=`<div class="sec-card-h">✦ AI 산출물 보고(월별) <span class="sec-sub">AI가 만든 결과(영수증 인식·감사 지적·문서 초안)를 담당자가 확인·고침·버린 건수와, AI 결과가 들어간 문서 수</span></div>`;
+  const head=`<div class="sec-card-h">✦ AI 산출물 보고(월별) <span class="sec-sub">AI가 만든 결과(영수증 인식·감사 지적·문서 초안)를 담당자가 확인·고침·버린 건수와, AI 결과가 들어간 문서 수 · 규정 답변·절차 안내의 맞음/틀림 판단</span></div>`;
   if(S.insights.available && !S.aiRep){ S.aiRep={loading:true};
     fetch('/api/secretary/insights/ai').then(r=>r.json()).then(d=>{ S.aiRep=d.success&&d.available?d:{none:true, error:d.error}; if(S.view==='manage') render(); }).catch(()=>{ S.aiRep={none:true}; if(S.view==='manage') render(); }); }
   const org=S.insights.available && S.aiRep && !S.aiRep.loading && !S.aiRep.none;
@@ -1922,12 +1952,13 @@ function aiReportCard(){
   const rows=scope==='org'?(S.aiRep.months||[]):aiLocalMonths();
   const ks=['receipt','audit','draft']; const sum=(r,st)=>ks.reduce((a,k)=>a+((r[k]||{})[st]||0),0);
   const tabs=`<div class="sec-row"><button class="sec-mini ${scope==='org'?'on':''}" data-a="aiscope" data-v="org" ${org?'':'disabled title="기관 집단 지식 저장소가 있으면 켜집니다"'}>기관 전체(익명 통계)</button><button class="sec-mini ${scope==='local'?'on':''}" data-a="aiscope" data-v="local">이 브라우저의 처리 이력</button>${S.insights.available&&S.aiRep&&S.aiRep.loading?'<span class="sec-sub">불러오는 중...</span>':''}${org&&scope==='org'?'<button class="sec-mini" data-a="airef" title="기관 숫자 다시 불러오기">↻ 새로고침</button>':''}</div>`;
-  if(!rows.length) return `<div class="sec-card">${head}${tabs}<div class="sec-hint">아직 기록이 없습니다. 영수증 AI 인식, AI 감사, 문서 초안의 ✦ AI 초안을 쓰고 담당자가 확인하면 쌓입니다.${scope==='org'?' 기관 전체 숫자는 담당자가 기관 통계 기여를 켜 둔 경우에만 모입니다.':''}</div></div>`;
+  if(!rows.length) return `<div class="sec-card">${head}${tabs}<div class="sec-hint">아직 기록이 없습니다. 영수증 AI 인식, AI 감사, 문서 초안의 ✦ AI 초안을 쓰고 담당자가 확인하면 쌓입니다. 규정 답변·AI 상황 분석은 👍 맞음/👎 틀림을 누르면 판단이 함께 쌓입니다.${scope==='org'?' 기관 전체 숫자는 담당자가 기관 통계 기여를 켜 둔 경우에만 모입니다.':''}</div></div>`;
   return `<div class="sec-card">${head}${tabs}<div class="sec-airep"><div class="sec-airep-r h"><span>월</span><span>AI 결과</span><span>그대로</span><span>고쳐서</span><span>버림</span><span>대기</span><span>낸 문서(AI)</span><span></span></div>`+
     rows.map(r=>{ const made=sum(r,'made');
       return `<div class="sec-airep-r"><b>${esc(r.month)}</b><span>${made}</span><span>${sum(r,'ok')}</span><span>${sum(r,'edited')}</span><span>${sum(r,'rejected')}</span><span>${sum(r,'pending')}</span>`+
         `<span>${(r.output.ai||0)+(r.output.plain||0)} (${r.output.ai||0})</span><button class="sec-mini" data-a="aicopy" data-m="${esc(r.month)}" title="월간 보고 문구 복사">📋 보고 문구</button>`+
-        `<span class="sec-sub sec-airep-k">${ks.filter(k=>(r[k]||{}).made).map(k=>`${AI_KIND[k]} ${r[k].made}`).join(' · ')||'—'}</span></div>`; }).join('')+`</div>`+
+        `<span class="sec-sub sec-airep-k">${ks.filter(k=>(r[k]||{}).made).map(k=>`${AI_KIND[k]} ${r[k].made}`).join(' · ')||'—'}`+
+        `${Object.keys(AI_QA).filter(k=>(r[k]||{}).made).map(k=>` · ${AI_QA[k]} ${r[k].made}(맞음 ${r[k].ok||0} · 틀림 ${r[k].rejected||0})`).join('')}</span></div>`; }).join('')+`</div>`+
     `<div class="sec-hint">'그대로·고쳐서'는 담당자가 원래 자료와 대조해 확인한 결과입니다. 확인 대기인 AI 결과는 문서로 내보낼 때 한 번 더 확인을 받으므로, 낸 문서에는 확인된 결과만 들어갑니다.</div></div>`;
 }
 function receipts(c){ return (c&&c.receipts)||[]; }
@@ -2069,6 +2100,7 @@ async function aiUnderstand(q, force){
       reasons:d.reasons||[], facts:d.facts||[], questions:d.questions||[], cautions:d.cautions||[]}:{q, error:d.error||'AI가 이해하지 못했습니다.'};
   }catch(e){ if(S.query===q) S.aiRes={q, error:'AI에 연결하지 못했습니다.'}; }
   if(S.query!==q || !S.aiRes) return;          // 그사이 다른 물음으로 바뀌었으면 손대지 않는다
+  if((S.aiRes.ids||[]).length) S.aiRes.aiId=aiQaMade('plan', q);
   // 등록 절차를 못 찾았는데 AI가 하나를 골랐다면 바로 그 절차로
   if(S.view==='nomatch' && S.aiRes.ids && S.aiRes.ids.length===1){ openWithDates(S.aiRes.ids[0], q); return; }
   render();
@@ -2121,6 +2153,7 @@ async function askRegs(q, force){
   catch(e){ d={success:false, error:'서버에 연결하지 못했습니다.'}; }
   if(S.query!==q) return;                          // 그사이 다른 물음으로 바뀌었으면 버린다
   S.regAns=Object.assign({q}, d&&d.success?d:{error:(d&&d.error)||'답을 찾지 못했습니다.', candidates:(d&&d.candidates)||[]});
+  if(d&&d.success&&d.mode==='ai'&&d.found) S.regAns.aiId=aiQaMade('reg', q);
   render();
 }
 function regAnsBox(){
@@ -2136,7 +2169,7 @@ function regAnsBox(){
   const cites=(a.citations||[]).map(c=>`<div class="sec-reg-q">${art(c)}${c.quote?`<q>${esc(c.quote)}</q>`:''}${c.revision?`<span class="sec-sub">${esc(c.revision)}</span>`:''}</div>`).join('');
   return `<div class="sec-notice reg"><div>📖 <b>규정 답변</b> <span class="sec-sub">우리 기관 내규 조문 기준 · 최종 판단은 원문과 담당 부서 확인</span></div>`+
     `<div class="sec-reg-a">${esc(a.answer).replace(/\n/g,'<br>')}</div>`+(a.caution?`<div class="sec-sub">⚠ ${esc(a.caution)}</div>`:'')+
-    `<div class="sec-reg-cites">${cites}</div></div>`;
+    `<div class="sec-reg-cites">${cites}</div>${aiQaHtml(a.aiId,'답변이')}</div>`;
 }
 function aiBox(){
   const a=S.aiRes; if(!a || a.q!==S.query) return aiOn()&&S.query?`<div class="sec-ai-re"><button class="sec-linkbtn" data-a="aiask">✦ AI로 상황 분석하기</button></div>`:(S.query?aiKeyHint():'');
@@ -2144,13 +2177,13 @@ function aiBox(){
   if(a.error) return `<div class="sec-notice ai">✦ ${esc(a.error)}</div>`;
   if(!a.ids.length) return `<div class="sec-notice ai">✦ ${esc(a.summary||'등록된 절차 가운데 맞는 것을 찾지 못했습니다.')}${a.uncovered?` <span class="sec-sub">(${esc(a.uncovered)})</span>`:''}</div>`;
   const ps=a.ids.map(getProc).filter(Boolean);
-  if(ps.length===1 && ps[0].id===S.procId) return `<div class="sec-notice ai"><div>✦ AI도 이 절차로 이해했습니다 — ${esc(a.summary)}</div>${aiExtra(a)}</div>`;
+  if(ps.length===1 && ps[0].id===S.procId) return `<div class="sec-notice ai"><div>✦ AI도 이 절차로 이해했습니다 — ${esc(a.summary)}</div>${aiExtra(a)}${aiQaHtml(a.aiId,'안내가')}</div>`;
   const plan=ps.length>1?`<div class="sec-plan">`+ps.map((p,n)=>{ const c=cases().find(x=>x.procId===p.id&&x.status!=='done'); const nx=c?nextStep(c,p):{i:0,s:p.steps[0]};
       return `<div class="sec-plan-i"><span class="sec-plan-n">${n+1}</span><div class="sec-plan-m"><b>${esc(p.icon||'')} ${esc(shortTitle(p.title))}</b>`+
         `<span class="sec-sub">${nx&&nx.s?'먼저: '+esc(nx.s.t.slice(0,70)):''}</span></div><button class="sec-btn sm" data-a="aiopen" data-id="${esc(p.id)}">${p.id===S.procId?'보는 중':'열기'}</button></div>`; }).join('')+`</div>`:
     `<div class="sec-row"><button class="sec-btn sm primary" data-a="aiopen" data-id="${esc(ps[0].id)}">${esc(ps[0].icon||'')} ${esc(shortTitle(ps[0].title))} 열기</button></div>`;
   return `<div class="sec-notice ai"><div>${a.local?'🧩 <b>여러 업무가 섞인 상황</b>':'✦ <b>AI가 이해한 상황</b>'} — ${esc(a.summary)}${ps.length>1?` <span class="sec-sub">절차 ${ps.length}개를 순서대로 처리하세요</span>`:''}</div>${plan}`+
-    aiExtra(a)+(a.uncovered?`<div class="sec-sub">등록 절차로 안내되지 않는 부분: ${esc(a.uncovered)}</div>`:'')+`</div>`;
+    aiExtra(a)+(a.uncovered?`<div class="sec-sub">등록 절차로 안내되지 않는 부분: ${esc(a.uncovered)}</div>`:'')+aiQaHtml(a.aiId,'안내가')+`</div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

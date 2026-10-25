@@ -3869,8 +3869,11 @@ def _sec_ins_rate_ok(store: dict | None = None, limit: int = 60) -> bool:
 #   output 은 문서 산출물(복사·한글·ERP 넣기)을 낸 횟수 — ai(AI 결과가 들어간 문서) · plain(AI 결과 없음).
 #   기관 사무실은 한 IP 로 나가는 일이 많아 사건 기록보다 넉넉히(시간당 300) 받는다. 로그인 없는 익명 기록이므로
 #   숫자는 '담당자 화면이 보낸 자기 보고'이다 — 한 요청의 크기와 속도만 막고, 정확한 실적은 처리 이력(건별 기록)으로 확인한다.
+#   reg(규정 답변)·plan(상황 이해로 고른 절차 안내)은 문서에 들어가는 산출물이 아니라 화면 안내라 고쳐 쓸 일이 없다 —
+#   담당자가 원문과 대조해 '맞음(ok)·틀림(rejected)'만 판단하고, 판단하지 않은 것은 대기(판단 안 함)로 남는다.
 _SEC_AI_KINDS = {"receipt": ("made", "ok", "edited", "rejected"), "audit": ("made", "ok", "edited", "rejected"),
-                 "draft": ("made", "ok", "edited", "rejected"), "output": ("plain", "ai")}
+                 "draft": ("made", "ok", "edited", "rejected"), "output": ("plain", "ai"),
+                 "reg": ("made", "ok", "rejected"), "plan": ("made", "ok", "rejected")}
 _SEC_AIEV_HITS: dict = {}
 
 
@@ -3916,7 +3919,7 @@ def _sec_ai_month_summary(h: dict) -> dict:
         out[kind] = {s: max(0, h.get(f"{kind}:{s}", 0)) for s in sts}
         if "made" in sts:
             o = out[kind]
-            o["pending"] = max(0, o["made"] - o["ok"] - o["edited"] - o["rejected"])
+            o["pending"] = max(0, o["made"] - o["ok"] - o.get("edited", 0) - o["rejected"])
     return out
 
 
