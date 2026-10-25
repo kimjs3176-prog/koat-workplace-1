@@ -29,6 +29,7 @@ export function load(today = "2026-10-08") {
     slice("// ── 메일에서 일정 가져오기", "// 끌어다 놓기·붙여넣기"),
     // AI 산출물 보고·AI 초안 자료(이 건의 메모·일정·증빙)
     slice("const AI_KIND=", "function aiEvent("),
+    slice("const AI_QA=", "\n") + "\n",
     slice("// 월별 AI 산출물 보고", "function aiReportCard(){"),
     slice("function fmtLong(s)", "\n") + "\n",
     "const receipts=c=>(c&&c.receipts)||[]; const scheds=()=>[]; const getProc=()=>null;",

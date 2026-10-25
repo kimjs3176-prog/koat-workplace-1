@@ -324,3 +324,20 @@ def test_ai_review_counts_in_month_result_was_made(client, monkeypatch, tmp_path
     months = {m["month"]: m for m in client.get("/api/secretary/insights/ai").get_json()["months"]}
     assert months["2026-10"]["receipt"]["ok"] == 1 and months["2026-10"]["receipt"]["pending"] == 0
     assert months["2026-11"]["receipt"]["made"] == 1 and "2031-01" not in months
+
+
+def test_ai_reg_and_plan_judgements(client, monkeypatch, tmp_path):
+    # 규정 답변·절차 안내는 맞음(ok)·틀림(rejected)만 — 고쳐 쓰는(edited) 판단은 없다. 판단 안 한 것은 대기로 남는다
+    monkeypatch.setattr(api_server, "SEC_INS_FILE", str(tmp_path / "ins.json"))
+    monkeypatch.setattr(api_server, "_SEC_KV_URL", "")
+    ev = lambda **b: client.post("/api/secretary/insights/event", json={"type": "ai", **b})   # noqa: E731
+    for _ in range(3):
+        ev(kind="reg", st="made")
+    ev(kind="reg", st="ok"); ev(kind="reg", st="rejected")
+    ev(kind="reg", st="pending", prev="rejected")                # 틀림 되돌리기
+    ev(kind="plan", st="made", n=9)                              # 한 요청에 한 건만
+    ev(kind="plan", st="rejected")
+    assert ev(kind="reg", st="edited").status_code == 400 and ev(kind="plan", st="ok", prev="edited").status_code == 400
+    m = client.get("/api/secretary/insights/ai").get_json()["months"][0]
+    assert m["reg"] == {"made": 3, "ok": 1, "rejected": 0, "pending": 2}
+    assert m["plan"] == {"made": 1, "ok": 0, "rejected": 1, "pending": 0}

@@ -234,6 +234,16 @@ test("aiReportText: 월간 AI 산출물 보고 문구(만듦·사용·버림·�
   assert.match(t, /낸 문서\(복사·한글·ERP 넣기\) 12건 중 AI 결과가 들어간 문서 5건/);
 });
 
+test("aiReportText: 규정 답변·절차 안내 판단(맞음 비율은 판단한 것 가운데서)", () => {
+  const r = T.aiMonth("2026-10");
+  Object.assign(r.reg, { made: 5, ok: 3, rejected: 1, pending: 1 });
+  Object.assign(r.plan, { made: 2, ok: 1 });
+  const t = T.aiReportText(r, "이 브라우저");
+  assert.match(t, /AI가 만든 결과 0건\(없음\)/);                    // 안내는 산출물 사용률에 섞지 않는다
+  assert.match(t, /AI 안내 7건\(규정 답변 5건, 절차 안내 2건\) — 담당자 판단 맞음 4건 · 틀림 1건 · 판단 안 함 2건, 판단한 것 중 맞음 80%/);
+  assert.doesNotMatch(T.aiReportText(T.aiMonth("2026-10"), "x"), /AI 안내/);
+});
+
 test("draftSources: AI 초안 자료는 이 건에 사람이 적은 것만(메모·상황·기준일·증빙)", () => {
   assert.deepEqual(plain(T.draftSources(null)), []);
   const src = plain(T.draftSources({ procId: "x", note: "세종 방문 협의", query: "출장 정산", dates: {}, receipts: [{ date: "2026-10-05", kind: "운임", vendor: "코레일", route: "서울→오송" }] }));
