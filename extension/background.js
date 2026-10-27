@@ -134,6 +134,8 @@ async function panelWindow(tab) {
 }
 
 // 'https://erp.example.com/*' 또는 'https://*.example.com/*' 형식의 주소 규칙과 탭 주소 비교
+// 상세창을 window.open('') 뒤 스크립트로 그리는 ERP 는 창 주소가 about:blank 다 — 그 문서의 출처(띄운 ERP)로 판단한다
+const senderUrls = (sender) => [sender.tab && sender.tab.url, sender.url, sender.origin].filter((u) => u && u !== "null");
 const hostMatch = (pat, url) => {
   try {
     const u = new URL(url); const m = String(pat).match(/^(\*|https?):\/\/([^/]+)/); if (!m) return false;
@@ -345,10 +347,11 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
       const allowed = origin ? await chrome.permissions.contains({ origins: [origin + "/*"] }).catch(() => false) : false;
       const st = state[m.tabId] || {};
       let frames = null, frameErr = "";
-      try { frames = await chrome.scripting.executeScript({ target: { tabId: m.tabId, allFrames: true }, func: () => !!globalThis.__secSnapshot }); }
+      try { frames = await chrome.scripting.executeScript({ target: { tabId: m.tabId, allFrames: true }, func: () => ({ s: !!globalThis.__secSnapshot, o: self.origin }) }); }
       catch (e) { frameErr = e.message; }
-      reply({ ok: true, url: diagUrl(tab.url), title: tab.title || "", windowType: winType[tab.windowId] || "", listed, allowed,
-        cs: !!st.cs, frames: frames ? frames.length : 0, framesWithScript: frames ? frames.filter((f) => f.result).length : 0, frameErr,
+      const listedAny = listed || (frames || []).some((f) => f.result && f.result.s && (s.erpHosts || []).some((h) => hostMatch(h, f.result.o)));
+      reply({ ok: true, url: diagUrl(tab.url), title: tab.title || "", windowType: winType[tab.windowId] || "", listed: listedAny, allowed: allowed || (listedAny && !!st.cs),
+        cs: !!st.cs, frames: frames ? frames.length : 0, framesWithScript: frames ? frames.filter((f) => f.result && f.result.s).length : 0, frameErr,
         context: st.context || null, guard: st.guard ? { proc: st.guard.proc, n: (st.guard.pitfalls || []).length, enabled: st.guard.enabled } : null,
         focusFrame: st.focusFrame });
     })().catch((e) => reply({ ok: false, error: e.message }));
@@ -372,7 +375,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
   } else if (m.type === "context" && sender.tab) {        // 화면 감지 결과 — 프레임 중 가장 구체적인 것
     // 설정에서 뺀 ERP 주소는 기본 탑재 주소(manifest)라 내용 스크립트가 붙더라도 안내·점검을 하지 않는다
     settings().then(({ erpHosts }) => {
-      const listed = [sender.tab.url, sender.url].some((u) => u && (erpHosts || []).some((h) => hostMatch(h, u)));   // 탭 주소를 못 읽는 포털 안 ERP 프레임도
+      const listed = senderUrls(sender).some((u) => (erpHosts || []).some((h) => hostMatch(h, u)));   // 탭 주소를 못 읽는 포털 안 ERP 프레임·about:blank 상세창도
       if (!listed) { diag("bg", "context.unlisted", { page: diagUrl(sender.tab.url) }, sender); reply && reply({ ignored: true }); return; }
       reply && reply(applyContext(sender.tab, sender.frameId, m.context, sender) ? { ok: true } : { ignored: true });
     });
