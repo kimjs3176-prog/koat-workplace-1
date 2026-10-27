@@ -88,3 +88,19 @@ test("readTimes: 오전·오후, '3시간'(걸린 시간)은 시각이 아님, �
   const r = C.evaluate([{ t: "공동", check: { kind: "span", from: "10:30", to: "15:30" } }], { fields: [{ label: "근무시간", value: "09:00 ~ 06:00", row: 0 }] }, "2026-10-21");
   assert.equal(r[0], null);
 });
+
+test("deleg: 화면 금액으로 전결권자 — 단가·부가세 칸은 빼고, 물품 특례 줄 우선", () => {
+  assert.equal(C.parseAmount("3,300,000"), 3300000);
+  assert.equal(C.parseAmount("330만원"), 3300000);
+  assert.equal(C.parseAmount("1억 5천만"), 150000000);
+  assert.equal(C.parseAmount("2026-10-05"), 0);
+  const tiers = [{ op: "ge", amt: 1e8, q: "", who: "원장" }, { op: "ge", amt: 2e7, q: "", who: "본부장" },
+    { op: "lt", amt: 2e7, q: "", who: "부서장" }, { op: "lt", amt: 5e6, q: "", who: "부서장(센터장)" }, { op: "lt", amt: 5e6, q: "물품구매의경우", who: "부서장" }];
+  assert.equal(C.delegPick(tiers.slice(0, 4), 3e6).who, "부서장(센터장)");
+  assert.equal(C.delegPick(tiers, 3e6).who, "부서장");
+  assert.equal(C.delegPick(tiers, 3e7).who, "본부장");
+  const r = C.evaluate([{ t: "전결", check: { kind: "deleg", blocks: [{ title: "다. 예산집행사항", tiers: tiers.slice(0, 4) }] } }],
+    { fields: [{ label: "단가", value: "90,000,000", row: 0 }, { label: "부가세", value: "3,000,000", row: 0 }, { label: "합계금액", value: "33,000,000", row: 1 }] }, "2026-10-21");
+  assert.equal(r[0].ok, true); assert.match(r[0].note, /합계금액.*33,000,000원.*본부장/);
+  assert.equal(C.evaluate([{ t: "전결", check: { kind: "deleg", blocks: [] } }], { fields: [] }, "2026-10-21")[0], null);
+});

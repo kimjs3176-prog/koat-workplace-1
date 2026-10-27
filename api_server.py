@@ -6,6 +6,7 @@ KOAT 서무비서 — 서무 규정·지침·서식을 담아 두고, 상황을 
 
 import os, json, re, time, threading, webbrowser, base64
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 # 신뢰할 수 없는 XML(업로드 파일·외부 법령 XML)의 엔티티 폭탄(billion laughs) 방어.
 # defusedxml 이 있으면 그 파서를 쓰고, 없으면 표준 파서로 폴백한다.
 try:
@@ -4436,11 +4437,480 @@ def secretary_erp_meta():
                                     "pitfalls": [{"t": _sec_tx(x.get("t", ""), cfg),
                                                   "basis": [{k: b.get(k) for k in ("reg", "art", "q") if b.get(k)} for b in (x.get("basis") or [])][:2],
                                                   **({"check": x["check"]} if isinstance(x.get("check"), dict) else {})}
-                                                 for x in (p.get("pitfalls") or [])][:12],
+                                                 for x in (p.get("pitfalls") or [])][:12] + _sec_deleg_pitfall(p["id"]),
                                     "drafts": [s.get("draft") for s in (p.get("steps") or []) if s.get("draft")]}
                                    for p in procs.values() if not p.get("hidden")],
                     "erp_hosts": _sec_ext_hosts(), "org": (cfg.get("org") or {}).get("name", ""),
                     "erp": _sec_erp_profile(cfg)})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 판정 도구 — 전결권자 · 계약 방법 · 법인카드 이용내역 점검 기준
+#   규정 문서에서 직접 읽거나(위임전결규칙 [별표], 법인카드 운영요령 제4조·제9조), 규칙마다 근거 조문의
+#   문구(quote)를 붙여 지금 규정에 그 문구가 그대로 있는지 확인한다(verified). 문구가 사라졌으면 규정이
+#   바뀐 것이므로 화면에 '근거 확인 필요'로 보인다 — 금액 기준을 지어내거나 옛 기준을 조용히 쓰지 않는다.
+# ══════════════════════════════════════════════════════════════════════════
+_KR_UNIT = {"억": 10**8, "천만": 10**7, "백만": 10**6, "십만": 10**5, "만": 10**4, "천": 10**3, "백": 100, "십": 10}
+_KR_NUM = r"\d+(?:\.\d+)?(?:억|천만|백만|십만|만|천|백|십)?"
+
+
+def _kr_amount(s, won: bool = False):
+    """'5천만 원'·'1억5천만원'·'10백만원'·'1,500만원'·'3,000,000' → 원(int). won=True 면 '원'이 붙은 금액만(‘1건당’의 1 을 금액으로 읽지 않게)."""
+    t = re.sub(r"[\s,]", "", str(s or ""))
+    m = re.search(rf"((?:{_KR_NUM})+)원" if won else rf"((?:{_KR_NUM})+)", t)
+    if not m:
+        return None
+    total = sum(float(n) * _KR_UNIT.get(u, 1) for n, u in re.findall(r"(\d+(?:\.\d+)?)(억|천만|백만|십만|만|천|백|십)?", m.group(1)))
+    return int(round(total))
+
+
+def _sec_quote_ok(reg: str, art: str, quote: str) -> bool:
+    """근거 문구가 지금 규정(조문, 조문 번호가 없으면 규정 전체)에 그대로 있는지 — 띄어쓰기·가운뎃점 차이는 무시"""
+    m, _ = _sec_resolve_reg(reg)
+    if not m or not quote:
+        return False
+    if art:
+        hit = _sec_art(m.get("title", ""), art)
+        text = hit[3] if hit else ""
+    else:
+        text = _sec_reg_text(m.get("title", ""))
+    k = lambda s: re.sub(r"[\s·ㆍ․・‧,]", "", s or "")   # noqa: E731
+    return bool(text) and k(quote) in k(text)
+
+
+class _SecTableParser(HTMLParser):
+    """규정 HTML 의 맨 바깥 표들 → [[(글, rowspan, colspan)]]"""
+    def __init__(self):
+        super().__init__()
+        self.tables, self._t, self._row, self._cell, self._d, self._span = [], None, None, None, 0, (1, 1)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "table":
+            self._d += 1
+            if self._d == 1:
+                self._t = []
+        elif tag == "tr" and self._d == 1:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None and self._d == 1:
+            self._cell = []
+            self._span = (_sec_int(a.get("rowspan"), 1, 1, 500), _sec_int(a.get("colspan"), 1, 1, 20))
+        elif tag in ("p", "br") and self._cell is not None:
+            self._cell.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None:
+            self._row.append((re.sub(r"\s+", " ", "".join(self._cell)).strip(), *self._span))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self._t.append(self._row)
+            self._row = None
+        elif tag == "table":
+            if self._d == 1 and self._t is not None:
+                self.tables.append(self._t)
+                self._t = None
+            self._d = max(0, self._d - 1)
+
+    def handle_data(self, d):
+        if self._cell is not None:
+            self._cell.append(d)
+
+
+def _sec_table_grid(rows: list) -> list:
+    """rowspan·colspan 을 펼친 칸 격자(줄마다 칸 수가 같아진다)"""
+    pend, out = {}, []
+    for r in rows:
+        row, col, cells = [], 0, list(r)
+        while cells or any(c >= col for c in pend):
+            if col in pend:
+                txt, left = pend[col]
+                row.append(txt)
+                if left <= 1:
+                    del pend[col]
+                else:
+                    pend[col] = (txt, left - 1)
+                col += 1
+                continue
+            if not cells:
+                break
+            txt, rs, cs = cells.pop(0)
+            for _ in range(cs):
+                row.append(txt)
+                if rs > 1:
+                    pend[col] = (txt, rs - 1)
+                col += 1
+        out.append(row)
+    return out
+
+
+_SEC_DELEG_CACHE: dict = {}
+_SEC_ROLE_RX = re.compile(r"^(원장|이사장|사장|부원장|부사장|상임이사|본부장|부서장|실장|처장|국장|팀장|센터장|부장|과장)$")
+
+
+def _sec_deleg_rows():
+    """위임전결규칙 [별표] → ([{i, sec, group, parent, item, who:[{role, note}]}], 규정 제목). 파일이 바뀌면 다시 읽는다."""
+    m, _ = _sec_resolve_reg("위임전결규칙")
+    if not m:
+        return [], ""
+    path = os.path.join(REG_DIR, m.get("slug") or m.get("title", ""), "index.html")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return [], ""
+    key = (path, st.st_mtime, st.st_size)
+    if _SEC_DELEG_CACHE.get("key") == key:
+        return _SEC_DELEG_CACHE["rows"], m.get("title", "")
+    rows = []
+    try:
+        p = _SecTableParser()
+        with open(path, encoding="utf-8", errors="replace") as f:
+            p.feed(f.read())
+        table = next((t for t in p.tables if any("전결" in c[0] for r in t[:3] for c in r)), None)
+        grid = _sec_table_grid(table or [])
+        roles = [c for r in grid[:3] for c in r if _SEC_ROLE_RX.match(re.sub(r"\s+", "", c))]
+        roles = list(dict.fromkeys(re.sub(r"\s+", "", c) for c in roles))
+        n = len(roles)
+        sec, parent, prev = "", "", None
+        for r in grid:
+            if n < 2 or len(r) < n + 1:
+                continue
+            rc, rest = r[-n:], r[:-n]
+            if any(_SEC_ROLE_RX.match(re.sub(r"\s+", "", c)) for c in rc) or tuple(r) == prev:
+                prev = tuple(r)
+                continue                                   # 머리줄·두 줄로 나뉜 같은 칸
+            prev = tuple(r)
+            s0 = re.sub(r"\s+", "", rest[0]) if len(rest) >= 3 else ""
+            sec = s0 or sec
+            group = rest[-2] if len(rest) >= 2 else ""
+            item = rest[-1].strip()
+            if not item or item == group:
+                continue
+            sub = item.startswith("○")
+            if not sub:
+                parent = item
+            who = [{"role": roles[i], "note": re.sub(r"^○\s*", "", c).strip(" ()")} for i, c in enumerate(rc) if c.strip()]
+            rows.append({"i": len(rows), "sec": sec, "group": group, "parent": parent if sub else "",
+                         "item": re.sub(r"^○\s*", "", item), "who": who})
+    except Exception as e:
+        print(f"[secretary] 위임전결규칙 별표를 읽지 못함: {e}")
+        rows = []
+    _SEC_DELEG_CACHE.update(key=key, rows=rows)
+    return rows, m.get("title", "")
+
+
+def _sec_deleg_cond(item: str):
+    """'추정가 2천만 원 이상' → ('ge', 20000000, ''), '물품 구매의 경우 5백만원 미만' → ('lt', 5000000, '물품 구매의 경우')"""
+    amt = _kr_amount(item, won=True)
+    op = re.search(r"(이상|초과|미만|이하)", item)
+    if amt is None or not op:
+        return None
+    rest = re.sub(rf"(추정가격?|1건당|건당|취득금액|계약금액|금액|(?:{_KR_NUM})+\s*원|이상|초과|미만|이하|[○()·\s])", "",
+                  re.sub(r"^[가-힣]\.", "", re.sub(r"[\s,]", "", item)))
+    return {"이상": "ge", "초과": "gt", "미만": "lt", "이하": "le"}[op.group(1)], amt, rest
+
+
+def _sec_deleg_pick(tiers: list, amount: int):
+    """금액 구간 줄 가운데 이 금액에 맞는 줄의 순번 — 맞는 '미만·이하' 중 가장 좁은 것, 없으면 맞는 '이상·초과' 중 가장 큰 것"""
+    ok = lambda op, a: {"ge": amount >= a, "gt": amount > a, "lt": amount < a, "le": amount <= a}[op]   # noqa: E731
+    below = [(a, i) for i, (op, a) in tiers if op in ("lt", "le") and ok(op, a)]
+    if below:
+        return min(below)[1]
+    above = [(a, i) for i, (op, a) in tiers if op in ("ge", "gt") and ok(op, a)]
+    return max(above)[1] if above else -1
+
+
+def _sec_deleg_label(who: list) -> str:
+    return ", ".join(w["role"] + (f"({w['note']})" if w.get("note") else "") for w in who) or "—"
+
+
+def _sec_deleg_blocks(rows: list, kw: str, amount=None, proc: str = "") -> list:
+    """검색어가 걸린 업무 묶음들. 묶음 = 상위 항목(가·나…)과 그 아래 ○ 줄들, 또는 같은 업무내용(1·2…)의 줄들."""
+    k = _norm_key(kw)
+    if not k:
+        return []
+    blocks, seen = [], set()
+    for r in rows:
+        hay = _norm_key(r["group"] + " " + (r["parent"] or r["item"]) + " " + r["item"])
+        if k not in hay:
+            continue
+        if r["parent"] and k in _norm_key(r["parent"]):        # ○ 줄이 상위 항목 덕에 걸렸으면 상위 묶음으로
+            key = (r["sec"], r["group"], r["parent"])
+            members = [x for x in rows if (x["sec"], x["group"], x["parent"]) == key]
+        elif not r["parent"] and any(x["parent"] == r["item"] and x["group"] == r["group"] and x["sec"] == r["sec"] for x in rows):
+            key = (r["sec"], r["group"], r["item"])
+            members = [x for x in rows if (x["sec"], x["group"], x["parent"]) == key]
+        elif k in _norm_key(r["group"]) and k not in _norm_key(r["item"]):
+            key = (r["sec"], r["group"], "")
+            members = [x for x in rows if (x["sec"], x["group"]) == key[:2] and x["who"]]
+        else:
+            key = (r["sec"], r["group"], r["item"], r["i"])
+            members = [r]
+        if key in seen:
+            continue
+        seen.add(key)
+        members = [x for x in members if x["who"]]
+        if not members:
+            continue
+        conds = [(x, _sec_deleg_cond(x["item"])) for x in members]
+        generic = [(i, (c[0], c[1])) for i, (x, c) in enumerate(conds) if c and not c[2]]
+        b = {"sec": key[0], "group": key[1], "parent": key[2] if len(key) > 2 else "",
+             "title": " › ".join(x for x in (key[0], key[1], key[2] if len(key) > 2 else "") if x),
+             "rows": [{"item": x["item"], "who": _sec_deleg_label(x["who"]), "cond": c and {"op": c[0], "amt": c[1], "q": c[2]}}
+                      for x, c in conds],
+             "tiered": bool(generic), "picked": -1}
+        if amount is not None and generic:
+            b["picked"] = _sec_deleg_pick(generic, amount)
+            # '물품 구매의 경우 5백만원 미만' 같은 특례 줄 — 이 업무에 해당하면 그 줄을 쓴다
+            for i, (x, c) in enumerate(conds):
+                if c and c[2] and _sec_deleg_pick([(i, (c[0], c[1]))], amount) == i and \
+                        (proc == "goods-purchase" and "물품" in c[2]):
+                    b["picked"] = i
+        blocks.append(b)
+    # 공통 사항을 앞에(같은 업무가 부서별 사항에도 있으면 뒤에 — 위임전결규칙 제6조제4항: 부서별 사항이 우선)
+    return sorted(blocks, key=lambda b: (b["sec"] != "공통", b["title"]))[:12]
+
+
+# 절차 → 위임전결규칙 [별표]에서 찾을 말(그 기관 별표에 없는 말이면 아무것도 보이지 않는다)
+_SEC_DELEG_PROC = {
+    "domestic-trip": ["국내출장"], "overseas-trip": ["국외출장"], "leave": ["휴가("], "flexible-work": ["유연근무"],
+    "goods-purchase": ["예산집행사항", "고정자산및물품의관리"], "service-contract": ["예산집행사항"],
+    "corp-card": ["업무추진비"], "event": ["업무추진비", "예산집행사항"], "expert-fee": ["예산집행사항"],
+    "gift-cert": ["예산집행사항"], "official-vehicle": ["배차신청"],
+}
+_SEC_DELEG_BASIS = {"reg": "위임전결규칙", "art": "6"}
+
+
+@app.route("/api/secretary/deleg")
+def secretary_deleg():
+    """전결권자 찾기 — ?proc=절차id 또는 ?q=업무, &amount=원(선택)"""
+    rows, title = _sec_deleg_rows()
+    if not rows:
+        return jsonify({"success": True, "available": False, "blocks": []})
+    amount = _kr_amount(request.args.get("amount")) if (request.args.get("amount") or "").strip() else None
+    proc = str(request.args.get("proc") or "")[:48]
+    q = str(request.args.get("q") or "").strip()[:40]
+    kws = [q] if q else _SEC_DELEG_PROC.get(proc, [])
+    blocks = []
+    for kw in kws:
+        blocks += [b for b in _sec_deleg_blocks(rows, kw, amount, proc) if b["title"] not in {x["title"] for x in blocks}]
+    if proc and not q:
+        blocks = [b for b in blocks if b["sec"] == "공통"] or blocks     # 절차 화면은 공통 사항만(부서별은 '전결권자 찾기'에서)
+    return jsonify({"success": True, "available": True, "reg": title, "basis": _SEC_DELEG_BASIS,
+                    "amount": amount, "blocks": blocks[:12]})
+
+
+def _sec_deleg_checks(proc_id: str) -> list:
+    """확장 결재 전 점검용: 이 절차의 금액 구간(전결권자) — [{title, tiers:[{op, amt, who, q}]}]"""
+    rows, _ = _sec_deleg_rows()
+    out = []
+    for kw in _SEC_DELEG_PROC.get(proc_id, []):
+        for b in _sec_deleg_blocks(rows, kw, None, proc_id):
+            if b["sec"] == "공통" and b["tiered"]:
+                out.append({"title": b["parent"] or b["group"],
+                            "tiers": [{**r["cond"], "who": r["who"]} for r in b["rows"] if r["cond"]
+                                      and (not r["cond"]["q"] or (proc_id == "goods-purchase" and "물품" in r["cond"]["q"]))]})
+    return out[:3]
+
+
+def _sec_deleg_pitfall(proc_id: str) -> list:
+    """확장 결재 전 점검에 더하는 항목: 화면 금액으로 위임전결규칙 [별표]의 전결권자를 짚는다(금액 구간이 있는 업무만)"""
+    blocks = _sec_deleg_checks(proc_id)
+    if not blocks:
+        return []
+    return [{"t": f"결재선의 전결권자가 금액에 맞나요? ({blocks[0]['title']})", "basis": [_SEC_DELEG_BASIS],
+             "check": {"kind": "deleg", "blocks": blocks}}]
+
+
+# ── 계약 방법 판정 ─────────────────────────────────────────────────────────
+# 기관 계약사무규칙·재무회계규정 시행세칙·고정자산 및 물품 관리요령의 금액 기준. 규칙마다 근거 문구를 붙여 지금 규정에
+# 그대로 있는지 확인한다. 소액 수의계약 한도·1인 견적은 「국가계약법 시행령」(계약사무규칙 제3조제2항으로 준용) 기준이라
+# 기관 규정 밖의 법령임을 표시한다.
+_SEC_CONTRACT = {
+    "dept_goods": 5_000_000, "dept_service": 15_000_000,         # 시행세칙 [별표 1-1] 부서 지출원인행위(부가세 포함, 미만)
+    "small": 20_000_000, "small_special": 50_000_000,             # 소액 수의계약·1인 견적(추정가격, 이하)
+    "doc_skip": 30_000_000, "inspect_skip": 30_000_000,           # 계약서·검사조서 생략(계약금액, 이하)
+    "retiree_skip": 10_000_000, "disclose": 5_000_000, "asset": 1_000_000,
+}
+_SEC_LAW_URL = "https://www.law.go.kr/법령/국가를당사자로하는계약에관한법률시행령"
+_SEC_PARTNERS = {"general": "일반 업체", "women": "여성기업", "disabled": "장애인기업", "social": "사회적기업",
+                 "coop": "사회적협동조합", "selfsup": "자활기업·마을기업", "severe": "중증장애인생산품 생산시설", "std": "장애인표준사업장"}
+
+
+def _sec_contract_judge(kind: str, amount: int, vat: str, partner: str, corp: bool) -> dict:
+    C = _SEC_CONTRACT
+    gross = amount if vat == "incl" else int(round(amount * 1.1))       # 계약금액(부가세 포함)
+    est = int(round(amount / 1.1)) if vat == "incl" else amount         # 추정가격(부가세 제외)
+    w = lambda n: f"{n:,}원"                                              # noqa: E731
+    items = []
+
+    def add(k, verdict, title, detail, reg="", art="", quote="", q="", law=""):
+        it = {"k": k, "verdict": verdict, "title": title, "detail": detail}
+        if reg:
+            it["basis"] = {k2: v for k2, v in (("reg", reg), ("art", art), ("q", q)) if v}
+            it["verified"] = _sec_quote_ok(reg, art, quote) if quote else None
+        if law:
+            it["law"] = law
+        items.append(it)
+
+    # 1) 부서에서 직접 계약할 수 있나(분임 지출원인행위) / 운영부서 직접 취득
+    if kind == "asset":
+        add("dept", "warn", "부서에서 직접 계약할 수 없습니다 — 계약담당(운영지원실)에 계약 의뢰",
+            "자산취득비 등 자본적 지출은 각 부서의 분임지출원인행위담당이 처리할 수 없습니다.",
+            "재무회계규정 시행세칙", "", "자본적 지출", q="자본적 지출")
+    else:
+        lim = C["dept_goods"] if kind == "goods" else C["dept_service"]
+        ok = gross < lim
+        add("dept", "ok" if ok else "warn",
+            ("부서에서 직접 계약·지출 가능" if ok else "계약담당(운영지원실)에 계약 의뢰") + f" — 계약건당 {w(lim)}(부가세 포함) 미만 기준",
+            f"계약금액(부가세 포함) {w(gross)}. " + ("소액물품은 관리부서에 청구하지 않고 운용부서가 직접 취득할 수 있습니다." if ok and kind == "goods" else ""),
+            "재무회계규정 시행세칙", "",
+            "계약건당 500만원(부가세 포함) 미만 물품" if kind == "goods" else "계약건당 1,500만원(부가세 포함) 미만 용역",
+            q="계약건당 500만원" if kind == "goods" else "계약건당 1,500만원")
+    # 2) 계약 방법 — 사회적가치 수의계약 → 소액 수의계약 → 경쟁입찰
+    special_lim = partner in ("women", "disabled", "social", "coop", "selfsup")
+    lim = C["small_special"] if special_lim else C["small"]
+    if partner in ("severe", "std"):
+        sole, how = True, f"{_SEC_PARTNERS[partner]}과(와)의 계약은 금액과 상관없이 수의계약할 수 있습니다(직접 생산·수행한 것에 한정)."
+        add("method", "ok", "수의계약 가능(사회적가치 우선계약)", how, "계약사무규칙", "9",
+            "중증장애인생산품" if partner == "severe" else "장애인표준사업장")
+    elif est <= lim:
+        sole = True
+        add("method", "ok", f"소액 수의계약 가능 — 추정가격 {w(lim)} 이하",
+            f"추정가격(부가세 제외) {w(est)}." + (f" {_SEC_PARTNERS[partner]}은(는) 5천만원 이하까지 수의계약할 수 있습니다(계약사무규칙 제9조)." if special_lim else "")
+            + " 소액 수의계약 한도는 「국가계약법 시행령」 제26조제1항제5호가목 기준입니다(계약사무규칙 제3조제2항으로 준용) — 법령이 바뀌면 달라질 수 있습니다.",
+            "계약사무규칙", "10", "추정가격이 2천만원", law=_SEC_LAW_URL)
+    else:
+        sole = False
+        add("method", "warn", "경쟁입찰이 원칙 — 전자조달시스템(나라장터)에 입찰공고",
+            f"추정가격 {w(est)}은(는) 소액 수의계약 한도({w(lim)})를 넘습니다. 일반경쟁이 원칙이고, 관계 법령이 정한 경우에만 제한·지명경쟁 또는 수의계약을 할 수 있습니다. "
+            "입찰공고 내용을 정정하면 남은 공고기간에 5일 이상을 더해야 합니다(제11조).",
+            "계약사무규칙", "8", "일반경쟁에 부쳐야 한다")
+    # 3) 견적 — 소액 수의계약은 1인 견적(「국가계약법 시행령」 제30조), 경쟁입찰은 입찰서
+    if sole and partner not in ("severe", "std"):
+        add("quote", "ok", "1인 견적으로 계약 가능",
+            f"추정가격 {w(lim)} 이하 수의계약은 1인 견적서로 할 수 있습니다(「국가계약법 시행령」 제30조). "
+            "견적 전 거래처의 사업자 상태(계속·휴업·폐업)를 확인하세요.", law=_SEC_LAW_URL)
+    elif not sole:
+        add("quote", "info", "입찰로 진행 — 견적서 대신 입찰서", "적격심사 등 낙찰자 결정 방법은 입찰공고에 따릅니다.", "계약사무규칙", "13", "적격심사기준")
+    # 4) 수의계약 사전 체크리스트
+    if sole:
+        dept_ok = kind != "asset" and gross < (C["dept_goods"] if kind == "goods" else C["dept_service"])
+        add("checklist", "skip" if dept_ok else "need",
+            "수의계약 사전 체크리스트(별지 제7호) " + ("첨부 생략 가능" if dept_ok else "첨부"),
+            ("부서에서 지출원인행위를 할 수 있는 금액이라 생략할 수 있습니다." if dept_ok
+             else "수의계약 대상자의 자격요건과 대상 물품의 직접생산 여부를 확인해 첨부합니다."),
+            "계약사무규칙", "9", "수의계약 사전 체크리스트")
+        # 5) 퇴직자 재직여부 확인
+        if corp:
+            if gross <= C["retiree_skip"]:
+                add("retiree", "skip", "퇴직자 재직여부 확인서(별지 제5호) 생략 가능", f"계약금액 {w(C['retiree_skip'])} 이하입니다.",
+                    "계약사무규칙", "21", "1천만원이하인 계약")
+            else:
+                add("retiree", "need", "퇴직자 재직여부 확인서(별지 제5호) 받기",
+                    "법인의 임원 명단을 받아 퇴직 2년 이내 농진원 퇴직자가 임원으로 있는지 확인합니다. 해당하면 수의계약할 수 없습니다"
+                    + (" — 다만 전자조달시스템으로 견적을 받는 경우는 예외입니다." if est >= C["small"] else "."),
+                    "계약사무규칙", "21", "퇴직자 재직여부")
+        else:
+            add("retiree", "info", "개인과 계약 — 퇴직 2년 이내 농진원 퇴직자 본인인지 확인", "퇴직일부터 2년 이내의 퇴직자와는 수의계약할 수 없습니다.",
+                "계약사무규칙", "21", "퇴직자와 그 퇴직자의 퇴직일부터 2년 이내")
+    # 6) 계약서
+    if gross <= C["doc_skip"]:
+        add("doc", "skip", "계약서 작성 생략 가능",
+            "청구서·각서·승낙사항(별지 제4호) 등 계약 성립의 증거 서류를 받아 비치합니다. 청렴계약이행서약서·인권존중의무 이행서약서도 받지 않을 수 있습니다.",
+            "계약사무규칙", "16", "계약금액이 3천만원 이하인 계약")
+    else:
+        add("doc", "need", "표준계약서(별지 제3호) 작성",
+            "청렴계약이행서약서(별지 제1호)·인권존중의무 이행서약서(별지 제6호)를 받고, 중소기업과는 상생협력 약정을 합니다.",
+            "계약사무규칙", "16", "표준계약서")
+    # 7) 검사조서
+    add("inspect", "skip" if gross <= C["inspect_skip"] else "need",
+        "검사조서 작성 " + ("생략 가능" if gross <= C["inspect_skip"] else "필요"),
+        "납품(완료) 때 검사하고 " + ("검사조서는 생략할 수 있습니다." if gross <= C["inspect_skip"] else "검사조서를 작성합니다."),
+        "계약사무규칙", "17", "3천만원 이하인 계약의 경우")
+    # 8) 수의계약 공개
+    if sole:
+        add("disclose", "need", "수의계약 내용 홈페이지 공개 — " + ("계약 건별" if gross >= C["disclose"] else "건수·금액 통합"),
+            "매월 말일 기준으로 다음 달 말일까지 공개합니다(사업명·기간·상대자·계약금액·수의계약 근거와 사유).",
+            "계약사무규칙", "20", "5백만원 이상은 계약 건 별로")
+    # 9) 자산 등록
+    if kind == "asset" and gross >= C["asset"]:
+        add("asset", "need", "자산관리시스템 등록 — 취득금액 100만원 이상 비소모품",
+            "취득한 뒤 총괄관리부서에 알려 자산관리시스템에 등록·관리되게 합니다.",
+            "고정자산 및 물품 관리요령", "16", "취득금액 100만원 이상(부가세 포함)의 비소모품")
+    # 10) 지역·중소기업 제한(경쟁입찰)
+    if not sole:
+        add("local", "info", "고시금액 미만이면 지역·중소기업 제한 검토",
+            "추정가격이 고시금액(기획재정부 고시) 미만인 물품·용역 경쟁입찰은 농진원 소재 지역 업체·중소기업자로 제한하는 등 사회적가치 증진을 검토합니다.",
+            "계약사무규칙", "9", "고시금액 미만")
+    rows, _ = _sec_deleg_rows()
+    deleg = _sec_deleg_blocks(rows, "예산집행사항", est, "goods-purchase" if kind in ("goods", "asset") else "")
+    deleg = [b for b in deleg if b["sec"] == "공통"][:1]
+    return {"gross": gross, "est": est, "sole": sole, "items": items, "deleg": deleg,
+            "basis_deleg": _SEC_DELEG_BASIS if deleg else None}
+
+
+@app.route("/api/secretary/contract", methods=["POST"])
+def secretary_contract():
+    """계약 방법 판정 — {kind: goods|asset|service, amount, vat: incl|excl, partner, corp}"""
+    b = request.get_json(silent=True)
+    if not isinstance(b, dict):
+        return jsonify({"success": False, "error": "요청 형식이 올바르지 않습니다."}), 400
+    kind = b.get("kind") if b.get("kind") in ("goods", "asset", "service") else "goods"
+    amount = _kr_amount(b.get("amount")) if not isinstance(b.get("amount"), (int, float)) else int(b["amount"])
+    if not amount or amount <= 0 or amount > 10**12:
+        return jsonify({"success": False, "error": "금액을 입력하세요."}), 400
+    vat = "excl" if b.get("vat") == "excl" else "incl"
+    partner = b.get("partner") if b.get("partner") in _SEC_PARTNERS else "general"
+    return jsonify({"success": True, **_sec_contract_judge(kind, amount, vat, partner, b.get("corp") is not False)})
+
+
+# ── 법인카드 이용내역 점검 기준 — 법인카드 운영요령 제4조(사용시간·제한업종·제한물품)·제9조(한도)에서 읽는다 ──
+_SEC_CARD_STOP = {"카페", "바", "등", "기타", "주점", "그밖의"}       # 너무 넓은 말(커피 전문점·'바'가 든 상호를 잡지 않게)
+
+
+def _sec_card_rules() -> dict:
+    m, _ = _sec_resolve_reg("법인카드 운영요령")
+    out = {"available": bool(m), "reg": (m or {}).get("title", ""), "hours": None, "limit": None,
+           "industries": [], "goods": [], "basis": {"reg": "법인카드 운영요령", "art": "4"}}
+    if not m:
+        return out
+    a4 = _sec_art(m["title"], "4")
+    t4 = re.sub(r"\s+", " ", a4[3]) if a4 else ""
+    k4 = re.sub(r"\s+", "", t4)
+    h = re.search(r"근무일(\d{1,2})시부터(\d{1,2})시까지", k4)
+    if h:
+        out["hours"] = {"from": int(h.group(1)), "to": int(h.group(2)), "quote": f"근무일 {h.group(1)}시부터 {h.group(2)}시까지"}
+    # ③ 1. 일반유흥주점업종 : 룸싸롱, 단란주점, … 등 접객요원을 … / ⑥ 1. 금, 은, 보석 등 귀금속류
+    p3 = re.search(r"③(.*?)(?:④|$)", t4)
+    for name, body in re.findall(r"\d+\.\s*([^:：\d]+?)\s*[:：]\s*([^\d]+?)(?=\s\d+\.|$)", p3.group(1) if p3 else ""):
+        kws = []
+        for x in re.split(r"[,，]", re.sub(r"\s등\s.*$", "", body)):
+            x = re.sub(r"\(.*?\)|등$", "", re.sub(r"\s+", "", x)).strip("․・·.")
+            if "․" in x or "・" in x:                       # '이․미용실' → 미용실, '실내․외골프장' → 골프장
+                tail = re.split(r"[․・]", x)[-1]
+                x = tail[1:] if len(tail) > 3 else tail
+            if len(x) >= 2 and x not in _SEC_CARD_STOP:
+                kws.append(x)
+        if kws:
+            out["industries"].append({"name": re.sub(r"\s+", "", name), "kw": kws[:30]})
+    p6 = re.search(r"⑥(.*)$", t4)
+    for body in re.findall(r"\d+\.\s*([^\d]+?)(?=\s\d+\.|$)", p6.group(1) if p6 else ""):
+        head, _, tail = body.partition(" 등 ")              # '금, 은, 보석 등 귀금속류' — 앞은 물품, 뒤는 묶음 이름(띄어 쓴 설명이면 뺌)
+        kws = [re.sub(r"\s+", "", x) for x in head.split(",")] + ([re.sub(r"류$", "", tail.strip())] if tail.strip() and " " not in tail.strip() else [])
+        out["goods"].append({"name": re.sub(r"\s+", " ", body).strip()[:30], "kw": [k for k in kws if len(k) >= 2 and k not in _SEC_CARD_STOP][:10]})
+    a9 = _sec_art(m["title"], "9")
+    lim = re.search(r"기본한도액은월?([\d,]+(?:억|천만|백만|십만|만)?원)", re.sub(r"\s+", "", a9[3])) if a9 else None
+    if lim:
+        out["limit"] = {"amount": _kr_amount(lim.group(1)), "quote": lim.group(1), "basis": {"reg": "법인카드 운영요령", "art": "9"}}
+    out["evidence"] = {"basis": {"reg": "법인카드 운영요령", "art": "12"}, "ok": _sec_quote_ok("법인카드 운영요령", "12", "매출전표 등의 증빙서류")}
+    out["publish"] = {"basis": {"reg": "법인카드 운영요령", "art": "14"}, "ok": _sec_quote_ok("법인카드 운영요령", "14", "월별 사용내역")}
+    return out
+
+
+@app.route("/api/secretary/card/rules")
+def secretary_card_rules():
+    """법인카드 이용내역 점검 기준(사용시간·제한업종·제한물품·월 한도) — 이용내역 자체는 서버로 보내지 않고 화면에서 대조한다."""
+    return jsonify({"success": True, **_sec_card_rules()})
 
 
 # ══════════════════════════════════════════════════════════════════════════

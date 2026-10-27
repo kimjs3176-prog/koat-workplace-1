@@ -7,6 +7,7 @@
 //   attach                — 첨부가 1개 이상
 //   hours    {max}        — 근무 시각(시작~끝)이 max 시간 이하
 //   span     {from, to}   — 근무 시각이 from~to 를 모두 덮는지(공동근무시간)
+//   deleg    {blocks}     — 화면 금액으로 위임전결규칙 [별표]의 전결권자를 짚는다(판정이 아니라 안내 — 결재선은 사람이 확인)
 (() => {
   const pad = (n) => String(n).padStart(2, "0");
   const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -77,6 +78,32 @@
     const all = cand.flatMap((f) => parseTimes(f.value));
     return all.length >= 2 ? { from: all[0], to: all[1] } : null;
   }
+  // 금액: '3,300,000' · '330만원' · '1억 5천만' → 원. 단가·수량·번호 칸은 뺀다
+  const UNIT = { 억: 1e8, 천만: 1e7, 백만: 1e6, 십만: 1e5, 만: 1e4, 천: 1e3 };
+  function parseAmount(v) {
+    const t = String(v || "").replace(/[\s,]|원$/g, "");
+    if (!/^(\d+(\.\d+)?(억|천만|백만|십만|만|천)?)+$/.test(t)) return 0;
+    let n = 0; for (const m of t.matchAll(/(\d+(?:\.\d+)?)(억|천만|백만|십만|만|천)?/g)) n += +m[1] * (UNIT[m[2]] || 1);
+    return Math.round(n);
+  }
+  function readAmount(fields) {
+    let best = null;
+    for (const f of fields || []) {
+      const l = f.label || "";
+      if (!/금액|합계|총액|추정|소요|예산액|사용액|결제액|계약액|집행액|비용/.test(l) || /단가|수량|번호|코드|비율|잔액|부가세|세액/.test(l)) continue;
+      const n = parseAmount(f.value);
+      if (n >= 1000 && (!best || n > best.n)) best = { n, label: l };
+    }
+    return best;
+  }
+  // 금액 구간 줄 가운데 맞는 줄 — 맞는 '미만·이하' 중 가장 좁은 것, 없으면 맞는 '이상·초과' 중 가장 큰 것(서버 _sec_deleg_pick 과 같음)
+  function delegPick(tiers, n) {
+    const ok = (t) => ({ ge: n >= t.amt, gt: n > t.amt, lt: n < t.amt, le: n <= t.amt })[t.op];
+    const gen = tiers.filter((t) => !t.q && ok(t)), lo = gen.filter((t) => t.op === "lt" || t.op === "le"), hi = gen.filter((t) => t.op === "ge" || t.op === "gt");
+    let pick = lo.length ? lo.reduce((a, b) => (b.amt < a.amt ? b : a)) : hi.length ? hi.reduce((a, b) => (b.amt > a.amt ? b : a)) : null;
+    const sp = tiers.find((t) => t.q && ok(t)); if (sp) pick = sp;              // '물품 구매의 경우 5백만원 미만' 같은 특례
+    return pick;
+  }
   function evaluate(pitfalls, screen, today, labels) {
     const dates = readDates(screen.fields || [], labels), times = readTimes(screen.fields || [], labels);
     const at = (k) => { const l = String(((dates._l || {})[k]) || "").trim(); return l ? `'${l.slice(0, 12)}' 칸` : "화면 날짜"; };
@@ -95,6 +122,9 @@
         return h > 0 && h <= (+c.max || 0) ? { ok: true, note: `${h}시간` } : h > 0 ? { ok: false, note: `${h}시간 — 하루 ${c.max}시간 넘음` } : null; }
       if (c.kind === "span" && times && times.to > times.from) { const toM = (s) => { const [h, mm] = s.split(":").map(Number); return h * 60 + mm; };
         return times.from <= toM(c.from) && times.to >= toM(c.to) ? { ok: true, note: `${c.from}~${c.to} 포함` } : { ok: false, note: `근무 시각이 ${c.from}~${c.to}를 덮지 않습니다` }; }
+      if (c.kind === "deleg") { const a = readAmount(screen.fields); if (!a) return null;
+        const parts = (c.blocks || []).map((b) => { const t = delegPick(b.tiers || [], a.n); return t ? `${b.title}: ${t.who}` : ""; }).filter(Boolean);
+        return parts.length ? { ok: true, note: `'${a.label.slice(0, 12)}' ${a.n.toLocaleString("ko-KR")}원 → 전결권자 ${parts.join(" · ")} — 결재선에 있는지 확인` } : null; }
       return null;                                            // 화면에서 값을 못 읽음 — 사람이 확인
     });
     if (dates.start && dates.end && dates.start > dates.end) res.extra = { ok: false, note: `시작일(${md(dates.start)})이 끝난 날(${md(dates.end)})보다 늦습니다` };
@@ -111,5 +141,5 @@
     if (/(^|\n)\s*(?:첨부(된)?\s*파일(이)?\s*없(습니다|음)\.?|No attachments?\.?)\s*($|\n)/im.test(t)) return 0;
     return undefined;
   }
-  globalThis.SEC_CHECK = { evaluate, readDates, readTimes, parseDate, countAttach };
+  globalThis.SEC_CHECK = { evaluate, readDates, readTimes, parseDate, countAttach, parseAmount, readAmount, delegPick };
 })();

@@ -471,3 +471,64 @@ def test_budget_audit_rules(monkeypatch):
     assert "일반수용비" in f["detail"] and f["basis"] == {"reg": "재무회계규정", "art": "82"}
     monkeypatch.setattr(api_server, "_sec_config", real)
     assert ids("goods-purchase", {}) == []                                   # 기준표가 없으면 점검하지 않는다
+
+
+def test_kr_amount():
+    f = api_server._kr_amount
+    assert f("5천만 원") == 50_000_000 and f("1억5천만원") == 150_000_000 and f("10백만원") == 10_000_000
+    assert f("1,500만원") == 15_000_000 and f("3,000,000") == 3_000_000 and f("330만") == 3_300_000
+    assert f("1건당 2백만 원 이상", won=True) == 2_000_000 and f("없음") is None
+
+
+def test_deleg_table_and_tiers(client):
+    rows, title = api_server._sec_deleg_rows()
+    assert title and len(rows) > 300                          # 위임전결규칙 [별표] 전체(공통 + 부서별)
+    d = client.get("/api/secretary/deleg", query_string={"proc": "corp-card", "amount": "70만"}).get_json()
+    b = d["blocks"][0]
+    assert "업무추진비" in b["title"] and b["rows"][b["picked"]]["who"] == "본부장"      # 1건당 5십만 원 이상
+    pick = lambda pid, amt: (lambda b: b["rows"][b["picked"]]["who"])(            # noqa: E731
+        client.get("/api/secretary/deleg", query_string={"proc": pid, "amount": amt}).get_json()["blocks"][0])
+    assert pick("goods-purchase", "300만") == "부서장"                              # 물품 구매 특례(5백만원 미만)
+    assert pick("service-contract", "300만") == "부서장(센터장)"
+    assert pick("service-contract", "3000만") == "본부장" and pick("service-contract", "2억") == "원장"
+    d = client.get("/api/secretary/deleg", query_string={"proc": "domestic-trip"}).get_json()
+    assert d["blocks"] and d["blocks"][0]["rows"][0]["who"].startswith("부서장") and d["blocks"][0]["picked"] == -1
+    assert client.get("/api/secretary/deleg", query_string={"proc": "leave-nothing"}).get_json()["blocks"] == []
+    assert client.get("/api/secretary/deleg", query_string={"q": "휴일대체"}).get_json()["blocks"]
+
+
+def test_erp_meta_has_deleg_check(client):
+    d = client.get("/api/secretary/erp/meta").get_json()
+    p = next(x for x in d["procedures"] if x["id"] == "corp-card")
+    chk = p["pitfalls"][-1]["check"]
+    assert chk["kind"] == "deleg" and chk["blocks"][0]["tiers"][0] == {"op": "ge", "amt": 2_000_000, "q": "", "who": "원장"}
+
+
+def test_contract_judge(client):
+    post = lambda **b: client.post("/api/secretary/contract", json=b).get_json()   # noqa: E731
+    k = lambda d: {i["k"]: i for i in d["items"]}                                   # noqa: E731
+    d = post(kind="goods", amount="330만", vat="incl")
+    assert d["success"] and d["est"] == 3_000_000 and d["sole"]
+    it = k(d)
+    assert it["dept"]["verdict"] == "ok" and it["doc"]["verdict"] == "skip" and it["inspect"]["verdict"] == "skip"
+    assert it["checklist"]["verdict"] == "skip" and it["retiree"]["verdict"] == "skip" and it["disclose"]["title"].endswith("통합")
+    assert all(i.get("verified") is not False for i in d["items"])                 # 근거 문구가 지금 규정에 있다
+    assert d["deleg"][0]["rows"][d["deleg"][0]["picked"]]["who"] == "부서장"
+    d = post(kind="service", amount=40_000_000, vat="excl")                          # 추정가격 4천만 → 경쟁입찰
+    it = k(d)
+    assert not d["sole"] and it["method"]["verdict"] == "warn" and it["doc"]["verdict"] == "need" and "local" in it
+    d = post(kind="service", amount=40_000_000, vat="excl", partner="women")         # 여성기업은 5천만원 이하 수의계약·1인 견적
+    assert d["sole"] and k(d)["quote"]["verdict"] == "ok" and k(d)["retiree"]["verdict"] == "need"
+    assert post(kind="goods", amount=10_000_000, partner="severe")["sole"]            # 중증장애인생산품: 금액 제한 없음
+    d = post(kind="asset", amount="200만")
+    assert k(d)["dept"]["verdict"] == "warn" and k(d)["asset"]["verdict"] == "need"
+    assert client.post("/api/secretary/contract", json={"kind": "goods"}).status_code == 400
+    assert client.post("/api/secretary/contract", json=[1]).status_code == 400
+
+
+def test_card_rules_from_regulation(client):
+    d = client.get("/api/secretary/card/rules").get_json()
+    assert d["hours"] == {"from": 8, "to": 22, "quote": "근무일 8시부터 22시까지"} and d["limit"]["amount"] == 10_000_000
+    kws = {k for x in d["industries"] for k in x["kw"]}
+    assert {"단란주점", "노래방", "골프장", "미용실", "호프집"} <= kws and not kws & {"카페", "바"}
+    assert any("귀금속" in g["kw"] for g in d["goods"])
