@@ -259,6 +259,229 @@ function deadlineText(step){
   return dl.label || step.when || '';
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 🧮 판정 도구 — 전결권자 찾기 · 계약 방법 판정 · 법인카드 이용내역 점검
+//   기준은 서버가 지금 규정 문서에서 읽은 것(위임전결규칙 [별표]·계약사무규칙·법인카드 운영요령)이고,
+//   판정마다 📖 근거 조문이 붙는다. 근거 문구가 지금 규정에 없으면 '근거 확인 필요'로 보인다.
+// ═══════════════════════════════════════════════════════════════════════════
+const basisBtn=b=>b?`<button class="sec-mini" data-a="openreg" data-reg="${esc(b.reg)}" data-art="${esc(b.art||'')}" data-q="${esc(b.q||'')}">📖 ${esc(basisLabel(b))}</button>`:'';
+// 위임전결규칙 [별표] 묶음 → 표(금액에 맞는 줄 강조)
+function delegBlocksHtml(d){
+  if(!d) return `<div class="sec-sub">불러오는 중…</div>`;
+  if(d.error) return `<div class="sec-notice warn">${esc(d.error)}</div>`;
+  if(!d.available) return `<div class="sec-sub">위임전결규칙 [별표]를 찾지 못했습니다(내규 등록 확인).</div>`;
+  if(!(d.blocks||[]).length) return `<div class="sec-sub">맞는 업무를 찾지 못했습니다. 다른 말(예: 업무추진비, 예산집행, 국외출장)로 찾아 보세요.</div>`;
+  return d.blocks.map(b=>{ const pk=b.picked>=0?b.rows[b.picked]:null;
+    return `<div class="sec-deleg">`+(pk?`<div class="sec-deleg-pick">→ 전결권자 <b>${esc(pk.who)}</b> <span class="sec-sub">${esc(pk.item)}${d.amount!=null?` · ${won(d.amount)}원 기준`:''}</span></div>`:'')+
+      `<div class="sec-deleg-h">${esc(b.title)}</div><div class="sec-tbl-wrap"><table class="sec-tbl"><tbody>`+
+      b.rows.map((r,i)=>`<tr${i===b.picked?' class="on"':''}><td>${esc(r.item)}</td><td class="who">${esc(r.who)}</td></tr>`).join('')+`</tbody></table></div></div>`; }).join('')+
+    `<div class="sec-row">${basisBtn(d.basis)}<span class="sec-sub">별표에 없는 일은 비슷한 업무에 준하고, 중대한 재정 부담·민원이 예상되면 직근 상급자 결재(제6조·제7조).</span></div>`;
+}
+function delegFetch(qs, done){
+  const key=qs.toString(); S.dl=S.dl||{}; if(S.dl[key]) return S.dl[key];
+  S.dl[key]=null;
+  fetch('/api/secretary/deleg?'+key).then(r=>r.json()).then(d=>{ S.dl[key]=d.success?d:{error:d.error||'불러오지 못했습니다.'}; done&&done(); })
+    .catch(()=>{ S.dl[key]={error:'서버에 연결하지 못했습니다.'}; done&&done(); });
+  return null;
+}
+// 절차 화면 카드: 이 업무의 전결권자(금액이 있으면 그 구간)
+function delegCardHtml(p, c){
+  S.pdAmt=S.pdAmt||{};
+  const rcSum=receipts(c).reduce((a,r)=>a+(Number(r.amount)||0),0);
+  const amt=S.pdAmt[p.id]!=null?S.pdAmt[p.id]:(rcSum?won(rcSum):'');
+  const qs=new URLSearchParams({proc:p.id}); if(String(amt).trim()) qs.set('amount', String(amt).replace(/[^\d만억천백십.]/g,''));
+  const d=delegFetch(qs, ()=>{ if(S.view==='proc'&&S.procId===p.id) render(); });
+  if(!d || d.error || !d.available || !(d.blocks||[]).length) return '';     // 불러오는 중이거나 이 업무가 별표에 없으면 카드 없음
+  const tiered=d&&(d.blocks||[]).some(b=>b.tiered);
+  const extra=p.id==='goods-purchase'||p.id==='service-contract'?`<button class="sec-btn sm" data-a="toct" data-kind="${p.id==='service-contract'?'service':'goods'}">📑 계약 방법 판정</button>`
+    :p.id==='corp-card'?`<button class="sec-btn sm" data-a="view" data-v="tools">💳 카드 이용내역 점검</button>`:'';
+  return `<div class="sec-card"><div class="sec-card-h">🖋 전결권자 <span class="sec-sub">위임전결규칙 [별표]${tiered?' — 금액을 넣으면 그 구간을 짚습니다':''}</span></div>`+
+    (tiered?`<div class="sec-row"><label class="sec-f sm"><span>금액(원)</span><input data-a="pdamt" inputmode="numeric" value="${esc(amt)}" placeholder="예: 3,300,000 또는 330만"></label>${extra}</div>`
+      :extra?`<div class="sec-row">${extra}</div>`:'')+
+    ((d.blocks||[]).some(b=>b.rows.some(r=>/추정가/.test(r.item)))?`<div class="sec-sub">추정가는 부가세를 뺀 금액입니다.</div>`:'')+
+    delegBlocksHtml(d)+`</div>`;
+}
+function toolsView(){
+  S.tl=S.tl||{q:'', amt:'', ct:{kind:'goods', amount:'', vat:'incl', partner:'general', corp:true}};
+  const T=S.tl, ct=T.ct;
+  let dl='';
+  if(T.dlKey) dl=delegBlocksHtml(S.dl&&S.dl[T.dlKey]);
+  const opt=(v,l,cur)=>`<option value="${v}"${v===cur?' selected':''}>${l}</option>`;
+  const ctRes=T.ctRes;
+  const VD={ok:['가능','ok'], need:['필요','need'], skip:['생략 가능','skip'], warn:['확인','warn'], info:['참고','info']};
+  const ctHtml=!ctRes?'':ctRes.error?`<div class="sec-notice warn">${esc(ctRes.error)}</div>`:
+    `<div class="sec-ct-sum">계약금액(부가세 포함) <b>${won(ctRes.gross)}원</b> · 추정가격(부가세 제외) <b>${won(ctRes.est)}원</b> · ${ctRes.sole?'<b>수의계약</b> 경로':'<b>경쟁입찰</b> 경로'}</div>`+
+    `<ul class="sec-ct">`+ctRes.items.map(it=>{ const v=VD[it.verdict]||VD.info;
+      return `<li><span class="sec-vd ${v[1]}">${v[0]}</span><div><b>${esc(it.title)}</b><div class="sec-sub">${esc(it.detail)}</div>`+
+        `<div class="sec-row">${basisBtn(it.basis)}${it.law?`<a class="sec-mini" href="${esc(it.law)}" target="_blank" rel="noopener">⚖ 국가계약법 시행령</a>`:''}`+
+        `${it.verified===false?'<span class="sec-warn-t">⚠ 근거 문구를 지금 규정에서 찾지 못했습니다 — 규정 개정 여부를 확인하세요</span>':''}</div></div></li>`; }).join('')+`</ul>`+
+    (ctRes.deleg&&ctRes.deleg.length?`<div class="sec-card-h" style="margin-top:8px">🖋 전결권자(추정가격 기준)</div>`+delegBlocksHtml({available:true, blocks:ctRes.deleg, basis:ctRes.basis_deleg, amount:ctRes.est}):'')+
+    `<div class="sec-hint">판정은 규정의 금액 기준을 대 본 것입니다. 실제 계약은 계약담당과 확인하세요.</div>`;
+  return `<div class="sec-tools">`+
+    `<div class="sec-card"><div class="sec-card-h">🖋 전결권자 찾기 <span class="sec-sub">위임전결규칙 [별표] — 업무와 금액으로</span></div>`+
+      `<form class="sec-row" data-a="dlform"><label class="sec-f"><span>업무</span><input name="q" value="${esc(T.q)}" placeholder="예: 업무추진비, 예산집행, 국외출장, 휴일대체"></label>`+
+      `<label class="sec-f sm"><span>금액(원, 선택)</span><input name="amt" inputmode="numeric" value="${esc(T.amt)}" placeholder="예: 3,000,000"></label><button class="sec-btn primary sm" type="submit">찾기</button></form>`+
+      dl+`</div>`+
+    `<div class="sec-card"><div class="sec-card-h">📑 계약 방법 판정 <span class="sec-sub">계약사무규칙·재무회계규정 시행세칙·고정자산 및 물품 관리요령</span></div>`+
+      `<form data-a="ctform"><div class="sec-eg">`+
+        `<label class="sec-f"><span>무엇을</span><select name="kind">${opt('goods','물품(소모품·일반)',ct.kind)}${opt('asset','물품(비품·장비 — 자산 취득)',ct.kind)}${opt('service','용역',ct.kind)}</select></label>`+
+        `<label class="sec-f"><span>금액(원)</span><input name="amount" inputmode="numeric" value="${esc(ct.amount)}" placeholder="예: 3,300,000"></label>`+
+        `<label class="sec-f"><span>금액은</span><select name="vat">${opt('incl','부가세 포함',ct.vat)}${opt('excl','부가세 별도(추정가격)',ct.vat)}</select></label></div>`+
+      `<div class="sec-eg"><label class="sec-f"><span>계약 상대</span><select name="partner">${[['general','일반 업체'],['women','여성기업'],['disabled','장애인기업'],['social','사회적기업'],['coop','사회적협동조합'],['selfsup','자활기업·마을기업'],['severe','중증장애인생산품 생산시설'],['std','장애인표준사업장']].map(([v,l])=>opt(v,l,ct.partner)).join('')}</select></label>`+
+        `<label class="sec-cb"><input type="checkbox" name="corp"${ct.corp?' checked':''}> <span>상대가 법인</span></label></div>`+
+      `<div class="sec-row"><button class="sec-btn primary sm" type="submit">판정</button></div></form>${ctHtml}</div>`+
+    cardToolHtml()+`</div>`;
+}
+
+// ── 법인카드 이용내역 점검 — 카드사 이용내역(엑셀 복사·CSV)을 이 화면에서만 대조한다(서버로 보내지 않고 저장하지 않음) ──
+const CARD_COLS={date:/이용\s*일|승인\s*일|거래\s*일|사용\s*일|매출\s*일|일자|날짜|일시/, time:/시간|시각/, merchant:/가맹점\s*명?|이용\s*처|사용\s*처|상호/,
+  industry:/업종/, amount:/이용\s*금액|승인\s*금액|매출\s*금액|결제\s*금액|사용\s*금액|금액/, card:/카드\s*번호|카드|이용자|사용자|소지자/, status:/취소|상태|승인\s*구분|구분/, appr:/승인\s*번호/};
+const CARD_NOT={date:/결제|청구|취소|입금/, merchant:/업종|주소|번호|전화/, amount:/수수료|부가세|할부|봉사료|원금|잔액|포인트/, card:/유효|종류/};
+function cardSplit(line, sep){
+  if(sep==='\t') return line.split('\t').map(x=>x.trim());
+  const out=[]; let cur='', q=false;
+  for(let i=0;i<line.length;i++){ const ch=line[i];
+    if(q){ if(ch==='"'&&line[i+1]==='"'){ cur+='"'; i++; } else if(ch==='"') q=false; else cur+=ch; }
+    else if(ch==='"') q=true; else if(ch===sep){ out.push(cur.trim()); cur=''; } else cur+=ch; }
+  out.push(cur.trim()); return out;
+}
+// 붙여 넣은 글 → {head, map:{열 이름→번호}, rows:[칸들]}. 머리줄은 열 이름이 두 개 이상 맞는 첫 줄
+function cardParse(text, manual){
+  const lines=String(text||'').replace(/\r/g,'').split('\n').filter(l=>l.trim());
+  if(!lines.length) return {head:[], map:{}, rows:[]};
+  const sep=lines.some(l=>l.includes('\t'))?'\t':lines.some(l=>l.includes(';'))&&!lines.some(l=>l.includes(','))?';':',';
+  let hi=lines.findIndex(l=>{ const cs=cardSplit(l,sep); return ['date','merchant','amount'].filter(k=>cs.some(c=>CARD_COLS[k].test(c)&&!(CARD_NOT[k]&&CARD_NOT[k].test(c)))).length>=2; });
+  const head=hi>=0?cardSplit(lines[hi],sep):[];
+  const map={};
+  if(hi>=0) for(const k of Object.keys(CARD_COLS)){ const i=head.findIndex((c,j)=>CARD_COLS[k].test(c)&&!(CARD_NOT[k]&&CARD_NOT[k].test(c))&&!Object.values(map).includes(j)); if(i>=0) map[k]=i; }
+  Object.assign(map, manual||{});
+  return {head, map, rows:lines.slice(hi+1).map(l=>cardSplit(l,sep)).filter(cs=>cs.some(Boolean))};
+}
+function cardDate(v){
+  const s=String(v||'').trim(); let m=s.match(/((?:19|20)\d{2})\s*[.\-\/년]\s*(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})/)||s.match(/^((?:19|20)\d{2})(\d{2})(\d{2})/);
+  if(!m){ const y=s.match(/^(\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/); if(y) m=[0,'20'+y[1],y[2],y[3]]; }
+  if(!m) return '';
+  const d=new Date(+m[1], +m[2]-1, +m[3]); return d.getMonth()===+m[2]-1?`${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`:'';
+}
+function cardTime(v){ const m=String(v||'').match(/(?:^|\s|T)([01]?\d|2[0-3]):?([0-5]\d)(?::?[0-5]\d)?\s*$/)||String(v||'').match(/\b([01]?\d|2[0-3]):([0-5]\d)/); return m?(+m[1])*60+(+m[2]):null; }
+function cardAmt(v){ const s=String(v||'').replace(/[\s,원₩]/g,''); const neg=/^-|^\(.*\)$|^△/.test(s); const n=Number(s.replace(/[^\d.]/g,'')); return n?(neg?-n:n):0; }
+const cardNorm=s=>String(s||'').replace(/[^0-9A-Za-z가-힣]/g,'').toUpperCase();
+// 점검: 사용시간(근무일 8~22시)·제한업종·제한물품·같은 날 같은 가맹점 여러 번·월 한도·내 처리 이력 증빙
+function cardCheck(parsed, rules, opts){
+  const M=parsed.map, g=k=>cs=>M[k]!=null?cs[M[k]]||'':'';
+  const off=(opts&&opts.offInfo)||(()=>''), mine=(opts&&opts.receipts)||[];
+  const rows=parsed.rows.map((cs,i)=>{ const dv=g('date')(cs); const st=g('status')(cs);
+    const amt=cardAmt(g('amount')(cs));
+    return {i, date:cardDate(dv), time:M.time!=null?cardTime(g('time')(cs)):cardTime(dv), merchant:g('merchant')(cs), industry:g('industry')(cs),
+      amount:amt, card:g('card')(cs).replace(/\s/g,'').slice(-6), cancel:/취소|거절|부도/.test(st)||amt<0, flags:[], match:null}; })
+    .filter(r=>r.date&&r.amount);
+  // 취소 줄은 같은 카드·가맹점·금액의 승인 줄과 짝지어 둘 다 뺀다
+  rows.filter(r=>r.cancel).forEach(c=>{ const o=rows.find(r=>!r.cancel&&!r.voided&&r.card===c.card&&cardNorm(r.merchant)===cardNorm(c.merchant)&&Math.abs(r.amount)===Math.abs(c.amount)); if(o) o.voided=true; c.voided=true; });
+  const live=rows.filter(r=>!r.voided);
+  const H=rules&&rules.hours;
+  live.forEach(r=>{
+    const o=off(r.date); const t=r.time;
+    if(o) r.flags.push({k:'time', sev:'medium', t:`근무일 아님(${o})`, b:rules.basis});
+    else if(H && t!=null && (t<H.from*60 || t>=H.to*60)) r.flags.push({k:'time', sev:'medium', t:`사용시간 밖(${String(Math.floor(t/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')}) — 사유·증빙 제출`, b:rules.basis});
+    const hay=cardNorm(r.industry+' '+r.merchant);
+    const ind=(rules.industries||[]).find(x=>x.kw.some(k=>hay.includes(cardNorm(k))));
+    if(ind) r.flags.push({k:'ind', sev:'high', t:`제한업종 의심 — ${ind.name}`, b:rules.basis});
+    const gd=(rules.goods||[]).find(x=>x.kw.some(k=>cardNorm(r.merchant).includes(cardNorm(k))));
+    if(gd) r.flags.push({k:'goods', sev:'high', t:`사용 제한 물품 의심 — ${gd.name}`, b:rules.basis});
+    const m=mine.find(x=>x.date===r.date && Math.abs(Number(x.amount)||0)===Math.abs(r.amount));
+    if(m) r.match=m;
+  });
+  // 같은 날 같은 카드·같은 가맹점에서 여러 번 — 1건당 금액 기준(전결권자)·한도를 피하려는 분할로 보일 수 있다
+  const grp={}; live.forEach(r=>{ const k=r.card+'|'+r.date+'|'+cardNorm(r.merchant); (grp[k]=grp[k]||[]).push(r); });
+  Object.values(grp).filter(a=>a.length>=2).forEach(a=>{ const sum=a.reduce((s,r)=>s+r.amount,0);
+    a.forEach(r=>r.flags.push({k:'split', sev:'medium', t:`같은 날 같은 가맹점 ${a.length}회(합계 ${won(sum)}원) — 분할 결제인지 확인`, b:{reg:'위임전결규칙', art:'6'}})); });
+  const months={}; live.forEach(r=>{ const k=(r.card||'카드')+' '+r.date.slice(0,7); months[k]=(months[k]||0)+r.amount; });
+  const L=rules.limit&&rules.limit.amount;
+  const over=L?Object.entries(months).filter(([,v])=>v>L).map(([k,v])=>({k, v})):[];
+  return {rows:live, cancelled:rows.length-live.length, over, total:live.reduce((s,r)=>s+r.amount,0)};
+}
+function cardToolHtml(){
+  const C=S.card=S.card||{raw:'', only:false, pub:{}, f:{}};
+  const R=S.cardRules;
+  if(R===undefined){ S.cardRules=null; fetch('/api/secretary/card/rules').then(r=>r.json()).then(d=>{ S.cardRules=d.success?d:{error:true}; if(S.view==='tools') render(); }).catch(()=>{ S.cardRules={error:true}; }); }
+  let res='';
+  if(C.res){ const X=C.res;
+    if(X.error) res=`<div class="sec-notice warn">${esc(X.error)}</div>`;
+    else{
+      const bad=X.rows.filter(r=>r.flags.length), sev=k=>bad.filter(r=>r.flags.some(f=>f.k===k)).length, noEv=X.rows.filter(r=>!r.match).length;
+      const list=C.only?bad:X.rows;
+      res=`<div class="sec-ct-sum">${X.rows.length}건 · 합계 <b>${won(X.total)}원</b>${X.cancelled?` · 취소 짝 ${X.cancelled}건 제외`:''} · 확인 필요 <b class="${bad.length?'sec-warn-t':''}">${bad.length}건</b>`+
+        ` <span class="sec-sub">(사용시간 ${sev('time')} · 제한업종 ${sev('ind')} · 제한물품 ${sev('goods')} · 분할 의심 ${sev('split')} · 내 처리 이력 증빙 없음 ${noEv})</span></div>`+
+        X.over.map(o=>`<div class="sec-notice warn">⚠ ${esc(o.k)} 사용액 ${won(o.v)}원 — 월 기본한도 ${won(R.limit.amount)}원 초과(한도 변경 신청 확인) ${basisBtn(R.limit.basis)}</div>`).join('')+
+        `<div class="sec-row"><label class="sec-cb"><input type="checkbox" data-a="cardonly"${C.only?' checked':''}> <span>확인 필요만 보기</span></label>`+
+        `<span class="sec-sub">'공개'에 체크한 줄로 업무추진비 집행내역 공개표를 만듭니다.</span></div>`+
+        `<div class="sec-tbl-wrap"><table class="sec-tbl sec-card-tbl"><thead><tr><th>공개</th><th>일시</th><th>가맹점</th><th class="r">금액</th><th>점검</th><th>내 증빙</th></tr></thead><tbody>`+
+        list.map(r=>`<tr class="${r.flags.some(f=>f.sev==='high')?'bad':r.flags.length?'warn':''}"><td><input type="checkbox" data-a="cardpub" data-i="${r.i}"${C.pub[r.i]?' checked':''} aria-label="공개표에 넣기"></td>`+
+          `<td>${esc(r.date.slice(5))}${r.time!=null?' '+String(Math.floor(r.time/60)).padStart(2,'0')+':'+String(r.time%60).padStart(2,'0'):''}</td>`+
+          `<td>${esc(r.merchant)}${r.industry?`<div class="sec-sub">${esc(r.industry)}</div>`:''}</td><td class="r">${won(r.amount)}</td>`+
+          `<td>${r.flags.map(f=>`<div class="sec-flag ${f.sev}">${esc(f.t)}</div>`).join('')||'<span class="sec-sub">—</span>'}</td>`+
+          `<td>${r.match?`<span class="sec-ok-t">✓ ${esc(r.match.title.slice(0,16))}</span>`:'<span class="sec-sub">없음</span>'}</td></tr>`).join('')+`</tbody></table></div>`+
+        (R&&!R.error?`<div class="sec-row">${basisBtn(R.basis)}${R.evidence?basisBtn(R.evidence.basis):''}${R.publish?basisBtn(R.publish.basis):''}</div>`:'')+
+        cardPubHtml(X);
+    }
+  }
+  const P=C.parsed;
+  const mapUi=P&&P.head.length&&['date','merchant','amount'].some(k=>P.map[k]==null)?`<div class="sec-notice warn">열을 다 알아보지 못했습니다 — 직접 고르세요.</div><div class="sec-eg">`+
+    [['date','이용일자'],['time','이용시간'],['merchant','가맹점'],['industry','업종'],['amount','금액'],['card','카드번호'],['status','취소 여부']].map(([k,l])=>
+      `<label class="sec-f sm"><span>${l}</span><select data-a="cardmap" data-k="${k}"><option value="">—</option>${P.head.map((h,i)=>`<option value="${i}"${P.map[k]===i?' selected':''}>${esc(h||('열 '+(i+1)))}</option>`).join('')}</select></label>`).join('')+`</div>`:'';
+  return `<div class="sec-card"><div class="sec-card-h">💳 법인카드 이용내역 점검 <span class="sec-sub">법인카드 운영요령 — 사용시간·제한업종·제한물품·분할 결제·월 한도·증빙</span></div>`+
+    `<div class="sec-hint">카드사·은행 사이트에서 받은 이용내역을 엑셀에서 머리줄째 복사해 붙여 넣으세요(CSV도 됩니다). 이용내역은 <b>서버로 보내지 않고 저장하지도 않습니다</b> — 이 화면에서만 대조합니다.</div>`+
+    (R&&R.error?`<div class="sec-notice warn">점검 기준(법인카드 운영요령)을 불러오지 못했습니다.</div>`:R&&!R.hours?`<div class="sec-notice warn">법인카드 운영요령에서 사용시간 기준을 읽지 못했습니다 — 규정 개정 여부를 확인하세요.</div>`:'')+
+    `<label class="sec-f"><span>이용내역</span><textarea data-a="cardraw" rows="6" placeholder="이용일자\t이용시간\t가맹점명\t업종\t이용금액\n2026-10-05\t21:40\t○○식당\t한식\t182,000">${esc(C.raw)}</textarea></label>`+
+    mapUi+`<div class="sec-row"><button class="sec-btn primary sm" data-a="cardgo">점검</button>${C.raw?'<button class="sec-btn sm" data-a="cardclear">지우기</button>':''}</div>`+res+`</div>`;
+}
+// 업무추진비 집행내역 공개표 — 법인카드 운영요령 제14조(월별 사용내역 공개). 목적·대상·인원은 담당자가 채운다
+function cardPubHtml(X){
+  const C=S.card; const sel=X.rows.filter(r=>C.pub[r.i]); if(!sel.length) return '';
+  const f=(r,k,ph)=>`<input data-a="cardf" data-i="${r.i}" data-k="${k}" value="${esc((C.f[r.i]||{})[k]||(k==='purpose'&&r.match?r.match.title:''))}" placeholder="${ph}">`;
+  return `<div class="sec-card-h" style="margin-top:10px">📋 업무추진비 집행내역 공개표 <span class="sec-sub">${sel.length}건 — 목적·대상·인원을 채운 뒤 복사</span></div>`+
+    `<div class="sec-tbl-wrap"><table class="sec-tbl"><thead><tr><th>일시</th><th>장소</th><th>집행 목적</th><th>대상</th><th>인원</th><th class="r">금액</th></tr></thead><tbody>`+
+    sel.map(r=>`<tr><td>${esc(r.date)}</td><td>${esc(r.merchant)}</td><td>${f(r,'purpose','업무협의 등')}</td><td>${f(r,'target','○○기관 등')}</td><td>${f(r,'n','명')}</td><td class="r">${won(r.amount)}</td></tr>`).join('')+
+    `</tbody></table></div><div class="sec-row"><button class="sec-btn sm" data-a="cardcopy">📋 표 복사(엑셀에 붙여넣기)</button><button class="sec-btn sm" data-a="cardcsv">⬇ CSV 받기</button></div>`;
+}
+function cardPubRows(){
+  const C=S.card, X=C.res; if(!X||!X.rows) return [];
+  const per=(r)=>{ const n=Number(String((C.f[r.i]||{}).n||'').replace(/[^\d]/g,'')); return n?Math.round(r.amount/n):''; };
+  return [['일시','장소','집행 목적','대상','인원','금액','1인당','결제 방법']].concat(X.rows.filter(r=>C.pub[r.i]).map(r=>{ const F=C.f[r.i]||{};
+    const t=r.time!=null?' '+String(Math.floor(r.time/60)).padStart(2,'0')+':'+String(r.time%60).padStart(2,'0'):'';
+    return [r.date+t, r.merchant, F.purpose||(r.match?r.match.title:''), F.target||'', F.n||'', r.amount, per(r), '법인카드']; }));
+}
+function toolSubmit(f){
+  const fd=new FormData(f); const T=S.tl;
+  if(f.dataset.a==='dlform'){
+    T.q=String(fd.get('q')||'').trim(); T.amt=String(fd.get('amt')||'').trim();
+    if(!T.q){ toast('찾을 업무를 적으세요(예: 업무추진비).'); return; }
+    const qs=new URLSearchParams({q:T.q}); if(T.amt) qs.set('amount', T.amt.replace(/[^\d만억천백십.]/g,''));
+    T.dlKey=qs.toString(); delegFetch(qs, ()=>{ if(S.view==='tools') render(); }); render(); return;
+  }
+  Object.assign(T.ct, {kind:fd.get('kind'), amount:String(fd.get('amount')||'').trim(), vat:fd.get('vat'), partner:fd.get('partner'), corp:!!fd.get('corp')});
+  toolContract();
+}
+async function toolContract(){
+  const T=S.tl, ct=T.ct;
+  if(!String(ct.amount).replace(/[^\d]/g,'')){ toast('금액을 입력하세요.'); return; }
+  try{ const r=await fetch('/api/secretary/contract',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:ct.kind, amount:String(ct.amount).replace(/[^\d만억천백십.]/g,''), vat:ct.vat, partner:ct.partner, corp:ct.corp})});
+    const d=await r.json(); T.ctRes=d.success?d:{error:d.error||'판정하지 못했습니다.'};
+  }catch(e){ T.ctRes={error:'서버에 연결하지 못했습니다.'}; }
+  if(S.view==='tools') render();
+}
+function cardRun(){
+  const C=S.card; const R=S.cardRules;
+  if(!R||R.error){ C.res={error:'점검 기준을 아직 불러오지 못했습니다. 잠시 뒤 다시 누르세요.'}; render(); return; }
+  C.parsed=cardParse(C.raw, C.manual);
+  if(['date','merchant','amount'].some(k=>C.parsed.map[k]==null)){ C.res=C.parsed.head.length?null:{error:'머리줄(이용일자·가맹점·금액)을 찾지 못했습니다. 엑셀에서 머리줄까지 함께 복사하세요.'}; render(); return; }
+  const mine=[]; cases().forEach(c=>receipts(c).forEach(r=>{ if(r.date&&r.amount) mine.push({date:r.date, amount:r.amount, title:c.title||''}); }));
+  C.res=cardCheck(C.parsed, R, {offInfo, receipts:mine}); C.pub={}; C.f={};
+  if(!C.res.rows.length) C.res={error:'읽은 이용 건이 없습니다. 날짜·금액 열을 확인하세요.'};
+  render();
+}
+
 // ── 처리 이력(건) ────────────────────────────────────────────────────────
 function curCase(){ return S.caseId ? cases().find(c=>c.id===S.caseId)||null : null; }
 function ensureCase(){
@@ -431,7 +654,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['tools','🧮 판정 도구'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -449,6 +672,7 @@ function render(){
   else if(S.view==='manage') body=manageView();
   else if(S.view==='edit') body=editView();
   else if(S.view==='ext') body=extView();
+  else if(S.view==='tools') body=toolsView();
   // 입력하다 화면이 다시 그려져도 그 칸(포커스·커서)과 스크롤 위치를 지킨다 — 같은 화면일 때만
   // (같은 화면이라도 다른 절차·다른 건으로 바뀌었으면 되살리지 않는다 — 앞 건의 메모·날짜가 새 건에 저장되지 않게)
   // (새 건은 첫 입력 때 만들어지므로 '건 없음 → 새 건'은 같은 건으로 본다)
@@ -632,7 +856,7 @@ function procView(){
     `</span></div>`;
   const caseNote=c?`<div class="sec-card"><div class="sec-card-h">🗒 이 건 메모 <span class="sec-sub">처리 이력에 함께 남습니다(인계 때 유용)</span></div><textarea class="sec-note" data-a="cnote" rows="2" placeholder="예) 10/2 세종 출장, KTX 왕복 법인카드 결제">${esc(c.note||'')}</textarea></div>`:'';
   return regAnsBox()+aiBox()+altHtml+`<div class="sec-proc">`+head+notes+keyFactsHtml(p)+approval+dateIn+nextBox+caseBar+
-    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${budgetHtml(p, c)}${pitHtml}${auditHtml(p, c)}${aiLedgerHtml(c)}${caseNote}</div>`+
+    `<div class="sec-layout"><div class="sec-main"><div class="sec-card"><div class="sec-card-h">🔀 단계별 절차 <span class="sec-sub">선택 단계는 해당할 때만</span></div><div class="sec-steps">${steps}</div></div>${receiptHtml(p, c)}${budgetHtml(p, c)}${delegCardHtml(p, c)}${pitHtml}${auditHtml(p, c)}${aiLedgerHtml(c)}${caseNote}</div>`+
     `<aside class="sec-side">${insightHtml(p)}${formsHtml}${tips}${noteHtml}</aside></div></div>`;
 }
 
@@ -1087,7 +1311,7 @@ function editView(){
     `<textarea data-a="es" data-i="${i}" data-k="t" rows="2" placeholder="할 일(예: 운임·숙박비 증빙을 갖춰 정산을 신청합니다)">${esc(s.t||'')}</textarea>`+
     `<div class="sec-es-g">`+
       `<label class="sec-f"><span>시점</span><input data-a="es" data-i="${i}" data-k="when" value="${esc(s.when||'')}" placeholder="예: 마친 날 다음 날부터 14일 이내"></label>`+
-      `<label class="sec-f"><span>기한 계산</span><span class="sec-dl"><select data-a="es" data-i="${i}" data-k="dlref"><option value="">없음</option>${(p.dates||[]).map(d=>`<option value="${esc(d.k)}" ${s.deadline&&s.deadline.ref===d.k?'selected':''}>${esc(d.l)}</option>`).join('')}</select>`+
+      `<label class="sec-f"><span>기한 계산</span><span class="sec-deleg"><select data-a="es" data-i="${i}" data-k="dlref"><option value="">없음</option>${(p.dates||[]).map(d=>`<option value="${esc(d.k)}" ${s.deadline&&s.deadline.ref===d.k?'selected':''}>${esc(d.l)}</option>`).join('')}</select>`+
         `<input type="number" data-a="es" data-i="${i}" data-k="dldays" value="${s.deadline?esc(s.deadline.days):''}" placeholder="±일" style="width:70px"></span></label>`+
       `<label class="sec-f"><span>근거(쉼표)</span><input data-a="es" data-i="${i}" data-k="basis" value="${esc((s.basis||[]).map(b=>b.art?`${b.reg} 제${b.art}조`:`${b.reg}#${b.q||''}`).join(', '))}" placeholder="여비규정 제8조, 복무규정 제8조"></label>`+
       `<label class="sec-f"><span>필요 서류(쉼표)</span><input data-a="es" data-i="${i}" data-k="docs" value="${esc((s.docs||[]).join(', '))}" placeholder="영수증, 매출전표"></label>`+
@@ -1494,11 +1718,14 @@ function bind(panel){
   // role=button 인 칸(처리 이력 줄 등)도 키보드 Enter·Space 로 누를 수 있게
   panel.addEventListener('keydown', e=>{ if(e.key!=='Enter'&&e.key!==' ') return; const t=e.target;
     if(t&&t.getAttribute&&t.getAttribute('role')==='button'&&t.dataset&&t.dataset.a&&t.tagName!=='BUTTON'){ e.preventDefault(); t.click(); } });
-  panel.addEventListener('submit', e=>{ const f=e.target.closest('[data-a="askform"]'); if(!f) return; e.preventDefault(); const q=document.getElementById('secQ'); ask(q?q.value:''); });
+  panel.addEventListener('submit', e=>{
+    const tf=e.target.closest('[data-a="dlform"],[data-a="ctform"]');
+    if(tf){ e.preventDefault(); toolSubmit(tf); return; }
+    const f=e.target.closest('[data-a="askform"]'); if(!f) return; e.preventDefault(); const q=document.getElementById('secQ'); ask(q?q.value:''); });
   panel.addEventListener('click', e=>{
     const b=e.target.closest('[data-a]'); if(!b || !panel.contains(b)) return;
     const a=b.dataset.a, D=b.dataset;
-    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule','budraw','budbasis','budsel'].includes(a)) return;
+    if(['date','pnote','cnote','ef','es','lay','himport','askform','formsin','tokg','alias','cfg','cfghol','packfile','rcfile','rcf','cfgerp','cfgerprule','budraw','budbasis','budsel','dlform','ctform','pdamt','cardraw','cardmap','cardpub','cardf','cardonly'].includes(a)) return;
     e.preventDefault();
     switch(a){
       case 'retry': start(); break;
@@ -1525,16 +1752,13 @@ function bind(panel){
         if(S._erpProblems.length){ S._erpOpen=true; render(); toast('ERP 화면 규칙에 고칠 줄이 있습니다.', 4200); break; }
         saveConfig(c, '기관 설정을 저장했습니다.'); break; }
       case 'budpick': setBudget(D.v||''); break;
-      case 'budguess': { S._budOpen=true; const pv=budgetParse(S._budRaw!=null?S._budRaw:budgetText((S.cfg||{}).budget)); let n=0;
-        pv.items.forEach(it=>{ if(!it.procs.length){ const g=budGuess(it); if(g.length){ it.procs=g; n++; } } });
-        S._budRaw=budgetText({items:pv.items}); render(); toast(n?`과목 ${n}개에 흔히 쓰는 업무를 채웠습니다. 맞는지 확인하고 저장하세요.`:'짐작해 채울 과목이 없습니다.'); break; }
-      case 'budsave': { S._budOpen=true; const pv=budgetParse(S._budRaw!=null?S._budRaw:budgetText((S.cfg||{}).budget));
-        if(pv.problems.length){ render(); toast('과목표에 고칠 줄이 있습니다.', 4200); break; }
-        // 기관 설정 칸에 고치다 만 값이 있으면 함께 저장된다(저장하면 초안을 비우므로 따로 버리지 않게)
-        const cfg=JSON.parse(JSON.stringify(S._cfgDraft||S.cfg||{})); delete cfg.updated;
-        if(!String((cfg.org||{}).name||'').trim()){ toast('기관 설정의 기관명을 먼저 입력하세요.'); break; }
-        cfg.budget={basis:(S._budBasis!=null?S._budBasis:((S.cfg.budget||{}).basis||'')).trim(), items:pv.items};
-        saveConfig(cfg, pv.items.length?`예산과목 ${pv.items.length}개를 저장했습니다.`:'예산과목 기준표를 비웠습니다.').then(ok=>{ if(ok){ S._budRaw=null; S._budBasis=null; } }); break; }
+      case 'toct': { S.tl=S.tl||{q:'', amt:'', ct:{kind:'goods', amount:'', vat:'incl', partner:'general', corp:true}};
+        const a=(S.pdAmt||{})[S.procId]; S.tl.ct.kind=D.kind||'goods'; if(a) S.tl.ct.amount=a; S.tl.ctRes=null; S.view='tools'; render(); if(a) toolContract(); break; }
+      case 'cardgo': cardRun(); break;
+      case 'cardclear': S.card={raw:'', only:false, pub:{}, f:{}}; render(); break;
+      case 'cardcopy': { const t=cardPubRows().map(r=>r.join('\t')).join('\n'); navigator.clipboard.writeText(t).then(()=>toast('공개표를 복사했습니다. 엑셀에 붙여 넣으세요.'), ()=>toast('복사하지 못했습니다.')); break; }
+      case 'cardcsv': { const csv='﻿'+cardPubRows().map(r=>r.map(x=>/[",\n]/.test(String(x))?'"'+String(x).replace(/"/g,'""')+'"':x).join(',')).join('\r\n');
+        const u=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'})); const l=document.createElement('a'); l.href=u; l.download=`업무추진비_집행내역_${today()}.csv`; l.click(); setTimeout(()=>URL.revokeObjectURL(u),2000); break; }
       case 'packout': packOut(); break;
       case 'packin': packIn(D.l); break;
       case 'packcancel': S._packPreview=null; render(); break;
@@ -1613,6 +1837,10 @@ function bind(panel){
         if(c.datesAi) delete c.datesAi[el.dataset.k]; }); render(); }     // 사람이 고친 기준일은 더 이상 AI 값이 아니다
     else if(a==='lay'){ S.editLayer=el.value; render(); }
     else if(a==='budsel') setBudget(el.value);
+    else if(a==='pdamt'){ S.pdAmt=S.pdAmt||{}; S.pdAmt[S.procId]=el.value.trim(); render(); }
+    else if(a==='cardmap'){ const C=S.card; C.manual=C.manual||{}; if(el.value==='') delete C.manual[el.dataset.k]; else C.manual[el.dataset.k]=Number(el.value); cardRun(); }
+    else if(a==='cardpub'){ S.card.pub[el.dataset.i]=el.checked; render(); }
+    else if(a==='cardonly'){ S.card.only=el.checked; render(); }
     else if(a==='budraw'){ S._budOpen=true; render(); }                  // 칸을 벗어나면 미리 보기·고칠 줄을 새로 보여 준다
     else if(a==='alias'){ S._aliasDraft=S._aliasDraft||{}; if(el.value) S._aliasDraft[el.dataset.n]=el.value; else delete S._aliasDraft[el.dataset.n]; }
     else if(a==='packfile') readJsonFile(el, packRead);
@@ -1639,6 +1867,8 @@ function bind(panel){
       const k=el.dataset.k; if(k==='preset'){ c.erp.preset=el.value; render(); return; }
       S._erpRaw=S._erpRaw||{}; S._erpRaw[k]=el.value; Object.assign(c.erp, erpRulesParse(k, el.value).val); return; }
     if(a==='budraw'){ S._budRaw=el.value; return; }
+    if(a==='cardraw'){ S.card.raw=el.value; return; }
+    if(a==='cardf'){ const f=S.card.f[el.dataset.i]=S.card.f[el.dataset.i]||{}; f[el.dataset.k]=el.value; return; }
     if(a==='budbasis'){ S._budBasis=el.value; return; }
     if(a==='cfgerp'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.erp=Object.assign({}, c.erp||{}, {hosts:el.value.split('\n').map(x=>x.trim()).filter(Boolean)}); return; }
     if(a==='cfghol'){ const c=S._cfgDraft=S._cfgDraft||JSON.parse(JSON.stringify(S.cfg)); c.holidays=c.holidays||{};
