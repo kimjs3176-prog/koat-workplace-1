@@ -115,6 +115,8 @@ chrome.runtime.onMessage.addListener((m) => {
 });
 if (!params.get("tab")) {
   chrome.tabs.onActivated.addListener((info) => { if (info.windowId === myWin) { bound = null; refreshContext(false); } });
+  // 붙어 있던 상세창(팝업)을 닫으면 원래 창의 탭으로 돌아온다 — 닫힌 창의 업무 배지·칸 넣기 대상이 남지 않게
+  chrome.tabs.onRemoved.addListener((id) => { if (id === bound || id === tabId) { bound = null; refreshContext(false); } });
 }
 
 $("ctx").addEventListener("click", () => { if (ctx) ask(ctx.q); });
