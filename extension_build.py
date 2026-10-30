@@ -24,23 +24,75 @@ def manifest() -> dict:
         return json.load(f)
 
 
-# ── 업데이트 도구 — 확장 폴더 안에서 더블클릭하면 이 서버의 최신 배포본을 받아 그 폴더에 덮어쓴다 ────────
-# (개발자 모드로 설치한 확장은 스토어 자동 업데이트가 없다.) 파일이 바뀌면 확장이 스스로 다시 불러온다(background.js).
-UPDATE_CMD = "업데이트.cmd"          # Windows
+# ── 설치·업데이트 도구 — 어디서 실행해도 된다(다운로드 폴더 그대로 더블클릭) ─────────────────────────────
+# 1) 브라우저 프로필(Preferences)에 적힌 '압축 해제 확장' 경로 가운데 서무비서(주소창 키워드 '서무')인 폴더를 찾아
+#    이 서버의 최신 배포본으로 덮어쓴다 → 확장이 스스로 다시 불러온다(background.js).
+# 2) 설치된 곳이 없으면 정해진 폴더에 새로 두고 그 폴더를 열어 준다(브라우저 등록은 한 번만 사람이).
+# (개발자 모드로 설치한 확장은 스토어 자동 업데이트가 없다.)
+UPDATE_CMD = "업데이트.cmd"          # Windows — zip 안 이름. 따로 받을 때는 UPDATE_CMD_DL
 UPDATE_SH = "업데이트.command"       # macOS(더블클릭) · Linux(bash)
+UPDATE_CMD_DL = "서무비서_확장.cmd"
+UPDATE_SH_DL = "서무비서_확장.command"
 
-_PS = (
-    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop';"
-    " [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
-    " $dir='%DIR%'.TrimEnd('\\');"
-    " if(-not (Test-Path (Join-Path $dir 'manifest.json'))){ throw '이 파일을 확장 폴더(manifest.json 이 있는 곳) 안에 두고 실행하세요.' };"
-    " $z=Join-Path $env:TEMP 'secretary-extension.zip'; Write-Host '받는 중: {url}'; Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile $z;"
-    " $t=Join-Path $env:TEMP ('sec-ext-'+[guid]::NewGuid()); Expand-Archive -LiteralPath $z -DestinationPath $t -Force;"
-    " $src=Join-Path $t 'secretary-extension'; if(-not (Test-Path (Join-Path $src 'manifest.json'))){ throw '받은 파일이 확장 배포본이 아닙니다.' };"
-    " Copy-Item -Path (Join-Path $src '*') -Destination $dir -Recurse -Force; Remove-Item $t -Recurse -Force; Remove-Item $z -Force;"
-    " $v=(Get-Content -Raw -LiteralPath (Join-Path $dir 'manifest.json') | ConvertFrom-Json).version;"
-    " Write-Host ('완료: 확장 파일을 버전 ' + $v + ' 으로 바꿨습니다.')"
-)
+# PowerShell 본문 — cmd 의 -Command "..." 안에 들어가므로 큰따옴표를 쓰지 않는다(문자열은 작은따옴표·연결, 정규식의 " 는 \x22)
+_PS = [
+    "[Console]::OutputEncoding=[Text.Encoding]::UTF8",
+    "$ErrorActionPreference='Stop'",
+    "try {",
+    "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12",
+    "$url='{url}'",
+    "$here='%HERE%'.TrimEnd('\\')",
+    "$isSec={ param($d) (Test-Path -LiteralPath (Join-Path $d 'manifest.json')) -and (Test-Path -LiteralPath (Join-Path $d 'sidepanel.html'))"
+    " -and ((Get-Content -Raw -LiteralPath (Join-Path $d 'manifest.json')) -match '\\x22keyword\\x22:\\s*\\x22(서무|\\\\uc11c\\\\ubb34)\\x22') }",   # 유니코드 이스케이프로 저장된 manifest 도
+    "$found=New-Object System.Collections.Generic.List[string]",
+    "if($here -and (& $isSec $here)){ $found.Add($here) }",
+    "$roots=@(($env:LOCALAPPDATA+'\\Google\\Chrome\\User Data'),($env:LOCALAPPDATA+'\\Microsoft\\Edge\\User Data'),($env:LOCALAPPDATA+'\\Naver\\Naver Whale\\User Data'),"
+    "($env:LOCALAPPDATA+'\\Chromium\\User Data'),($env:LOCALAPPDATA+'\\BraveSoftware\\Brave-Browser\\User Data'))",
+    "$edge=$false",
+    "foreach($r in $roots){ if(-not (Test-Path -LiteralPath $r)){ continue }",
+    " foreach($p in (Get-ChildItem -LiteralPath $r -Directory | Where-Object { $_.Name -match '^(Default|Profile \\d+)$' })){",
+    "  foreach($f in @('Preferences','Secure Preferences')){ $pf=Join-Path $p.FullName $f",
+    "   if(-not (Test-Path -LiteralPath $pf)){ continue }",
+    "   foreach($m in [regex]::Matches((Get-Content -Raw -LiteralPath $pf), '\\x22path\\x22:\\x22([^\\x22]+)\\x22')){ $d=$m.Groups[1].Value -replace '\\\\\\\\','\\'",
+    "    if([IO.Path]::IsPathRooted($d) -and -not $found.Contains($d) -and (& $isSec $d)){ $found.Add($d)",
+    "     if($r -like '*Edge*'){ $edge=$true } } } } } }",
+    "$z=Join-Path $env:TEMP 'secretary-extension.zip'",
+    "Write-Host ('받는 중: '+$url)",
+    "Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $z",
+    "$t=Join-Path $env:TEMP ('sec-ext-'+[guid]::NewGuid())",
+    "Expand-Archive -LiteralPath $z -DestinationPath $t -Force",
+    "$src=Join-Path $t 'secretary-extension'",
+    "if(-not (Test-Path -LiteralPath (Join-Path $src 'manifest.json'))){ throw '받은 파일이 확장 배포본이 아닙니다.' }",
+    "$v=(Get-Content -Raw -LiteralPath (Join-Path $src 'manifest.json') | ConvertFrom-Json).version",
+    "if($found.Count -gt 0){",
+    " foreach($d in $found){ $old=(Get-Content -Raw -LiteralPath (Join-Path $d 'manifest.json') | ConvertFrom-Json).version",
+    "  Copy-Item -Path (Join-Path $src '*') -Destination $d -Recurse -Force",
+    "  Write-Host ('업데이트: '+$d+'  ('+$old+' -> '+$v+')') }",
+    " Write-Host ''",
+    " Write-Host '완료. 브라우저가 확장을 스스로 다시 불러옵니다(패널이 열려 있으면 패널 위의 [지금 적용]을 누르세요).'",
+    " Write-Host '열려 있던 ERP 탭은 새로고침(F5)하면 새 판이 적용됩니다.'",
+    "} else {",
+    " $dst=Join-Path $env:LOCALAPPDATA '서무비서\\secretary-extension'",
+    " New-Item -ItemType Directory -Force -Path $dst | Out-Null",
+    " Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force",
+    " $page=if($edge -or ((Test-Path -LiteralPath ($env:LOCALAPPDATA+'\\Microsoft\\Edge\\User Data')) -and -not (Test-Path -LiteralPath ($env:LOCALAPPDATA+'\\Google\\Chrome\\User Data')))){ 'edge://extensions' } else { 'chrome://extensions' }",
+    " try { Set-Clipboard -Value $page } catch { }",
+    " Write-Host ('설치된 확장을 찾지 못해 새로 설치할 파일을 두었습니다(버전 '+$v+'):')",
+    " Write-Host ('  '+$dst)",
+    " Write-Host ''",
+    " Write-Host '브라우저에 한 번만 등록하면 됩니다:'",
+    " Write-Host ('  1. 주소창에 '+$page+' 를 입력합니다(클립보드에 복사해 두었습니다 - Ctrl+V).')",
+    " Write-Host '  2. 개발자 모드를 켭니다.'",
+    " Write-Host '  3. [압축해제된 확장 프로그램을 로드](Edge: [압축을 푼 파일 로드])를 누르고 방금 열린 폴더를 고릅니다.'",
+    " Start-Process explorer.exe -ArgumentList ([char]34+$dst+[char]34)",
+    "}",
+    "Remove-Item $t -Recurse -Force",
+    "Remove-Item $z -Force",
+    "} catch { Write-Host ''",
+    " Write-Host ('실패: '+$_.Exception.Message)",
+    " Write-Host '서무비서 웹 화면의 [확장 설치]에서 zip 을 받아 수동으로 설치·덮어쓸 수 있습니다.'",
+    " exit 1 }",
+]
 
 
 def update_scripts(server: str) -> dict:
@@ -49,7 +101,14 @@ def update_scripts(server: str) -> dict:
     if not server:
         return {}
     url = server + "/api/secretary/extension.zip"
-    # 실행 중인 배치 파일을 덮어쓰면 깨질 수 있어, 임시 폴더로 복사한 뒤 거기서 '/run 대상폴더' 로 다시 실행한다
+    # 문장 사이는 ';' — 블록을 여는 '{' 뒤에는 붙이지 않는다('} else {' 가 끊기지 않게)
+    ps = ""
+    for line in _PS:
+        line = line.replace("{url}", url).strip()
+        ps += line + (" " if line.endswith("{") else "; ")
+    ps = ps.rstrip("; ")
+    assert '"' not in ps, "PowerShell 본문에 큰따옴표가 있으면 cmd 인자가 끊긴다"
+    # 실행 중인 배치 파일을 덮어쓰면 깨질 수 있어(확장 폴더 안에서 실행한 경우), 임시 폴더로 복사한 뒤 '/run 원래폴더' 로 다시 실행한다
     cmd = "\r\n".join([
         "@echo off",
         "chcp 65001 >nul",
@@ -59,44 +118,62 @@ def update_scripts(server: str) -> dict:
         'call "%TEMP%\\sec-ext-update.cmd" /run "%~dp0"',
         "exit /b",
         ":run",
-        'set "DIR=%~2"',
-        "echo 서무비서 확장 업데이트",
-        "echo 폴더: %DIR%",
+        'set "HERE=%~2"',
+        "echo 서무비서 확장 설치·업데이트",
         "echo.",
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command "& { ' + _PS.replace("{url}", url) + ' }"',
-        "if errorlevel 1 (",
-        "  echo.",
-        "  echo 업데이트하지 못했습니다. 서무비서 웹 화면의 [확장 설치]에서 zip 을 받아 이 폴더에 덮어쓰세요.",
-        ") else (",
-        "  echo.",
-        "  echo 브라우저가 확장을 스스로 다시 불러옵니다. 패널이 열려 있으면 패널 위의 [지금 적용]을 누르세요.",
-        "  echo 열려 있던 ERP 탭은 새로고침^(F5^)하면 새 판이 적용됩니다.",
-        ")",
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command "& { ' + ps + ' }"',
         "echo.",
         "pause",
         "",
     ])
-    # bash 는 함수 본문을 먼저 다 읽으므로, 실행 중에 자기 파일이 바뀌어도 안전하다
+    # bash 는 함수 본문을 먼저 다 읽으므로, 실행 중에 자기 파일이 바뀌어도 안전하다. SEC_PROFILE_ROOTS 는 시험용(브라우저 프로필 위치 지정)
     sh = "\n".join([
         "#!/bin/bash",
-        "# 서무비서 확장 업데이트 — 이 파일이 있는 폴더에 최신 배포본을 덮어쓴다(macOS: 더블클릭, 처음엔 오른쪽 클릭 → 열기)",
+        "# 서무비서 확장 설치·업데이트 — 어디서 실행해도 됩니다(macOS: 더블클릭, 처음엔 오른쪽 클릭 → 열기)",
         "main() {",
-        "  set -e",
-        '  DIR="$(cd "$(dirname "$0")" && pwd)"',
         f'  URL="{url}"',
-        '  if [ ! -f "$DIR/manifest.json" ]; then echo "이 파일을 확장 폴더(manifest.json 이 있는 곳) 안에 두고 실행하세요."; exit 1; fi',
-        '  echo "서무비서 확장 업데이트 — $DIR"',
+        '  HERE="$(cd "$(dirname "$0")" && pwd)"',
+        "  is_sec() { [ -f \"$1/manifest.json\" ] && [ -f \"$1/sidepanel.html\" ] && grep -Eq '\"keyword\": *\"(서무|\\\\uc11c\\\\ubb34)\"' \"$1/manifest.json\"; }",
+        "  FOUND=()",
+        '  is_sec "$HERE" && FOUND+=("$HERE")',
+        '  if [ -n "$SEC_PROFILE_ROOTS" ]; then IFS=: read -r -a ROOTS <<< "$SEC_PROFILE_ROOTS"; else',
+        '    ROOTS=("$HOME/Library/Application Support/Google/Chrome" "$HOME/Library/Application Support/Microsoft Edge" "$HOME/Library/Application Support/Chromium"',
+        '      "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" "$HOME/Library/Application Support/Naver/Whale"',
+        '      "$HOME/.config/google-chrome" "$HOME/.config/microsoft-edge" "$HOME/.config/chromium" "$HOME/.config/BraveSoftware/Brave-Browser"); fi',
+        '  EDGE=0',
+        '  for r in "${ROOTS[@]}"; do [ -d "$r" ] || continue',
+        '    for pf in "$r"/Default/Preferences "$r"/Default/"Secure Preferences" "$r"/Profile*/Preferences "$r"/Profile*/"Secure Preferences"; do [ -f "$pf" ] || continue',
+        "      while IFS= read -r d; do",
+        '        case "$d" in /*) ;; *) continue;; esac',
+        '        skip=0; for f in "${FOUND[@]}"; do [ "$f" = "$d" ] && skip=1; done; [ $skip = 1 ] && continue',
+        '        if is_sec "$d"; then FOUND+=("$d"); case "$r" in *Edge*|*edge*) EDGE=1;; esac; fi',
+        "      done < <(grep -o '\"path\":\"[^\"]*\"' \"$pf\" | sed 's/^\"path\":\"//; s/\"$//')",
+        "    done",
+        "  done",
         '  TMP="$(mktemp -d)"',
         '  echo "받는 중: $URL"',
         '  curl -fsSL "$URL" -o "$TMP/ext.zip"',
         '  unzip -oq "$TMP/ext.zip" -d "$TMP"',
-        '  if [ ! -f "$TMP/secretary-extension/manifest.json" ]; then echo "받은 파일이 확장 배포본이 아닙니다."; exit 1; fi',
-        '  cp -R "$TMP/secretary-extension/." "$DIR/"',
+        '  SRC="$TMP/secretary-extension"',
+        '  if [ ! -f "$SRC/manifest.json" ]; then echo "받은 파일이 확장 배포본이 아닙니다."; rm -rf "$TMP"; return 1; fi',
+        "  ver() { sed -n 's/.*\"version\": *\"\\([^\"]*\\)\".*/\\1/p' \"$1/manifest.json\" | head -1; }",
+        '  V="$(ver "$SRC")"',
+        '  if [ ${#FOUND[@]} -gt 0 ]; then',
+        '    for d in "${FOUND[@]}"; do OLD="$(ver "$d")"; cp -R "$SRC/." "$d/"; echo "업데이트: $d  ($OLD -> $V)"; done',
+        '    echo; echo "완료. 브라우저가 확장을 스스로 다시 불러옵니다(패널이 열려 있으면 패널 위의 [지금 적용]을 누르세요)."',
+        '    echo "열려 있던 ERP 탭은 새로고침하면 새 판이 적용됩니다."',
+        "  else",
+        '    DST="$HOME/서무비서/secretary-extension"; mkdir -p "$DST"; cp -R "$SRC/." "$DST/"',
+        '    if [ $EDGE = 1 ]; then PAGE="edge://extensions"; else PAGE="chrome://extensions"; fi',
+        '    command -v pbcopy >/dev/null && printf "%s" "$PAGE" | pbcopy',
+        '    echo "설치된 확장을 찾지 못해 새로 설치할 파일을 두었습니다(버전 $V):"; echo "  $DST"; echo',
+        '    echo "브라우저에 한 번만 등록하면 됩니다:"',
+        '    echo "  1. 주소창에 $PAGE 를 입력합니다(클립보드에 복사해 두었습니다 - Cmd+V)."',
+        '    echo "  2. 개발자 모드를 켭니다."',
+        '    echo "  3. [압축해제된 확장 프로그램을 로드]를 누르고 방금 열린 폴더를 고릅니다."',
+        '    command -v open >/dev/null && open "$DST"',
+        "  fi",
         '  rm -rf "$TMP"',
-        "  V=\"$(sed -n 's/.*\"version\": *\"\\([^\"]*\\)\".*/\\1/p' \"$DIR/manifest.json\" | head -1)\"",
-        '  echo "완료: 확장 파일을 버전 $V 으로 바꿨습니다."',
-        '  echo "브라우저가 확장을 스스로 다시 불러옵니다. 패널이 열려 있으면 패널 위의 [지금 적용]을 누르세요."',
-        '  echo "열려 있던 ERP 탭은 새로고침하면 새 판이 적용됩니다."',
         "}",
         'main "$@"',
         "",

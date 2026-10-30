@@ -4350,15 +4350,16 @@ def _sec_ext_server() -> str:
 @app.route("/api/secretary/extension/update.cmd")
 @app.route("/api/secretary/extension/update.command")
 def secretary_extension_update_tool():
-    """업데이트 도구만 따로 받기 — 업데이트 도구가 없는 옛 판(1.5.5 이전)을 쓰는 사람이 확장 폴더에 넣어 더블클릭한다"""
+    """설치·업데이트 도구 받기 — 어디서 실행해도 설치된 확장 폴더를 찾아 덮어쓰고, 없으면 새로 설치할 폴더를 만들어 연다"""
     import extension_build
     scripts = extension_build.update_scripts(_sec_ext_server())
     if not scripts:
         return jsonify({"success": False, "error": "이 서버 주소(http)로는 업데이트 도구를 만들 수 없습니다. 웹 화면에서 zip 을 받아 덮어쓰세요."}), 400
     mac = request.path.endswith(".command")
     fn = extension_build.UPDATE_SH if mac else extension_build.UPDATE_CMD
+    dl = extension_build.UPDATE_SH_DL if mac else extension_build.UPDATE_CMD_DL     # 다운로드 폴더에서 알아보기 쉬운 이름
     resp = app.response_class(scripts[fn].encode("utf-8"), mimetype="application/octet-stream")
-    resp.headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(fn)
+    resp.headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(dl)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
