@@ -57,7 +57,7 @@ async function version() {
   try { const i = await (await fetch(server + "/api/secretary/extension/info", { cache: "no-store" })).json();
     if (i && i.version && verLt(cur, i.version)) {
       $("latest").textContent = `· 서버 최신 ${i.version}`;
-      $("updhow").innerHTML = "확장 폴더 안의 <b>업데이트.cmd</b>(Mac: 업데이트.command)를 더블클릭하면 새 판을 받아 덮어쓰고, 확장이 스스로 다시 불러옵니다. 폴더 위치: 확장 관리 페이지 › 서무비서 › 세부정보 › 소스. 그 파일이 없으면(옛 판) 아래에서 받아 확장 폴더에 넣고 더블클릭하세요.";
+      $("updhow").innerHTML = "아래에서 <b>업데이트 도구</b>를 받아 그 자리에서 더블클릭하세요(다운로드 폴더 그대로). 설치된 확장 폴더를 찾아 새 판으로 덮어쓰고, 확장이 스스로 다시 불러옵니다. 확장 폴더 안의 업데이트.cmd 를 눌러도 같습니다.";
       $("updget").href = server + "/api/secretary/extension/update.cmd"; $("updget").hidden = false;
     } else $("latest").textContent = "· 최신";
   } catch (e) { $("latest").textContent = "· 서버 확인 안 됨"; }

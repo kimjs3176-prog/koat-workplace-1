@@ -30,7 +30,7 @@ function findings() {
   const old = data.log.length - L.length;
   const add = (sev, title, fix) => out.push({ sev, title, fix });
   if (!data.settings.server) add("high", "서무비서 주소가 설정되어 있지 않습니다.", "확장 설정(⚙)에서 서무비서 주소를 넣거나, 서무비서 웹의 🧩 확장 설치에서 기관 맞춤 확장을 다시 받으세요.");
-  if (latest && latest !== "?" && verLt(data.version, latest)) add("mid", `새 확장 ${latest}이 있습니다(지금 ${data.version}).`, "확장 폴더 안의 업데이트.cmd(Mac: 업데이트.command)를 더블클릭하면 받아서 덮어쓰고 스스로 다시 불러옵니다. 그 파일이 없으면 서무비서 웹 🧩 확장 탭에서 받으세요.");
+  if (latest && latest !== "?" && verLt(data.version, latest)) add("mid", `새 확장 ${latest}이 있습니다(지금 ${data.version}).`, "서무비서 웹 🧩 확장 탭에서 업데이트 도구를 받아 그 자리에서 더블클릭하세요 — 설치된 폴더를 찾아 덮어쓰고 확장이 스스로 다시 불러옵니다(확장 폴더 안의 업데이트.cmd 도 같음).");
   if (!data.enabled) add("mid", "진단 기록이 꺼져 있습니다.", "위의 '진단 기록 켜기'를 켜야 문제를 찾을 수 있습니다.");
   // 확장이 화면 안에 들어가지 못한 탭(IE 모드 등)
   // 1.4.1부터는 화면에 정말 들어가지 못했을 때만 detect.tab 을 남긴다(이전 판의 detect.tab.none 은 오판정이 섞여 제외)
