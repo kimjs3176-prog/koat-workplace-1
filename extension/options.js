@@ -47,4 +47,20 @@ $("save").addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "hostsChanged" }).catch(() => {});
   msg.textContent = "저장했습니다. 열려 있는 ERP 탭은 새로고침하면 적용됩니다.";
 });
-load();
+// 버전·업데이트 — 폴더의 파일이 새 판이면 바로 적용, 서버에 새 판이 있으면 받는 법 안내
+const verLt = (a, b) => { const p = (v) => String(v || "").split(".").map(Number); const x = p(a), y = p(b); for (let i = 0; i < 4; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0); } return false; };
+async function version() {
+  const cur = chrome.runtime.getManifest().version; $("ver").textContent = cur;
+  const st = await chrome.runtime.sendMessage({ type: "update.check" }).catch(() => null);
+  if (st && st.pending) { $("updhow").textContent = `폴더의 파일이 ${st.disk} 판으로 바뀌어 있습니다. 적용하면 확장이 다시 불러와집니다.`; $("updapply").hidden = false; return; }
+  const server = $("server").value.trim().replace(/\/+$/, ""); if (!server) return;
+  try { const i = await (await fetch(server + "/api/secretary/extension/info", { cache: "no-store" })).json();
+    if (i && i.version && verLt(cur, i.version)) {
+      $("latest").textContent = `· 서버 최신 ${i.version}`;
+      $("updhow").innerHTML = "확장 폴더 안의 <b>업데이트.cmd</b>(Mac: 업데이트.command)를 더블클릭하면 새 판을 받아 덮어쓰고, 확장이 스스로 다시 불러옵니다. 폴더 위치: 확장 관리 페이지 › 서무비서 › 세부정보 › 소스. 그 파일이 없으면(옛 판) 아래에서 받아 확장 폴더에 넣고 더블클릭하세요.";
+      $("updget").href = server + "/api/secretary/extension/update.cmd"; $("updget").hidden = false;
+    } else $("latest").textContent = "· 최신";
+  } catch (e) { $("latest").textContent = "· 서버 확인 안 됨"; }
+}
+$("updapply").addEventListener("click", () => { $("updapply").disabled = true; chrome.runtime.sendMessage({ type: "update.apply" }).catch(() => {}); });
+load().then(version);

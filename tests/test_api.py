@@ -532,3 +532,26 @@ def test_card_rules_from_regulation(client):
     kws = {k for x in d["industries"] for k in x["kw"]}
     assert {"단란주점", "노래방", "골프장", "미용실", "호프집"} <= kws and not kws & {"카페", "바"}
     assert any("귀금속" in g["kw"] for g in d["goods"])
+
+
+def test_extension_zip_has_update_tools(client):
+    """배포본 zip 에 업데이트 도구(업데이트.cmd·.command)가 들어 있고, 그 안에 이 서버의 zip 주소가 박혀 있다"""
+    import io, zipfile
+    import extension_build
+    r = client.get("/api/secretary/extension.zip", base_url="https://sec.example.org")
+    assert r.status_code == 200
+    z = zipfile.ZipFile(io.BytesIO(r.data))
+    names = z.namelist()
+    assert "secretary-extension/업데이트.cmd" in names and "secretary-extension/업데이트.command" in names
+    cmd = z.read("secretary-extension/업데이트.cmd").decode("utf-8")
+    assert "https://sec.example.org/api/secretary/extension.zip" in cmd and "\r\n" in cmd and not cmd.startswith("﻿")
+    assert 'if "%~1"=="/run" goto run' in cmd                                  # 자기 파일을 덮어쓰기 전에 임시 폴더로
+    sh = z.read("secretary-extension/업데이트.command").decode("utf-8")
+    assert sh.startswith("#!/bin/bash") and 'main "$@"' in sh
+    assert z.getinfo("secretary-extension/업데이트.command").external_attr >> 16 == 0o755
+    assert extension_build.update_scripts("") == {}                              # 서버 주소가 없으면 도구도 없다(http 운영 주소)
+    r = client.get("/api/secretary/extension/update.cmd", base_url="https://sec.example.org")
+    assert r.status_code == 200 and "UTF-8''%EC%97%85%EB%8D%B0%EC%9D%B4%ED%8A%B8.cmd" in r.headers["Content-Disposition"]
+    assert client.get("/api/secretary/extension/update.command", base_url="https://sec.example.org").data.startswith(b"#!/bin/bash")
+    assert client.get("/api/secretary/extension/update.cmd", base_url="http://erp.example.org").status_code == 400
+    assert client.get("/api/secretary/extension/info", base_url="https://sec.example.org").get_json()["update_tools"] is True

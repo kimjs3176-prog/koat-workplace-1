@@ -33,7 +33,18 @@ async function settings() {
 
 // 도구 모음 아이콘을 누르면 사이드 패널(지원하지 않는 브라우저는 작은 창)
 chrome.runtime.onInstalled.addListener(async (d) => {
-  if (d && d.reason === "update") diag("bg", "updated", { from: d.previousVersion, to: chrome.runtime.getManifest().version });
+  if (d && d.reason === "update") {
+    const to = chrome.runtime.getManifest().version;
+    diag("bg", "updated", { from: d.previousVersion, to });
+    // 업데이트 도구(업데이트.cmd)·덮어쓰기로 파일이 바뀌어 스스로 다시 불러온 경우 — 패널은 닫혔으니 다시 여는 법을 알린다
+    const { updatedFrom } = await chrome.storage.local.get("updatedFrom").catch(() => ({}));
+    if (updatedFrom && updatedFrom !== to) {
+      chrome.storage.local.remove("updatedFrom").catch(() => {});
+      if ((await settings()).notify) chrome.notifications.create("sec-updated", { type: "basic", iconUrl: "icons/128.png", priority: 1,
+        title: `서무비서 확장 업데이트 완료 — ${to}`,
+        message: "🗂 아이콘(Alt+Shift+S)으로 패널을 다시 여세요. 열려 있던 ERP 탭은 새로고침(F5)하면 새 판이 적용됩니다." });
+    }
+  }
   if (!PANEL_FALLBACK) chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: "sec-ask", title: "서무비서에 묻기: “%s”", contexts: ["selection"] });
@@ -243,9 +254,10 @@ async function notifyDue() {
     items: items.slice(0, 5).map((x) => ({ title: (x.date < today ? "⏰ " : x.date === today ? "오늘 " : "내일 ") + x.proc, message: String(x.step || "").slice(0, 60) }))
   });
 }
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "sec-due") { updateBadge(); notifyDue(); getMeta(); } });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "sec-due") { updateBadge(); notifyDue(); getMeta(); applyUpdate(false).catch(() => {}); } });
 chrome.notifications.onClicked.addListener(async (id) => {
   chrome.notifications.clear(id).catch(() => {});
+  if (id === "sec-updated") return;
   const { server } = await settings();
   const { notifyCase } = await chrome.storage.local.get("notifyCase");
   if (server) chrome.tabs.create({ url: server + (notifyCase ? "/?case=" + encodeURIComponent(notifyCase) : "/?view=cal") });
@@ -299,6 +311,28 @@ chrome.storage.onChanged.addListener((ch, area) => {
 });
 
 function toPanel(msg) { chrome.runtime.sendMessage(Object.assign({ to: "panel" }, msg)).catch(() => {}); }
+
+// ── 업데이트 자동 적용 ─────────────────────────────────────────────────────
+// 개발자 모드로 설치한(압축 해제) 확장은 스토어 자동 업데이트가 없다. 대신 확장 폴더의 파일이 새 판으로 바뀌면
+// (업데이트.cmd 더블클릭 또는 zip 덮어쓰기) 디스크의 manifest.json 버전이 실행 중인 버전과 달라진다 —
+// 그때 chrome.runtime.reload() 로 스스로 다시 불러온다. 패널·설정·진단 화면이 열려 있으면 끊지 않고 패널에 알려 [지금 적용]을 누르게 한다.
+async function diskVersion() {
+  try { const r = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" }); return String(((await r.json()) || {}).version || ""); }
+  catch (e) { return ""; }
+}
+async function applyUpdate(force) {
+  const cur = chrome.runtime.getManifest().version, disk = await diskVersion();
+  if (!disk || disk === cur) return { pending: false, cur, disk };
+  if (!force) {
+    let open = true;                                    // getContexts 가 없는 옛 브라우저는 '열려 있음'으로 보고 끊지 않는다
+    try { if (chrome.runtime.getContexts) open = (await chrome.runtime.getContexts({ contextTypes: ["SIDE_PANEL", "TAB", "POPUP"] })).length > 0; } catch (e) {}
+    if (open) { toPanel({ type: "update", version: disk }); return { pending: true, cur, disk }; }
+  }
+  diag("bg", "update.apply", { from: cur, to: disk, force: !!force });
+  await chrome.storage.local.set({ updatedFrom: cur }).catch(() => {});
+  setTimeout(() => chrome.runtime.reload(), 150);       // 답을 보낸 뒤에 다시 불러온다
+  return { pending: true, cur, disk, reloading: true };
+}
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab) return;
@@ -393,6 +427,10 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     });
   } else if (m.type === "open" && sender.tab) {           // ERP 화면의 🗂 버튼
     openPanel(sender.tab, m.q || "", "", m.popup);
+  } else if (m.type === "update.check") {                 // 확장 화면: 폴더의 파일이 새 판인가(열려 있는 동안엔 다시 불러오지 않고 알리기만)
+    applyUpdate(false).then(reply).catch(() => reply({ pending: false })); return true;
+  } else if (m.type === "update.apply") {                 // 패널의 [지금 적용]·서무비서 웹 화면(marker.js)의 [지금 적용]
+    applyUpdate(true).then(reply).catch(() => reply({ pending: false })); return true;
   } else if (m.type === "getContext") {                   // 패널이 열릴 때 현재 탭 상태 요청
     stateReady.then(() => chrome.storage.session.get("pendingAsk")).then(({ pendingAsk }) => {
       // 방금 누른 🗂·칩의 물음 — 패널이 다른 탭(예: ERP 팝업 창의 원래 창)에 있어도 10초 안이면 받는다

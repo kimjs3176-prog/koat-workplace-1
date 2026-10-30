@@ -52,8 +52,11 @@ async function refreshContext(askNow) {
   else if (askNow && r && r.context) { lastAuto = r.context.q; ask(r.context.q); }
 }
 
+function showUpdate(v) { $("updv").textContent = v; $("upd").hidden = false; }
+$("updgo").addEventListener("click", () => { $("updgo").disabled = true; chrome.runtime.sendMessage({ type: "update.apply" }).catch(() => {}); });
 async function init() {
   if (!params.get("tab")) myWin = await chrome.windows.getCurrent().then((w) => w.id).catch(() => null);
+  chrome.runtime.sendMessage({ type: "update.check" }).then((r) => { if (r && r.pending && !r.reloading) showUpdate(r.disk); }).catch(() => {});
   const s = await chrome.runtime.sendMessage({ type: "settings" }).catch(() => null);
   if (!s) { $("setup").hidden = false; return; }               // 백그라운드가 답하지 않으면 설정 안내라도 보인다
   dlog("panel.open", { server: !!(s && s.server), autoAsk: !!(s && s.autoAsk) });
@@ -80,6 +83,9 @@ window.addEventListener("message", async (e) => {
     q.forEach(post);
   } else if (m.type === "deadlines") {                     // 처리 중인 건의 기한 → 아이콘 배지·알림
     chrome.runtime.sendMessage({ type: "deadlines", source: "panel", items: m.items || [] }).catch(() => {});
+  } else if (m.type === "extReload") {                     // 앱의 [↻ 지금 적용] — 폴더의 파일이 새 판이면 다시 불러온다
+    const r = await chrome.runtime.sendMessage({ type: "update.apply" }).catch(() => null);
+    post({ type: "updateResult", ...(r || { pending: false }) });
   } else if (m.type === "insert") {
     const id = await currentTab();
     if (id == null) { post({ type: "inserted", ok: false, error: "ERP 탭을 찾지 못했습니다." }); return; }
@@ -99,6 +105,7 @@ chrome.runtime.onMessage.addListener((m) => {
     bound = tabId = m.tabId; refreshContext(false); ask(m.q); return;
   }
   if (m.type === "sched") { if (!params.get("tab") || m.tabId === tabId) sched(m.q, m.replace); return; }   // 일정은 탭과 무관
+  if (m.type === "update") { showUpdate(m.version); return; }                                            // 폴더의 파일이 새 판으로 바뀜
   // ERP 팝업 창(기안 작성 창 등)에서 업무를 알아보면 이 창의 패널이 그 팝업 탭에 붙는다
   if (m.type === "context" && m.context && !params.get("tab") && m.panelWin != null && m.panelWin === myWin && m.tabId !== tabId) {
     bound = tabId = m.tabId;

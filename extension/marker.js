@@ -7,5 +7,7 @@
     if (e.source !== window || !e.data || e.data.src !== "koat-sec") return;
     if (e.data.type === "deadlines") chrome.runtime.sendMessage({ type: "deadlines", source: "tab", items: e.data.items || [] }).catch(() => {});
     else if (e.data.type === "openPanel") chrome.runtime.sendMessage({ type: "openHere" }).catch(() => {});
+    else if (e.data.type === "extReload") chrome.runtime.sendMessage({ type: "update.apply" })
+      .then((r) => window.postMessage({ src: "koat-sec-ext", type: "updateResult", ...(r || { pending: false }) }, location.origin)).catch(() => {});
   });
 })();
