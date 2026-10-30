@@ -14,3 +14,7 @@ iframe{flex:1;width:100%;border:0;background:var(--bg)}
 .setup p{margin:0;color:var(--mu);font-size:13px}
 .setup-ic{font-size:34px}
 .btn{border:0;background:var(--g);color:#fff;border-radius:9px;padding:8px 14px;font-size:13.5px;font-weight:700;cursor:pointer;font-family:inherit}
+
+.upd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 10px;background:#fff4e5;color:#7c3a00;font-size:12.5px;border-bottom:1px solid #f3d9b1}
+.upd .btn.sm{padding:4px 10px;font-size:12px}
+.upd .sub{color:#9a6b3a;font-size:11.5px}

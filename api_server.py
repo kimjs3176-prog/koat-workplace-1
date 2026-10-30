@@ -4337,17 +4337,37 @@ def secretary_extension_info():
     import extension_build
     man = extension_build.manifest()
     return jsonify({"success": True, "version": man.get("version", ""), "name": man.get("name", ""),
-                    "server": _sec_public_origin(),
+                    "server": _sec_public_origin(), "update_tools": bool(_sec_ext_server()),
                     "erp_hosts": _sec_ext_hosts() or man["content_scripts"][0]["matches"]})
+
+
+def _sec_ext_server() -> str:
+    """배포본에 넣는 서무비서 주소 — https 또는 로컬 시험 주소만(http 운영 주소는 넣지 않고 사용자가 설정)"""
+    server = _sec_public_origin()
+    return server if (server.startswith("https://") or re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", server)) else ""
+
+
+@app.route("/api/secretary/extension/update.cmd")
+@app.route("/api/secretary/extension/update.command")
+def secretary_extension_update_tool():
+    """업데이트 도구만 따로 받기 — 업데이트 도구가 없는 옛 판(1.5.5 이전)을 쓰는 사람이 확장 폴더에 넣어 더블클릭한다"""
+    import extension_build
+    scripts = extension_build.update_scripts(_sec_ext_server())
+    if not scripts:
+        return jsonify({"success": False, "error": "이 서버 주소(http)로는 업데이트 도구를 만들 수 없습니다. 웹 화면에서 zip 을 받아 덮어쓰세요."}), 400
+    mac = request.path.endswith(".command")
+    fn = extension_build.UPDATE_SH if mac else extension_build.UPDATE_CMD
+    resp = app.response_class(scripts[fn].encode("utf-8"), mimetype="application/octet-stream")
+    resp.headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(fn)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/secretary/extension.zip")
 def secretary_extension_zip():
     """이 서무비서 주소와 기관 ERP 주소를 넣은 확장 배포본. 압축을 풀면 secretary-extension 폴더 하나."""
     import extension_build
-    server = _sec_public_origin()
-    if not (server.startswith("https://") or re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", server)):
-        server = ""                                   # http 운영 주소는 넣지 않고 사용자가 설정
+    server = _sec_ext_server()
     org = (_sec_config().get("org") or {})
     svc = (_sec_config().get("service") or {})
     name = f"{org.get('abbr') or org.get('short') or ''} {svc.get('title') or '서무비서'}".strip()

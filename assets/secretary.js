@@ -106,6 +106,8 @@ async function load(force){
       S.common=d.common||S.common; S.org=d.org||S.org; S.admin=d.admin||{}; S.loaded=true;
       try{ reconcileAll(); }catch(e){}
       applyBranding();
+      if(!EMBED && extInstalled()){ checkExtUpdate();            // 일반 탭: 확장(marker.js)이 설치 버전을 알려 준다
+        if(!S._mkListen){ S._mkListen=true; window.addEventListener('message', e=>{ const m=e.data; if(e.source!==window||e.origin!==location.origin||!m||m.src!=='koat-sec-ext') return; if(m.type==='updateResult') extReloadResult(m); }); } }
       // 개인 절차 호환성 결과가 늦게 오면 그때 한 번 다시 그린다(다음 화면 갱신까지 알림이 늦지 않게)
       checkPersonal().then(()=>{ if(Object.values(S.pstatus||{}).some(x=>x&&x.ok===false) && document.getElementById('secWrap')) render(); });
     }catch(e){ S.loaded=false; throw e; }
@@ -601,6 +603,7 @@ async function start(opts){
       if(m.type==='ask' && m.q){ S.view='home'; ask(String(m.q).slice(0,200)); }
       else if(m.type==='sched' && m.text){ S.view='cal'; render(); openSched(null, '', parseSchedText(String(m.text).slice(0,5000))); }
       else if(m.type==='hello'){ S.extVersion=String(m.version||''); checkExtUpdate(); }
+      else if(m.type==='updateResult') extReloadResult(m);
       else if(m.type==='inserted'){
         if(m.ok){ toast('ERP 입력란(마지막으로 누른 칸)에 넣었습니다. 내용을 확인하세요.', 4200); return; }
         // 넣을 칸을 못 찾으면 클립보드로 — ERP에서 Ctrl+V
@@ -681,7 +684,7 @@ function render(){
   const sig=el=>el&&el!==document.body&&w.contains(el)?el.tagName+(el.id?'#'+el.id:'')+[...el.attributes].filter(a=>/^data-|^name$/.test(a.name)).map(a=>`[${a.name}="${a.value}"]`).join(''):'';
   let ss=null, se=null; try{ ss=ae&&ae.selectionStart; se=ae&&ae.selectionEnd; }catch(e){}
   const keep=same?{sig:sig(ae), v:ae&&'value' in ae?ae.value:null, ss, se, y:window.scrollY}:null;
-  w.innerHTML=ask+nav+`<div class="sec-body">${body}</div>`;
+  w.innerHTML=extUpdateBar()+ask+nav+`<div class="sec-body">${body}</div>`;
   S._lastView=where;
   if(keep){
     if(keep.sig){ const el=[...w.querySelectorAll(ae.tagName)].find(x=>sig(x)===keep.sig);
@@ -1799,6 +1802,7 @@ function bind(panel){
       case 'insall': S.insAll=null; loadInsAll(); break;
       case 'herox': _lsPut('koat_sec_herox', Date.now()+30*86400000); render(); break;
       case 'extpanel': window.postMessage({src:'koat-sec', type:'openPanel'}, location.origin); toast('확장 패널을 엽니다. 열리지 않으면 도구 모음의 서무비서 아이콘을 누르세요.'); break;
+      case 'extreload': extReload(); break;
       case 'copyext': { const t=D.t||''; (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast(t+' 를 복사했습니다. 주소창에 붙여넣으세요.')).catch(()=>toast('주소창에 '+t+' 를 직접 입력하세요.')); break; }
       case 'formsq': S.formsQ=D.q||''; S.view='forms'; render(); break;
       case 'tocal': addDeadlinesToCalendar(); break;
@@ -2863,10 +2867,40 @@ function loadExtInfo(){
 }
 const verLt=(a,b)=>{ const x=String(a).split('.').map(Number), y=String(b).split('.').map(Number); for(let i=0;i<3;i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 function checkExtUpdate(){
-  loadExtInfo().then(i=>{ if(i.version && S.extVersion && verLt(S.extVersion, i.version))
-    toast(`서무비서 확장 새 버전 ${i.version}이 있습니다(지금 ${S.extVersion}). 서무비서 웹 화면의 🧩 확장 설치 탭에서 받아 주세요.`, 6000); });
+  S.extVersion=S.extVersion||extInstalled();
+  loadExtInfo().then(i=>{ if(i.version && S.extVersion && verLt(S.extVersion, i.version)){ const was=S.extNew; S.extNew=i.version;
+      if(!was){ toast(`서무비서 확장 새 버전 ${i.version}이 있습니다(지금 ${S.extVersion}). 위의 안내에서 업데이트 방법을 보세요.`, 6000); render(); } } });
+}
+// 확장 폴더의 파일이 새 판으로 바뀌었으면 확장을 다시 불러온다(패널 안: 확장에 직접, 일반 탭: marker.js 가 전달)
+function extReload(){
+  toast('확장 폴더의 파일을 확인합니다…', 2500);
+  if(EMBED) toExt({type:'extReload'}); else window.postMessage({src:'koat-sec', type:'extReload'}, location.origin);
+}
+function extReloadResult(m){
+  if(m.reloading){ toast(`확장을 ${m.disk} 판으로 다시 불러옵니다. 패널이 닫히면 🗂 아이콘(Alt+Shift+S)으로 다시 여세요. 열려 있던 ERP 탭은 새로고침(F5)하세요.`, 8000); return; }
+  if(m.pending) { toast(`폴더에 ${m.disk} 판이 있지만 아직 적용하지 못했습니다. 확장 관리 페이지에서 ↻를 누르세요.`, 6000); return; }
+  toast(`확장 폴더의 파일이 아직 새 판이 아닙니다(지금 ${m.cur||S.extVersion}). 먼저 확장 폴더의 업데이트.cmd 를 더블클릭하거나 zip 을 받아 덮어쓰세요.`, 7000);
+}
+// 화면 위 고정 띠 — 확장이 설치돼 있고 서버에 새 판이 있을 때
+function extUpdateBar(){
+  if(!S.extNew || S.view==='ext') return '';
+  return `<div class="sec-updbar">🧩 확장 새 버전 <b>${esc(S.extNew)}</b>이 있습니다(지금 ${esc(S.extVersion)}). <button class="sec-linkbtn" data-a="view" data-v="ext">업데이트 방법 보기</button></div>`;
 }
 function browserKind(){ const u=navigator.userAgent; return /Edg\//.test(u)?'edge':/Whale\//.test(u)?'whale':/Chrome\//.test(u)?'chrome':'other'; }
+// 설치된 확장이 옛 판일 때의 업데이트 안내 — 업데이트 도구(1.5.6부터 zip 에 들어 있음) → 자동 적용
+function extUpdateHtml(i, page){
+  const hasTool=!verLt(S.extVersion,'1.5.6');          // 1.5.6 이전 판의 폴더에는 업데이트.cmd 가 없다
+  const step=(n,html)=>`<li class="sec-ext-st"><span class="sec-plan-n">${n}</span><div>${html}</div></li>`;
+  return `<div class="sec-card sec-upd"><div class="sec-card-h">⚠ 확장 업데이트 <span class="sec-sub">설치된 ${esc(S.extVersion)} → 새 버전 ${esc(i.version)}</span></div><ol class="sec-ext-steps">`+
+    (hasTool
+      ?step(1,`확장 폴더 안의 <b>업데이트.cmd</b>(Mac: <b>업데이트.command</b>)를 <b>더블클릭</b>합니다. 새 판을 받아 그 폴더에 덮어씁니다.`+
+          `<div class="sec-sub">폴더 위치를 모르면: <code>${page}</code> → 서무비서 → <b>세부정보</b> → '소스' 경로. Windows 가 "알 수 없는 게시자" 경고를 띄우면 '추가 정보 → 실행'. Mac 은 처음에 오른쪽 클릭 → 열기.</div>`)
+      :step(1,`<a class="sec-btn primary sm" href="/api/secretary/extension/update.cmd" download>⬇ 업데이트.cmd 받기</a> <a class="sec-btn sm" href="/api/secretary/extension/update.command" download>Mac용</a>`+
+          `<div class="sec-sub">설치된 판(${esc(S.extVersion)})의 폴더에는 업데이트 도구가 없습니다. 받은 파일을 <b>확장 폴더 안</b>(manifest.json 이 있는 곳)에 넣고 더블클릭하세요. 폴더 위치: <code>${page}</code> → 서무비서 → 세부정보 → '소스'. 다음부터는 이 파일만 더블클릭하면 됩니다.</div>`))+
+    step(2,`끝. 확장이 바뀐 파일을 알아보고 <b>스스로 다시 불러옵니다</b>(패널이 닫혀 있을 때 1시간 안). 바로 적용하려면 <button class="sec-btn sm primary" data-a="extreload">↻ 지금 적용</button>`+
+      `<div class="sec-sub">적용되면 패널이 닫힙니다 — 🗂 아이콘(Alt+Shift+S)으로 다시 여세요. 열려 있던 ERP 탭은 새로고침(F5)하면 새 판이 적용됩니다. 처리 이력·설정은 그대로 남습니다.</div>`)+
+    `</ol><details class="sec-sub" style="margin-top:6px"><summary>업데이트 도구를 쓸 수 없을 때(수동)</summary>① 아래 1번에서 zip 을 받아 압축을 풀고 ② 안의 파일을 기존 확장 폴더에 덮어쓴 뒤 ③ <code>${page}</code>에서 서무비서의 ↻를 누릅니다.</details></div>`;
+}
 function extView(){
   const i=S.extInfo; if(!i){ loadExtInfo().then(()=>{ if(S.view==='ext') render(); }); return `<div class="assist-loading"><div class="spinner"></div><span>불러오는 중...</span></div>`; }
   const b=browserKind();
@@ -2876,7 +2910,7 @@ function extView(){
   const dev=b==='edge'?"왼쪽 메뉴(또는 아래쪽)의 <b>개발자 모드</b>를 켭니다.":"오른쪽 위의 <b>개발자 모드</b>를 켭니다.";
   const load=b==='edge'?"<b>압축을 푼 파일 로드</b>(압축 해제된 항목 로드)를 누르고":"<b>압축해제된 확장 프로그램을 로드합니다</b>를 누르고";
   const step=(n,html)=>`<li class="sec-ext-st"><span class="sec-plan-n">${n}</span><div>${html}</div></li>`;
-  const installed=EMBED&&S.extVersion;
+  const installed=!!(S.extVersion||extInstalled()); S.extVersion=S.extVersion||extInstalled();
   return `<div class="sec-card sec-ext-hero"><div class="sec-ext-ic">🧩</div><div><div class="sec-card-h">서무비서 ERP 확장 <span class="sec-sub">${esc(bname)}용 · 버전 ${esc(i.version||'')}</span></div>`+
       `<ul class="sec-tips"><li>ERP·그룹웨어 화면 <b>옆 패널</b>에서 절차·기한·서식·근거·사전 감사를 봅니다.</li>`+
       `<li>ERP에서 출장·휴가·지출결의 같은 화면을 열면 <b>이 업무 안내</b>를 바로 띄웁니다.</li>`+
@@ -2884,7 +2918,7 @@ function extView(){
       `<li>잘 안 될 때는 패널의 <b>🩺 진단</b>이 원인(IE 모드·주소 설정·못 알아본 화면)을 찾아 줍니다.</li>`+
       `<li>ERP에서 <b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 보여 줍니다.</li>`+
       `<li>도구 모음 아이콘에 <b>다가오는 기한</b>을 표시하고, 오늘·내일 기한은 바탕화면으로 알립니다.</li></ul></div></div>`+
-    (installed?`<div class="sec-notice ${verLt(S.extVersion,i.version)?'warn':'info'}">${verLt(S.extVersion,i.version)?`⚠ 설치된 확장 ${esc(S.extVersion)} — 새 버전 ${esc(i.version)}을 받아 같은 폴더에 덮어쓴 뒤 확장 페이지에서 ↻ 새로고침하세요.`:`✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).`}</div>`:'')+
+    (installed?(verLt(S.extVersion,i.version)?extUpdateHtml(i, page):`<div class="sec-notice info">✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).</div>`):'')+
     (b==='other'?`<div class="sec-notice warn">이 브라우저에서는 확장을 쓸 수 없습니다. <b>Chrome</b>이나 <b>Microsoft Edge</b>로 이 페이지를 여세요.</div>`:'')+
     `<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
       step(1,`<a class="sec-btn primary" href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 받기 (v${esc(i.version||'')})</a>`+
@@ -2894,7 +2928,7 @@ function extView(){
       step(4,dev)+
       step(5,`${load} <code>secretary-extension</code> 폴더를 고릅니다.`)+
       step(6,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
-    `</ol><div class="sec-hint">새 버전이 나오면 1번에서 다시 받아 같은 폴더에 덮어쓰고, ${page} 에서 서무비서의 ↻(새로고침)을 누르면 됩니다. 처리 이력 등은 그대로 남습니다.</div></div>`+
+    `</ol><div class="sec-hint">새 버전이 나오면 확장 폴더 안의 <b>업데이트.cmd</b>(Mac: 업데이트.command)를 더블클릭하면 됩니다 — 받아서 덮어쓰고 확장이 스스로 다시 불러옵니다. 처리 이력 등은 그대로 남습니다.</div></div>`+
     `<details class="sec-card"><summary class="sec-card-h">관리자: 기관 PC 일괄 배포</summary><div class="sec-hint">`+
       `· 확장에 들어갈 ERP 주소는 <button class="sec-linkbtn" data-a="view" data-v="manage">⚙ 규정·절차 관리 › 🏢 기관 설정</button>의 'ERP·그룹웨어 주소'에서 바꿉니다.<br>`+
       `· 직원마다 설치하지 않으려면 받은 zip을 Chrome 웹 스토어·Edge 추가 기능에 <b>비공개(조직 한정)</b>로 올리고, 그룹 정책 <code>ExtensionInstallForcelist</code>에 확장 ID를 넣어 일괄 설치합니다.<br>`+
