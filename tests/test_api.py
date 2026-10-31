@@ -598,8 +598,11 @@ def test_expense_hwpx_tolerates_bad_numbers(client):
 
 
 def test_expense_receipt_template_has_no_default_department():
-    import openpyxl, warnings
-    warnings.simplefilter("ignore")
-    ws = openpyxl.load_workbook("assets/expense_receipt_template.xlsx").worksheets[0]
-    assert ws["G3"].value in (None, "")                                           # 부서명은 화면이 항상 채운다(기본값이 새어 나가지 않게)
-    assert {str(m) for m in ws.merged_cells.ranges if m.min_row == 9} == {"C9:D9", "E9:G9", "H9:J9"}
+    """표준 라이브러리로만 읽는다(CI 에 openpyxl 없음)"""
+    import zipfile, re as _re
+    z = zipfile.ZipFile("assets/expense_receipt_template.xlsx")
+    sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    g3 = _re.search(r'<c r="G3"[^>]*?(?:/>|>(.*?)</c>)', sheet)
+    assert not (g3 and g3.group(1) and "<v>" in g3.group(1))                     # 부서명은 화면이 항상 채운다(기본값이 새어 나가지 않게)
+    merges = set(_re.findall(r'<mergeCell ref="([A-Z]+9:[A-Z]+9)"', sheet))
+    assert merges == {"C9:D9", "E9:G9", "H9:J9"}
