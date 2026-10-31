@@ -641,7 +641,7 @@ function ask(q){
       selectProc(p.id, {keepQuery:true, caseId:S.caseId, keepNote:true}); return; }
     selectProc(p.id, {keepQuery:true}); return; }
   S.procId=null; S.caseId=null; S.view='nomatch'; render();
-  fetch('/api/secretary/related?q='+encodeURIComponent(q)).then(r=>r.json()).then(d=>{ S.related=(d&&d.items)||[]; if(S.view==='nomatch') render(); })
+  fetch('/api/secretary/related',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q})}).then(r=>r.json())   // 상황 문장을 주소에 싣지 않는다(접속 로그).then(d=>{ S.related=(d&&d.items)||[]; if(S.view==='nomatch') render(); })
     .catch(()=>{ S.related=[]; if(S.view==='nomatch') render(); });
 }
 function selectProc(id, o){

@@ -611,3 +611,14 @@ def test_expense_receipt_template_has_no_default_department():
 def test_extension_privacy_page(client):
     r = client.get("/extension/privacy")
     assert r.status_code == 200 and "개인정보처리방침" in r.get_data(as_text=True) and "수집하거나 외부로 보내지 않습니다" in r.get_data(as_text=True)
+
+
+def test_text_queries_accept_post_not_only_url(client, monkeypatch):
+    """사용자가 적은 글(상황 문장·거래처명)은 주소가 아니라 본문으로 — 접속 로그에 남지 않게. GET 은 호환용으로 유지"""
+    d = client.post("/api/secretary/related", json={"q": "출장 다녀와서 정산"}).get_json()
+    assert d["success"] and isinstance(d["items"], list)
+    assert client.get("/api/secretary/related", query_string={"q": "출장 정산"}).get_json()["success"]
+    monkeypatch.delenv("DATA_GO_KR_KEY", raising=False)
+    d = client.post("/api/expense/biz", json={"query": "한국농업기술진흥원"}).get_json()
+    assert d["success"] is False and d["need_key"] is True
+    assert client.post("/api/expense/biz", json={}).get_json()["error"].startswith("회사명")
