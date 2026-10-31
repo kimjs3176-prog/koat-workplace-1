@@ -462,20 +462,24 @@ let _rcptImages=[];   // 첨부 증빙 사진 dataURL (메모리 전용, localSt
 let _rcptOcr=[];      // _rcptImages와 같은 순서의 인식 상태 {st:'wait'|'run'|'ok'|'fail', amt, date, kind, row}
 let _rcptAutoOcr=true;
 function _rcpt(){ if(!_expState.receipt) _expState.receipt={user:'',dept:'',region:'',summary:'',rows:[],init:false}; return _expState.receipt; }
+// 국내여비 자동 계산으로 넣은 행(일비·식비·숙박)은 영수증이 아니므로 증빙 서식의 '대중교통비'에 넣지 않는다
+const _RCPT_CALC_RX=/^국내여비\(|일비|식비/;
 function _rcptEnsure(){
   const rc=_rcpt(); if(rc.init) return rc;
   const tv=_expState.travel||{};
   const trows=(tv.rows||[]).filter(r=>r.content||r.amt||r.date||r.place);
-  if(!rc.user) rc.user=tv.name||'';
-  if(!rc.dept) rc.dept=tv.dept||'';
   if(!rc.region) rc.region=[...new Set(trows.map(r=>String(r.place||'').trim()).filter(Boolean))].join(', ');
   if(!rc.summary) rc.summary=trows[0]?String(trows[0].content||''):'';
   if(!rc.rows||!rc.rows.length){
-    rc.rows= trows.length? trows.map(r=>({content:r.content||'', date:r.date||'', transit:String(r.amt||''), lodging:''}))
+    rc.rows= trows.length? trows.map(r=>({content:r.content||'', date:r.date||'', transit:_RCPT_CALC_RX.test(r.content||'')?'':String(r.amt||''), lodging:''}))
                          : [{content:'',date:_today(),transit:'',lodging:''}];
   }
   rc.init=true; _expSaveState(); return rc;
 }
+// 증빙 서식의 사용자·부서명: ③에 적은 값이 있으면 그것, 없으면 ①의 출장자 성명·소속(처음 그릴 때가 아니라 쓸 때마다 본다 —
+// 보통 ①을 채우기 전에 ②가 먼저 그려지므로 한 번만 베끼면 빈 채 남는다)
+function _rcptUserDept(){ const rc=_rcpt(), tv=_expState.travel||{};
+  return {user:(rc.user||'').trim()||(tv.name||'').trim(), dept:(rc.dept||'').trim()||(tv.dept||'').trim()}; }
 function _rcptSectionHtml(){
   const rc=_rcptEnsure();
   return `<div class="rcpt-zone"><div class="rcpt-zone-h"><span class="exp-zone-no">2</span><div><div class="rcpt-zone-t">증빙 사진 첨부 · 증빙 서식(Excel) 생성</div>`+
@@ -484,8 +488,9 @@ function _rcptSectionHtml(){
     `<div id="rcptBox">${_rcptInnerHtml(rc)}</div></div>`;
 }
 function _rcptInnerHtml(rc){
-  const f=(id,label,val,ph)=>`<label class="rcpt-f">${label}<input id="rc_${id}" value="${_ev(val)}" placeholder="${ph||''}" oninput="_rcptField('${id}',this.value)"></label>`;
-  const head=`<div class="rcpt-frow">${f('user','사용자',rc.user,'성명')}${f('dept','부서명',rc.dept,'예: 기술거래이전팀')}</div>`+
+  const f=(id,label,val,ph)=>`<label class="rcpt-f">${label}<input id="rc_${id}" value="${_ev(val)}" placeholder="${_ev(ph||'')}" oninput="_rcptField('${id}',this.value)"></label>`;
+  const tv=_expState.travel||{};
+  const head=`<div class="rcpt-frow">${f('user','사용자',rc.user,tv.name?'비우면 출장자 '+tv.name:'성명')}${f('dept','부서명',rc.dept,tv.dept?'비우면 소속 '+tv.dept:'예: 기술사업부')}</div>`+
     `<div class="rcpt-frow">${f('region','사용지역',rc.region,'예: 세종특별자치시')}${f('summary','적요',rc.summary,'출장 목적 요약')}</div>`;
   const imgs=`<div class="rcpt-imgs" id="rcptImgs">${_rcptThumbsHtml()}</div>`+
     `<div class="rcpt-imgbar"><label class="rcpt-attach">＋ 증빙 사진 첨부<input type="file" accept="image/*" multiple style="display:none" onchange="_rcptPickImages(this)"></label>`+
@@ -685,7 +690,7 @@ function _imgDims(dataURL){ return new Promise(res=>{ const im=new Image();
 async function _rcptGenerate(btn){
   const rc=_rcpt();
   const rows=(rc.rows||[]).filter(r=>r.content||r.date||r.transit||r.lodging);
-  if(!rc.user && !rows.length && !_rcptImages.length){ alert('사용자·내역 또는 증빙 사진 중 하나 이상을 입력/첨부해 주세요.'); return; }
+  if(!_rcptUserDept().user && !rows.length && !_rcptImages.length){ alert('사용자·내역 또는 증빙 사진 중 하나 이상을 입력/첨부해 주세요.'); return; }
   const orig=btn?btn.textContent:''; if(btn){ btn.disabled=true; btn.textContent='생성 중...'; }
   try{
     const ExcelJS=await _loadExcelJS();
@@ -695,8 +700,9 @@ async function _rcptGenerate(btn){
     const wb=new ExcelJS.Workbook(); await wb.xlsx.load(buf);
     const ws=wb.worksheets[0];
     const digits=v=>parseInt(String(v||'').replace(/[^\d]/g,''),10)||0;
-    ws.getCell('B3').value=rc.user||'';
-    if((rc.dept||'').trim()) ws.getCell('G3').value=rc.dept.trim();
+    const ud=_rcptUserDept();
+    ws.getCell('B3').value=ud.user;
+    ws.getCell('G3').value=ud.dept;              // 템플릿에 들어 있는 부서명 기본값이 남지 않게 비어 있어도 덮어쓴다
     ws.getCell('B4').value=rc.region||'';
     ws.getCell('B5').value=rc.summary||'';
     const BASE_FIRST=8, BASE_LAST=10, BASE_SUM=11;

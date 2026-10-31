@@ -588,3 +588,18 @@ def test_expense_biz_without_key(client, monkeypatch):
     monkeypatch.delenv("DATA_GO_KR_KEY", raising=False)
     d = client.get("/api/expense/biz", query_string={"query": "한국농업기술진흥원"}).get_json()
     assert d["success"] is False and d["need_key"] is True
+
+
+def test_expense_hwpx_tolerates_bad_numbers(client):
+    """colCnt·cs 가 숫자가 아니어도 500 이 아니라 기본값으로 만든다"""
+    payload = {"colCnt": "abc", "colWidths": ["x", 9000], "rows": [[{"t": "a", "cs": "많이"}, {"t": "b", "cs": None}]]}
+    r = client.post("/api/expense/hwpx", data=json.dumps(payload), content_type="application/json")
+    assert r.status_code == 200 and r.data[:2] == b"PK"
+
+
+def test_expense_receipt_template_has_no_default_department():
+    import openpyxl, warnings
+    warnings.simplefilter("ignore")
+    ws = openpyxl.load_workbook("assets/expense_receipt_template.xlsx").worksheets[0]
+    assert ws["G3"].value in (None, "")                                           # 부서명은 화면이 항상 채운다(기본값이 새어 나가지 않게)
+    assert {str(m) for m in ws.merged_cells.ranges if m.min_row == 9} == {"C9:D9", "E9:G9", "H9:J9"}

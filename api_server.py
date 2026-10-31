@@ -3239,7 +3239,7 @@ def _exp_hwpx_cell(text, col, row, cspan, width, height, bf):
 
 def _exp_hwpx_table(payload, bf):
     col_w = [int(x) for x in (payload.get("colWidths") or []) if str(x).isdigit()][:12]
-    col_cnt = int(payload.get("colCnt") or (len(col_w) or 1))
+    col_cnt = _sec_int(payload.get("colCnt"), len(col_w) or 1, 1, 12)
     rows = payload.get("rows") or []
     rh = 1848
     total_w = sum(col_w) if col_w else 47628
@@ -3250,7 +3250,7 @@ def _exp_hwpx_table(payload, bf):
         for c in (cells if isinstance(cells, list) else []):
             if not isinstance(c, dict):
                 continue
-            cs = max(1, min(12, int(c.get("cs") or 1)))
+            cs = _sec_int(c.get("cs"), 1, 1, 12)
             w = sum(col_w[col:col + cs]) if col_w else int(total_w / max(1, col_cnt)) * cs
             tcs.append(_exp_hwpx_cell(str(c.get("t", ""))[:2000], col, r, cs, w, rh, bf))
             col += cs
