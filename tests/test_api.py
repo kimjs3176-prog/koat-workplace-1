@@ -606,3 +606,8 @@ def test_expense_receipt_template_has_no_default_department():
     assert not (g3 and g3.group(1) and "<v>" in g3.group(1))                     # 부서명은 화면이 항상 채운다(기본값이 새어 나가지 않게)
     merges = set(_re.findall(r'<mergeCell ref="([A-Z]+9:[A-Z]+9)"', sheet))
     assert merges == {"C9:D9", "E9:G9", "H9:J9"}
+
+
+def test_extension_privacy_page(client):
+    r = client.get("/extension/privacy")
+    assert r.status_code == 200 and "개인정보처리방침" in r.get_data(as_text=True) and "수집하거나 외부로 보내지 않습니다" in r.get_data(as_text=True)

@@ -19,6 +19,22 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 - 환경변수는 Vercel 프로젝트 설정 → Environment Variables에서 등록합니다(예시: `.env.example`). **키·토큰은 코드나 저장소에 넣지 마세요.**
 - 기관 내부 서버에서는 `Dockerfile`로 실행합니다([docs/ADOPTION.md](ADOPTION.md#1-설치)).
 
+## 확장 배포 — 웹 스토어 비공개 등록(권장)
+서무비서는 **ERP 옆 패널(브라우저 확장)이 기본 제공 방식**입니다. 웹 화면은 확장이 없을 때 설치 안내와 관리 화면으로 씁니다. 개발자 모드 설치(🧩 확장 탭의 설치 도구)는 바로 쓸 수 있지만, 브라우저가 시작할 때마다 "개발자 모드 확장" 경고를 띄우고 기관 보안 정책에 막힐 수 있습니다. 직원 PC에 기본으로 깔려 있게 하려면 **스토어에 비공개로 올리고 그룹 정책으로 일괄 설치**합니다. 그러면 업데이트도 저절로 됩니다.
+
+1. **배포본 만들기**: `python scripts/build_extension.py --server https://<서무비서 주소> --erp https://kerp.koat.or.kr --erp https://onnara.koat.or.kr` → `dist/secretary-extension-<버전>.zip`. 새 판을 낼 때마다 `extension/manifest.json`의 `version`을 올립니다.
+2. **Chrome 웹 스토어**([개발자 대시보드](https://chrome.google.com/webstore/devconsole), 1회 등록비 US$5): 새 항목 → zip 업로드 → 공개 범위 **비공개(Unlisted)** 또는 Google Workspace 도메인 한정 → 아래 소개 문구·개인정보처리방침 URL 입력 → 검토 제출(보통 1~3일).
+3. **Edge 추가 기능**([Partner Center](https://partner.microsoft.com/dashboard/microsoftedge), 무료): 같은 zip 으로 제출. 공개 범위 **숨김(Hidden)**.
+4. **일괄 설치**(전산 담당): 그룹 정책 `ExtensionInstallForcelist`(Chrome: `컴퓨터 구성 › 관리 템플릿 › Google › Google Chrome › 확장 프로그램`, Edge: `Microsoft Edge › 확장`)에 `확장ID;https://clients2.google.com/service/update2/crx`(Edge는 `확장ID;https://edge.microsoft.com/extensionwebstorebase/v1/crx`)를 넣습니다. 확장 ID 는 스토어 항목 주소 끝의 32자입니다.
+
+**등록에 쓰는 문구**(그대로 붙여 넣어도 됩니다)
+- 이름: `서무비서 — ERP 옆에서 절차·서식·근거 안내` (기관명을 앞에 붙여도 됨)
+- 짧은 설명(132자 이내): `ERP·그룹웨어 옆 패널에서 출장·물품·휴가 등 서무 절차와 기한·서식·근거 조문을 안내하고, 초안을 입력란에 넣어 주며, 결재 올리기 전에 반려 점검 항목을 보여 줍니다.`
+- 자세한 설명: README 의 기능 표와 `docs/FEATURES.md`의 "🧩 브라우저 확장" 절을 붙여 넣습니다.
+- 개인정보처리방침 URL: `https://<서무비서 주소>/extension/privacy` (저장소의 `extension-privacy.html`)
+- 권한 사유(심사 양식): 개인정보처리방침 페이지의 "3. 권한을 쓰는 이유" 표를 그대로 씁니다. 원격 코드 없음, 데이터 판매 없음.
+- 스크린샷(1280×800): `docs/store/` 의 PNG 3장(ERP 옆 패널, 초안 → ERP에 넣기, 결재 전 점검 카드).
+
 ## 환경변수
 
 | 이름 | 용도 | 필수 |
