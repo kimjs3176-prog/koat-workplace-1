@@ -78,7 +78,9 @@ body.embed .brand-s, body.embed .tb-btn[href="/upload"], body.embed .tb-ext, bod
 body.embed .main{padding:10px 12px 24px;}
 </style>
 <link rel="stylesheet" href="/assets/secretary.css">
+<link rel="stylesheet" href="/assets/expense.css">
 <script src="/assets/secretary.js"></script>
+<script src="/assets/expense.js"></script>
 </head>
 <body>
 <script>try{ const v=localStorage.getItem('darkMode'); if(v==='1'||(v==null&&matchMedia('(prefers-color-scheme: dark)').matches)) document.body.classList.add('dark'); }catch(e){}</script>
@@ -123,7 +125,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   sync();
   btn.addEventListener('click', ()=>{ const d=!document.body.classList.contains('dark'); document.body.classList.toggle('dark', d);
     try{ localStorage.setItem('darkMode', d?'1':'0'); }catch(e){} sync(); });
-  // 진입 파라미터: ?q=상황(바로 안내) · ?reg=규정명(원문 열기) · ?view=list|history|forms|manage|cal · ?case=처리 건(확장 기한 알림)
+  // 진입 파라미터: ?q=상황(바로 안내) · ?reg=규정명(원문 열기) · ?view=list|history|forms|manage|cal|expense · ?case=처리 건(확장 기한 알림)
   const p=new URLSearchParams(location.search);
   Secretary.start({q:(p.get('q')||'').trim(), reg:(p.get('reg')||'').trim(), view:(p.get('view')||'').trim(), case:(p.get('case')||'').trim()});
 });

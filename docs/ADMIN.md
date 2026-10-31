@@ -37,6 +37,7 @@ python run_local.py          # http://localhost:5100 (PORT 환경변수로 변�
 | `SECRETARY_INSIGHTS_FILE` | 집단 지식 로컬 파일 위치 | 선택 |
 | `SEMANTIC_MIN_SCORE` | 의미 검색 최소 유사도 | 선택 |
 | `REG_PDF_BASE_URL` | 내규 원본 PDF 주소 접두어 | 선택 |
+| `DATA_GO_KR_KEY` | 지출결의서 거래처 조회 — 공공데이터포털 '금융위원회_기업기본정보'(회사명 → 사업자번호)·'국세청_사업자등록정보 상태조회' 활용신청 키(Decoding/Encoding 모두 가능). 없으면 직접 입력 | 선택 |
 | `ALLOWED_ORIGINS` | CORS 허용 도메인 | 선택 |
 
 ## 절차 관리
@@ -78,6 +79,9 @@ node scripts/alio_sync.mjs --apply      # 받아서 scripts/import_regs.py 로 �
 ├── index.html                 # 서무비서 화면 틀(원문 보기 패널 포함)
 ├── assets/secretary.js        # 서무비서 기능(절차 안내·기한·초안·이력·관리)
 ├── assets/secretary.css
+├── assets/expense.js·expense.css  # 지출결의서(일반·여비·업무추진비) — /?view=expense
+├── assets/ocr/                 # 증빙 사진 OCR(tesseract.js·한국어 모델, 브라우저에서 실행)
+├── assets/exceljs.min.js, expense_receipt_template.xlsx  # 출장 증빙 서식(Excel)
 ├── secretary/procedures.json  # 공통 절차·반려 점검·문서 초안 서식 (기관 절차: secretary/org.json)
 ├── secretary/config.json      # 기관 설정(기관명·명칭·규정명 매핑·기관 휴일)
 ├── secretary/holidays.json    # 법정 공휴일·대체공휴일

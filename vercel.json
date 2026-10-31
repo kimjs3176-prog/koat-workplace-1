@@ -6,7 +6,7 @@
       "use": "@vercel/python",
       "config": {
         "maxLambdaSize": "50mb",
-        "excludeFiles": "{node_modules/**,forms/**,dist/**,diag/**,tests/**}"
+        "excludeFiles": "{node_modules/**,forms/**,dist/**,diag/**,tests/**,assets/**}"
       }
     },
     {
