@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>서무비서 브라우저 확장 개인정보처리방침</title>
+<style>
+body{font-family:"Pretendard","Malgun Gothic",system-ui,sans-serif;max-width:760px;margin:0 auto;padding:32px 20px 60px;line-height:1.7;color:#1a1a1a;background:#fff}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 8px}
+.sub{color:#5f6b7a;font-size:13px;margin:0 0 20px}
+table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #dde;padding:8px 10px;text-align:left;vertical-align:top}th{background:#f5f7fa;white-space:nowrap}
+code{background:#f3f5f8;padding:1px 5px;border-radius:4px;font-size:13px}
+</style>
+</head>
+<body>
+<h1>서무비서 브라우저 확장 개인정보처리방침</h1>
+<p class="sub">적용 대상: Chrome·Edge용 「서무비서 — ERP 옆에서 절차·서식·근거 안내」 확장. 시행일 2026-11-01.</p>
+
+<p>서무비서 확장은 기관의 ERP·그룹웨어 화면 옆 패널에서 서무 절차·기한·서식·근거 조문을 안내하고, 만든 초안을 입력란에 넣어 주며, 결재 올리기 전에 반려 점검 항목을 보여 주는 도구입니다. <b>ERP 화면의 내용을 수집하거나 외부로 보내지 않습니다.</b></p>
+
+<h2>1. 수집·이용하는 정보</h2>
+<table>
+<tr><th>항목</th><th>내용</th><th>보관 위치</th></tr>
+<tr><td>설정</td><td>서무비서 서버 주소, ERP 주소, 버튼·알림 켜고 끄기</td><td>브라우저 동기화 저장소(사용자 계정)</td></tr>
+<tr><td>처리 이력·메모·초안</td><td>패널 안에서 사용자가 직접 적은 내용</td><td>브라우저 저장소(이 PC)</td></tr>
+<tr><td>화면 종류 판단</td><td>ERP 화면의 <b>제목 문구와 주소 경로</b>로 어떤 업무 화면인지 판단합니다. 입력값·본문·첨부는 읽지 않습니다. 결재 전 점검은 화면의 날짜·시각·금액·첨부 수를 <b>브라우저 안에서만</b> 대조하고 저장·전송하지 않습니다.</td><td>저장하지 않음</td></tr>
+<tr><td>진단 기록(선택)</td><td>동작 기록(칸 이름·종류·프레임 위치·버튼 이름·결과). 입력값·초안 내용은 기록하지 않으며, 긴 숫자열은 가립니다. 사용자가 「보고서 받기」 또는 「서버로 보내기」를 눌렀을 때만 밖으로 나갑니다.</td><td>브라우저 저장소(이 PC)</td></tr>
+</table>
+
+<h2>2. 서버와 주고받는 것</h2>
+<ul>
+<li>절차·반려 점검 항목·서식 목록·기관 ERP 화면 규칙(<code>/api/secretary/erp/meta</code>)을 기관 서무비서 서버에서 <b>받아옵니다</b>.</li>
+<li>패널은 기관 서무비서 웹 화면을 그대로 담아 보여 줍니다. 그 안에서 사용자가 직접 입력한 상황 문장·질문은 서버로 보내져 절차 안내에 쓰입니다.</li>
+<li>처리 중인 건의 <b>기한</b>(절차 이름·날짜)을 확장이 받아 아이콘 배지와 알림에 씁니다. 이 정보는 PC 안에만 있습니다.</li>
+<li>AI 기능(영수증 인식·초안·감사)은 사용자가 패널에 <b>자기 AI 키</b>를 넣었을 때만 동작하며, 키는 사용자 브라우저에만 저장됩니다.</li>
+</ul>
+
+<h2>3. 권한을 쓰는 이유</h2>
+<table>
+<tr><th>권한</th><th>이유</th></tr>
+<tr><td>ERP·그룹웨어 주소(호스트)</td><td>그 화면에 🗂 버튼을 그리고, 화면 종류를 판단하고, 초안을 입력란에 넣기 위해</td></tr>
+<tr><td>sidePanel · activeTab · scripting</td><td>옆 패널을 열고, 현재 탭의 입력란에 초안을 넣기 위해</td></tr>
+<tr><td>storage</td><td>설정과 진단 기록을 PC에 저장하기 위해</td></tr>
+<tr><td>contextMenus</td><td>글자를 드래그한 뒤 「서무비서에 묻기」 메뉴를 제공하기 위해</td></tr>
+<tr><td>alarms · notifications</td><td>다가오는 기한을 한 시간마다 확인해 배지·알림으로 알리기 위해</td></tr>
+</table>
+
+<h2>4. 제3자 제공·보관 기간</h2>
+<p>수집한 정보를 제3자에게 제공하거나 판매하지 않습니다. 설정·이력은 사용자가 지우거나 확장을 삭제할 때까지 브라우저에 보관됩니다. 진단 기록은 최근 3,000건까지만 유지되고 「기록 지우기」로 즉시 삭제됩니다.</p>
+
+<h2>5. 문의</h2>
+<p>기관 서무비서 관리자(기관 설정에 적힌 담당 부서)에게 문의하세요.</p>
+</body>
+</html>

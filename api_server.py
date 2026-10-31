@@ -1279,6 +1279,17 @@ def serve_asset_file(subpath):
         return Response("Not found", status=404)
 
 
+@app.route("/extension/privacy")
+def extension_privacy_page():
+    """확장 개인정보처리방침 — 웹 스토어·Edge 추가 기능 등록에 필요한 공개 페이지(Vercel 은 정적 파일로 서빙)."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension-privacy.html")
+        with open(p, encoding="utf-8") as f:
+            return Response(f.read(), mimetype="text/html; charset=utf-8")
+    except FileNotFoundError:
+        return Response("Not found", status=404)
+
+
 @app.route("/upload")
 @app.route("/upload.html")
 def upload_page():

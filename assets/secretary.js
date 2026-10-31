@@ -724,12 +724,21 @@ function extHero(){
   const v=extInstalled();
   if(v) return `<div class="sec-ext-ok"><span>🧩 <b>서무비서 확장 ${esc(v)}</b>이 설치되어 있습니다 — ERP 화면에서 <b>🗂</b>(또는 <b>Alt+Shift+S</b>)로 여세요. 상신 전 점검·기한 알림도 확장이 맡습니다.</span>`+
     `<button class="sec-btn sm" data-a="extpanel">이 탭 옆에 패널 열기</button></div>`;
-  if(_ls('koat_sec_herox',0)>Date.now()) return '';
   const b=browserKind();
+  if(_ls('koat_sec_herox',0)>Date.now())                       // 접어 둔 동안에도 설치 길은 한 줄로 남긴다(확장이 기본 제공 방식이므로)
+    return `<div class="sec-ext-bar">🧩 서무비서는 <b>ERP 옆 패널</b>로 쓰는 게 기본입니다 — ERP 화면을 열면 절차·기한·결재 전 점검이 저절로 뜹니다. `+
+      (b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치</span>`:`<button class="sec-linkbtn" data-a="view" data-v="ext">확장 설치하기</button>`)+`</div>`;
+  const i=S.extInfo; if(!i){ loadExtInfo().then(()=>{ if(S.view==='home') render(); }); }
+  const page=b==='edge'?'edge://extensions':b==='whale'?'whale://extensions':'chrome://extensions';
+  const hosts=((i&&i.erp_hosts)||[]).map(h=>h.replace(/\/\*$/,''));
+  const dev=b==='edge'?"왼쪽 메뉴(또는 아래쪽)의 <b>개발자 모드</b>를 켭니다.":"오른쪽 위의 <b>개발자 모드</b>를 켭니다.";
+  const load=b==='edge'?"<b>압축을 푼 파일 로드</b>(압축 해제된 항목 로드)를 누르고":"<b>압축해제된 확장 프로그램을 로드합니다</b>를 누르고";
+  const mac=/Mac/.test(navigator.platform||'');
   return `<div class="sec-ext-cta"><div class="sec-ext-cta-m"><div class="sec-ext-cta-t">🧩 서무비서는 <b>ERP 옆에서</b> 쓰는 브라우저 확장이 기본입니다</div>`+
     `<ul><li>ERP 화면을 열면 그 업무의 <b>절차·기한·반려 점검</b>을 옆 패널에 바로</li><li>만든 초안을 ERP에서 <b>마지막으로 누른 입력란</b>에 바로 넣기(안 되면 복사 → Ctrl+V)</li><li><b>상신 버튼</b>을 누르면 반려 점검 항목을 먼저 확인</li><li>도구 모음 아이콘에 <b>다가오는 기한</b>, 당일 바탕화면 알림</li></ul></div>`+
-    `<div class="sec-ext-cta-a">${b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치할 수 있습니다</span>`:`<button class="sec-btn primary" data-a="view" data-v="ext">🧩 확장 설치하기</button>`}`+
-    `<button class="sec-linkbtn" data-a="herox">웹에서 계속 쓰기</button></div></div>`;
+    `<div class="sec-ext-cta-a">${b==='other'?`<span class="sec-sub">Chrome·Edge에서 설치할 수 있습니다</span>`:`<button class="sec-btn primary" data-a="view" data-v="ext">🧩 자세히 보기</button>`}`+
+    `<button class="sec-linkbtn" data-a="herox">웹에서 계속 쓰기</button></div></div>`+
+    (b!=='other'&&i&&!i.error?extInstallStepsHtml(i, {page, hosts, dev, load, mac}):'');
 }
 // 처리 중인 건의 다가오는 기한 → 확장(아이콘 배지·바탕화면 알림). 패널 안이면 패널로, 일반 탭이면 marker.js 로.
 let _dlTimer=null, _dlLast='';
@@ -2903,6 +2912,31 @@ function extUpdateHtml(i, page){
       `<div class="sec-sub">적용되면 패널이 닫힙니다 — 🗂 아이콘(Alt+Shift+S)으로 다시 여세요. 열려 있던 ERP 탭은 새로고침(F5)하면 새 판이 적용됩니다. 처리 이력·설정은 그대로 남습니다.</div>`)+
     `</ol><details class="sec-sub" style="margin-top:6px"><summary>도구를 쓸 수 없을 때(수동)</summary>① 아래에서 zip 을 받아 압축을 풀고 ② 안의 파일을 기존 확장 폴더(<code>${page}</code> → 서무비서 → 세부정보 → '소스' 경로)에 덮어쓴 뒤 ③ <code>${page}</code>에서 서무비서의 ↻를 누릅니다.</details></div>`;
 }
+// 설치 순서 — 확장 탭과 웹 첫 화면(미설치 안내)이 같이 쓴다. 도구(설치·업데이트 .cmd)가 있으면 도구 중심, 없으면 zip
+function extInstallStepsHtml(i, o){
+  const {page, hosts, dev, load, mac}=o;
+  const step=(n,html)=>`<li class="sec-ext-st"><span class="sec-plan-n">${n}</span><div>${html}</div></li>`;
+  return (i.update_tools?`<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
+      step(1,(mac?`<a class="sec-btn primary" href="/api/secretary/extension/update.command" download>⬇ 설치 도구 받기(Mac)</a> <a class="sec-btn sm" href="/api/secretary/extension/update.cmd" download>Windows용</a>`
+                 :`<a class="sec-btn primary" href="/api/secretary/extension/update.cmd" download>⬇ 설치 도구 받기 (v${esc(i.version||'')})</a> <a class="sec-btn sm" href="/api/secretary/extension/update.command" download>Mac용</a>`)+
+        ` → 받은 파일을 <b>더블클릭</b>합니다. 확장 파일을 내려받아 정해진 폴더에 두고 그 폴더를 열어 줍니다(<code>${page}</code> 주소도 복사해 둡니다).`+
+        `<div class="sec-sub">이 서무비서 주소${hosts.length?`와 ERP 주소(${esc(hosts.join(', '))})`:''}가 미리 들어 있어 따로 설정하지 않아도 됩니다. Windows 가 "알 수 없는 게시자" 경고를 띄우면 '추가 정보 → 실행'. Mac 은 처음에 오른쪽 클릭 → 열기.</div>`)+
+      step(2,`주소창에 <code>${page}</code>를 붙여 넣어(Ctrl+V) 엽니다. <button class="sec-btn sm ghost" data-a="copyext" data-t="${page}">📋 주소 복사</button>`)+
+      step(3,dev)+
+      step(4,`${load} 방금 열린 <code>secretary-extension</code> 폴더를 고릅니다.`)+
+      step(5,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
+    `</ol><div class="sec-hint">새 버전이 나오면 같은 도구(또는 확장 폴더 안의 <b>업데이트.cmd</b>)를 다시 더블클릭하면 됩니다 — 설치된 폴더를 찾아 덮어쓰고 확장이 스스로 다시 불러옵니다. 처리 이력 등은 그대로 남습니다.</div>`+
+    `<details class="sec-sub" style="margin-top:6px"><summary>도구 없이 수동 설치(zip)</summary><a href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 zip 받기 (v${esc(i.version||'')})</a> → 압축을 풀어 <code>secretary-extension</code> 폴더를 둘 곳(예: 문서 폴더)에 두고, 위 2~5번 순서로 그 폴더를 고릅니다.</details></div>`
+    :`<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
+      step(1,`<a class="sec-btn primary" href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 받기 (v${esc(i.version||'')})</a>`+
+        `<div class="sec-sub">이 서무비서 주소${hosts.length?`와 ERP 주소(${esc(hosts.join(', '))})`:''}가 미리 들어 있어 따로 설정하지 않아도 됩니다.</div>`)+
+      step(2,`받은 <code>secretary-extension-${esc(i.version||'')}.zip</code>을 <b>압축 풀기</b> → <code>secretary-extension</code> 폴더가 생깁니다. 지우지 말고 둘 곳(예: 문서 폴더)에 두세요.`)+
+      step(3,`주소창에 <code>${page}</code>를 입력해 엽니다. <button class="sec-btn sm ghost" data-a="copyext" data-t="${page}">📋 주소 복사</button>`)+
+      step(4,dev)+
+      step(5,`${load} <code>secretary-extension</code> 폴더를 고릅니다.`)+
+      step(6,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
+    `</ol><div class="sec-hint">새 버전이 나오면 1번에서 다시 받아 같은 폴더에 덮어쓰면 확장이 스스로 다시 불러옵니다. 처리 이력 등은 그대로 남습니다.</div></div>`);
+}
 function extView(){
   const i=S.extInfo; if(!i){ loadExtInfo().then(()=>{ if(S.view==='ext') render(); }); return `<div class="assist-loading"><div class="spinner"></div><span>불러오는 중...</span></div>`; }
   const b=browserKind();
@@ -2923,30 +2957,12 @@ function extView(){
       `<li>도구 모음 아이콘에 <b>다가오는 기한</b>을 표시하고, 오늘·내일 기한은 바탕화면으로 알립니다.</li></ul></div></div>`+
     (installed?(verLt(S.extVersion,i.version)?extUpdateHtml(i, page):`<div class="sec-notice info">✓ 확장 ${esc(S.extVersion)}이 설치되어 있습니다(최신).</div>`):'')+
     (b==='other'?`<div class="sec-notice warn">이 브라우저에서는 확장을 쓸 수 없습니다. <b>Chrome</b>이나 <b>Microsoft Edge</b>로 이 페이지를 여세요.</div>`:'')+
-    (i.update_tools?`<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
-      step(1,(mac?`<a class="sec-btn primary" href="/api/secretary/extension/update.command" download>⬇ 설치 도구 받기(Mac)</a> <a class="sec-btn sm" href="/api/secretary/extension/update.cmd" download>Windows용</a>`
-                 :`<a class="sec-btn primary" href="/api/secretary/extension/update.cmd" download>⬇ 설치 도구 받기 (v${esc(i.version||'')})</a> <a class="sec-btn sm" href="/api/secretary/extension/update.command" download>Mac용</a>`)+
-        ` → 받은 파일을 <b>더블클릭</b>합니다. 확장 파일을 내려받아 정해진 폴더에 두고 그 폴더를 열어 줍니다(<code>${page}</code> 주소도 복사해 둡니다).`+
-        `<div class="sec-sub">이 서무비서 주소${hosts.length?`와 ERP 주소(${esc(hosts.join(', '))})`:''}가 미리 들어 있어 따로 설정하지 않아도 됩니다. Windows 가 "알 수 없는 게시자" 경고를 띄우면 '추가 정보 → 실행'. Mac 은 처음에 오른쪽 클릭 → 열기.</div>`)+
-      step(2,`주소창에 <code>${page}</code>를 붙여 넣어(Ctrl+V) 엽니다. <button class="sec-btn sm ghost" data-a="copyext" data-t="${page}">📋 주소 복사</button>`)+
-      step(3,dev)+
-      step(4,`${load} 방금 열린 <code>secretary-extension</code> 폴더를 고릅니다.`)+
-      step(5,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
-    `</ol><div class="sec-hint">새 버전이 나오면 같은 도구(또는 확장 폴더 안의 <b>업데이트.cmd</b>)를 다시 더블클릭하면 됩니다 — 설치된 폴더를 찾아 덮어쓰고 확장이 스스로 다시 불러옵니다. 처리 이력 등은 그대로 남습니다.</div>`+
-    `<details class="sec-sub" style="margin-top:6px"><summary>도구 없이 수동 설치(zip)</summary><a href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 zip 받기 (v${esc(i.version||'')})</a> → 압축을 풀어 <code>secretary-extension</code> 폴더를 둘 곳(예: 문서 폴더)에 두고, 위 2~5번 순서로 그 폴더를 고릅니다.</details></div>`
-    :`<div class="sec-card"><div class="sec-card-h">설치 순서 <span class="sec-sub">약 1분 · 관리자 권한 필요 없음</span></div><ol class="sec-ext-steps">`+
-      step(1,`<a class="sec-btn primary" href="/api/secretary/extension.zip" download>⬇ 확장 프로그램 받기 (v${esc(i.version||'')})</a>`+
-        `<div class="sec-sub">이 서무비서 주소${hosts.length?`와 ERP 주소(${esc(hosts.join(', '))})`:''}가 미리 들어 있어 따로 설정하지 않아도 됩니다.</div>`)+
-      step(2,`받은 <code>secretary-extension-${esc(i.version||'')}.zip</code>을 <b>압축 풀기</b> → <code>secretary-extension</code> 폴더가 생깁니다. 지우지 말고 둘 곳(예: 문서 폴더)에 두세요.`)+
-      step(3,`주소창에 <code>${page}</code>를 입력해 엽니다. <button class="sec-btn sm ghost" data-a="copyext" data-t="${page}">📋 주소 복사</button>`)+
-      step(4,dev)+
-      step(5,`${load} <code>secretary-extension</code> 폴더를 고릅니다.`)+
-      step(6,`도구 모음의 퍼즐 조각(확장) 아이콘 → <b>서무비서</b> 옆 📌로 고정합니다. ERP를 열고 오른쪽 아래 <b>🗂</b>나 <b>Alt+Shift+S</b>로 엽니다.`)+
-    `</ol><div class="sec-hint">새 버전이 나오면 1번에서 다시 받아 같은 폴더에 덮어쓰면 확장이 스스로 다시 불러옵니다. 처리 이력 등은 그대로 남습니다.</div></div>`)+
+    extInstallStepsHtml(i, {page, hosts, dev, load, mac})+
     `<details class="sec-card"><summary class="sec-card-h">관리자: 기관 PC 일괄 배포</summary><div class="sec-hint">`+
       `· 확장에 들어갈 ERP 주소는 <button class="sec-linkbtn" data-a="view" data-v="manage">⚙ 규정·절차 관리 › 🏢 기관 설정</button>의 'ERP·그룹웨어 주소'에서 바꿉니다.<br>`+
       `· 직원마다 설치하지 않으려면 받은 zip을 Chrome 웹 스토어·Edge 추가 기능에 <b>비공개(조직 한정)</b>로 올리고, 그룹 정책 <code>ExtensionInstallForcelist</code>에 확장 ID를 넣어 일괄 설치합니다.<br>`+
-      `· 개발자 모드 설치는 일부 기관 보안 정책에서 막혀 있을 수 있습니다. 그때는 위 일괄 배포를 쓰세요.</div></details>`;
+      `· 개발자 모드 설치는 일부 기관 보안 정책에서 막혀 있을 수 있습니다. 그때는 위 일괄 배포를 쓰세요.<br>`+
+      `· 스토어 등록에 필요한 <a href="/extension/privacy" target="_blank" rel="noopener">개인정보처리방침 페이지</a>와 등록 절차·소개 문구는 docs/ADMIN.md '웹 스토어 비공개 등록'에 있습니다.</div></details>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
