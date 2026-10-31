@@ -3183,6 +3183,240 @@ def secretary_draft_hwpx():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 지출결의서(assets/expense.js) — agro-law 에서 이관
+#   · POST /api/expense/hwpx : 본문 표 → 한글(.hwpx). 서식 베이스는 문서 초안과 같은 _sec_hwpx_base()
+#   · GET  /api/expense/biz  : 거래처 사업자번호 조회(회사명 → 금융위 기업기본정보) / 사업자 상태(국세청)
+#     DATA_GO_KR_KEY(공공데이터포털)가 없으면 need_key 로 답하고 화면은 직접 입력으로 계속 쓴다.
+# ══════════════════════════════════════════════════════════════════════════
+def _exp_hwpx_full_border(header_xml):
+    """4면 모두 선이 있는 borderFill id를 찾는다(표 테두리용). 없으면 None."""
+    for blk in re.findall(r'<hh:borderFill\b.*?</hh:borderFill>', header_xml, re.S):
+        idm = re.match(r'<hh:borderFill id="([0-9]+)"', blk)
+        if not idm:
+            continue
+        ok = 0
+        for side in ("leftBorder", "rightBorder", "topBorder", "bottomBorder"):
+            m = re.search(r'<hh:' + side + r'\b[^>]*type="([^"]+)"', blk)
+            if m and m.group(1) != "NONE":
+                ok += 1
+        if ok == 4:
+            return idm.group(1)
+    return None
+
+
+def _exp_hwpx_add_border(header_xml):
+    """실선 4면 borderFill 을 header 에 덧붙이고 (header, id) 를 돌려준다(최소 서식엔 표 테두리가 없을 수 있다)."""
+    ids = [int(x) for x in re.findall(r'<hh:borderFill id="([0-9]+)"', header_xml)]
+    new_id = str((max(ids) if ids else 0) + 1)
+    side = lambda s: f'<hh:{s} type="SOLID" width="0.12 mm" color="#000000"/>'
+    bf = (f'<hh:borderFill id="{new_id}" threeD="0" shadow="0" centerLine="NONE" breakCellSeparateLine="0">'
+          '<hh:slash type="NONE" Crooked="0" isCounter="0"/><hh:backSlash type="NONE" Crooked="0" isCounter="0"/>'
+          + side("leftBorder") + side("rightBorder") + side("topBorder") + side("bottomBorder")
+          + '<hh:diagonal type="SOLID" width="0.1 mm" color="#000000"/></hh:borderFill>')
+    m = re.search(r'<hh:borderFills itemCnt="(\d+)"', header_xml)
+    if not m:
+        return header_xml, "1"
+    header_xml = header_xml.replace(m.group(0), f'<hh:borderFills itemCnt="{int(m.group(1)) + 1}"', 1)
+    header_xml = header_xml.replace("</hh:borderFills>", bf + "</hh:borderFills>", 1)
+    return header_xml, new_id
+
+
+def _exp_hwpx_cell(text, col, row, cspan, width, height, bf):
+    return (
+        f'<hp:tc name="" header="0" hasMargin="1" protect="0" editable="0" dirty="0" borderFillIDRef="{bf}">'
+        f'<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" '
+        f'linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">'
+        f'<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
+        f'<hp:run charPrIDRef="0"><hp:t>{_sec_xesc(text)}</hp:t></hp:run>'
+        f'<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" '
+        f'baseline="850" spacing="600" horzpos="0" horzsize="{width}" flags="393216"/></hp:linesegarray>'
+        f'</hp:p></hp:subList>'
+        f'<hp:cellAddr colAddr="{col}" rowAddr="{row}"/>'
+        f'<hp:cellSpan colSpan="{cspan}" rowSpan="1"/>'
+        f'<hp:cellSz width="{width}" height="{height}"/>'
+        f'<hp:cellMargin left="141" right="141" top="141" bottom="141"/></hp:tc>')
+
+
+def _exp_hwpx_table(payload, bf):
+    col_w = [int(x) for x in (payload.get("colWidths") or []) if str(x).isdigit()][:12]
+    col_cnt = _sec_int(payload.get("colCnt"), len(col_w) or 1, 1, 12)
+    rows = payload.get("rows") or []
+    rh = 1848
+    total_w = sum(col_w) if col_w else 47628
+    trs = []
+    for r, cells in enumerate(rows):
+        col = 0
+        tcs = []
+        for c in (cells if isinstance(cells, list) else []):
+            if not isinstance(c, dict):
+                continue
+            cs = _sec_int(c.get("cs"), 1, 1, 12)
+            w = sum(col_w[col:col + cs]) if col_w else int(total_w / max(1, col_cnt)) * cs
+            tcs.append(_exp_hwpx_cell(str(c.get("t", ""))[:2000], col, r, cs, w, rh, bf))
+            col += cs
+        trs.append("<hp:tr>" + "".join(tcs) + "</hp:tr>")
+    tbl = (
+        f'<hp:tbl id="0" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" '
+        f'lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="0" rowCnt="{len(rows)}" colCnt="{col_cnt}" '
+        f'cellSpacing="0" borderFillIDRef="{bf}" noAdjust="0">'
+        f'<hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{rh*len(rows)}" heightRelTo="ABSOLUTE" protect="0"/>'
+        f'<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" '
+        f'vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>'
+        f'<hp:outMargin left="283" right="283" top="283" bottom="283"/>'
+        f'<hp:inMargin left="510" right="510" top="141" bottom="141"/>'
+        + "".join(trs) + '</hp:tbl>')
+    return (
+        '<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
+        f'<hp:run charPrIDRef="0">{tbl}</hp:run>'
+        '<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" '
+        'baseline="850" spacing="600" horzpos="0" horzsize="47628" flags="393216"/></hp:linesegarray></hp:p>')
+
+
+def _exp_hwpx_build(payload) -> bytes:
+    base = _sec_hwpx_base()
+    if not base:
+        raise RuntimeError("HWPX 기본 서식을 찾을 수 없습니다.")
+    zin = zipfile.ZipFile(_io.BytesIO(base), "r")
+    header = zin.read("Contents/header.xml").decode("utf-8", "ignore")
+    sec = zin.read("Contents/section0.xml").decode("utf-8", "ignore")
+    bf = _exp_hwpx_full_border(header)
+    if not bf:
+        header, bf = _exp_hwpx_add_border(header)
+    m = re.search(r"<hs:sec\b[^>]*>", sec)
+    if not m:
+        raise RuntimeError("HWPX 서식의 본문 구조를 읽지 못했습니다.")
+    body = sec[m.end():]
+    pi = body.find("<hp:p")
+    pj = body.find("</hp:p>", pi) + len("</hp:p>")
+    first = re.sub(r"<hp:t>.*?</hp:t>", "<hp:t></hp:t>", body[pi:pj], flags=re.S)   # 쪽 설정(secPr) 문단만 유지
+    title = _sec_clean_str(payload.get("title"), 80)
+    paras = _sec_hwpx_para(title, "0", 1200) if title else ""
+    new_sec = sec[:m.end()] + first + paras + _exp_hwpx_table(payload, bf) + _sec_hwpx_para("") + "</hs:sec>"
+    out = _io.BytesIO()
+    zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    zout.writestr(zipfile.ZipInfo("mimetype"), "application/hwp+zip", compress_type=zipfile.ZIP_STORED)
+    for n in zin.namelist():
+        if n in ("mimetype", "Preview/PrvImage.png"):
+            continue
+        if n == "Contents/section0.xml":
+            zout.writestr(n, new_sec.encode("utf-8"))
+        elif n == "Contents/header.xml":
+            zout.writestr(n, header.encode("utf-8"))
+        else:
+            zout.writestr(n, zin.read(n))
+    zout.close(); zin.close()
+    return out.getvalue()
+
+
+@app.route("/api/expense/hwpx", methods=["POST"])
+def expense_hwpx():
+    """지출결의서 본문 표를 한글(.hwpx) 파일로 생성."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "요청 형식이 올바르지 않습니다."}), 400
+    rows = data.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"success": False, "error": "표 데이터가 없습니다."}), 400
+    if len(rows) > 300:
+        return jsonify({"success": False, "error": "표가 너무 큽니다(300행 이하)."}), 400
+    try:
+        out = _exp_hwpx_build(data)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"HWPX 생성 실패: {e}"}), 500
+    fname = re.sub(r'[\\/:*?"<>|]+', "", str(data.get("filename") or "지출결의서"))[:60] + ".hwpx"
+    return Response(out, mimetype="application/hwp+zip",
+                    headers={"Content-Disposition": 'attachment; filename="expense.hwpx"; '
+                                                    "filename*=UTF-8''" + quote(fname)})
+
+
+def _exp_dgk_key() -> str:
+    """공공데이터포털 서비스키(Decoding 형태로 정규화 — Encoding 키를 그대로 넘기면 이중 인코딩된다)."""
+    k = (os.environ.get("DATA_GO_KR_KEY", "") or "").strip()
+    if k and re.search(r"%[0-9A-Fa-f]{2}", k):
+        try:
+            from urllib.parse import unquote
+            return unquote(k)
+        except Exception:
+            return k
+    return k
+
+
+def _exp_nts_status(key, bno):
+    """국세청 사업자등록 상태(계속/휴업/폐업)."""
+    try:
+        r = _SESSION.post("https://api.odcloud.kr/api/nts-businessman/v1/status",
+                          params={"serviceKey": key}, json={"b_no": [bno]}, timeout=12)
+        rows = (r.json() or {}).get("data") or []
+        if rows:
+            row = rows[0]
+            return {"status": row.get("b_stt") or "", "tax": row.get("tax_type") or "", "end": row.get("end_dt") or ""}
+    except Exception:
+        pass
+    return {}
+
+
+_EXP_FSC_BASE = ("https://apis.data.go.kr/1160100/service/"
+                 "GetCorpBasicInfoService_V2/getCorpOutline_V2")
+
+
+@app.route("/api/expense/biz")
+def expense_biz():
+    """거래처 조회 — 사업자등록번호(10자리)면 국세청 상태, 그 외(회사명)면 금융위 기업기본정보 후보."""
+    query = (request.args.get("query", "") or "").strip()[:80]
+    if not query:
+        return jsonify({"success": False, "error": "회사명 또는 사업자등록번호를 입력하세요."})
+    key = _exp_dgk_key()
+    if not key:
+        return jsonify({"success": False, "need_key": True,
+                        "error": "공공데이터포털 서비스키(DATA_GO_KR_KEY)가 설정되지 않았습니다."})
+    digits = re.sub(r"\D", "", query)
+    if len(digits) == 10 and re.fullmatch(r"[\d\s-]+", query):
+        st = _exp_nts_status(key, digits)
+        if not st:
+            return jsonify({"success": True, "count": 0, "items": [], "mode": "bno"})
+        biz = " · ".join(v for v in (st.get("status"), st.get("tax")) if v)
+        return jsonify({"success": True, "count": 1, "mode": "bno",
+                        "items": [{"name": digits, "ceo": "", "bno": digits, "addr": "", "biz": biz,
+                                   "closed": bool(st.get("end"))}]})
+    try:
+        r = _SESSION.get(_EXP_FSC_BASE, params={"serviceKey": key, "pageNo": "1", "numOfRows": "50",
+                                                "resultType": "json", "corpNm": query}, timeout=15)
+        try:
+            j = r.json() or {}
+        except Exception:
+            return jsonify({"success": False, "mode": "name",
+                            "error": f"기업기본정보 응답 오류(HTTP {r.status_code}). DATA_GO_KR_KEY의 "
+                                     "'금융위원회_기업기본정보' 활용신청·Decoding 키 여부를 확인하세요."})
+        recs = (((j.get("response") or {}).get("body") or {}).get("items") or [])
+        if isinstance(recs, dict):
+            recs = recs.get("item") or []
+        if isinstance(recs, dict):
+            recs = [recs]
+        items, seen = [], set()
+        for rec in (recs if isinstance(recs, list) else []):
+            nm = str(rec.get("corpNm") or "").strip()
+            bno = re.sub(r"\D", "", str(rec.get("bzno") or ""))
+            crno = re.sub(r"\D", "", str(rec.get("crno") or ""))
+            ceo = str(rec.get("enpRprfNm") or "").strip()
+            addr = str(rec.get("enpBsadr") or "").strip()
+            k = ("id:" + (crno or bno)) if (crno or bno) else ("nm:" + nm + "|" + ceo + "|" + addr)
+            if k in seen:
+                continue
+            seen.add(k)
+            items.append({"name": nm or "(상호 미상)", "ceo": ceo, "bno": bno, "addr": addr,
+                          "biz": str(rec.get("enpMainBizNm") or "").strip()})
+        qn = re.sub(r"\s+", "", query)
+
+        def _rank(it):   # 완전일치 → 접두일치 → 부분일치 → 그 외
+            n = re.sub(r"\s+", "", it["name"])
+            return 0 if n == qn else 1 if n.startswith(qn) else 2 if qn in n else 3
+        items.sort(key=_rank)
+        return jsonify({"success": True, "count": min(len(items), 30), "items": items[:30], "mode": "name"})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"조회 실패: {type(e).__name__}"})
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # ② 결재 전 사전 감사 — 규칙 감사(항상) + AI 감사(키가 있을 때)
 #   규칙 감사: 기한 경과·임박, 숙박비 상한, 증빙 누락·기간 밖·결제수단, 초안 필수 기재사항
 #   AI 감사: 절차·사실관계·초안을 '제공한 조문'과 대조. 근거는 제공한 조문 목록(enum)에서만 고른다.

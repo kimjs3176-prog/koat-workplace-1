@@ -621,7 +621,7 @@ async function start(opts){
   if(opts.q){ ask(opts.q); return; }
   // 확장의 기한 알림을 누르면 그 건으로 바로(이 브라우저에 있는 건일 때만)
   if(opts.case){ const c=cases().find(x=>x.id===opts.case); if(c && getProc(c.procId)){ selectProc(c.procId, {caseId:c.id, scroll:false}); return; } }
-  if(opts.view && ['list','history','forms','manage','cal','ext'].includes(opts.view)) S.view=opts.view;
+  if(opts.view && ['list','history','forms','manage','cal','ext','expense'].includes(opts.view)) S.view=opts.view;
   render();
 }
 
@@ -657,7 +657,7 @@ function selectProc(id, o){
 // ── 렌더 ─────────────────────────────────────────────────────────────────
 function render(){
   const w=document.getElementById('secWrap'); if(!w) return;
-  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['tools','🧮 판정 도구'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
+  const tabs=[['home','🏠 안내'],...(EMBED?[]:[['ext',extInstalled()?'🧩 확장':'🧩 확장 설치']]),['cal','📅 업무 달력'],['list','📚 절차 목록'],['forms','📎 서식·규정'],['tools','🧮 판정 도구'],['expense','🧾 지출결의서'],['history','🕘 처리 이력'],['manage','⚙ 규정·절차 관리']];
   const active=(S.view==='proc'||S.view==='nomatch')?'home':(S.view==='edit'?'manage':S.view);
   const openN=cases().filter(c=>c.status!=='done').length;
   const nav=`<div class="sec-tabs" role="tablist">`+tabs.map(([k,l])=>`<button class="sec-tab${active===k?' on':''}" role="tab" aria-selected="${active===k}" data-a="view" data-v="${k}">${l}${k==='history'&&openN?` <span class="sec-cnt">${openN}</span>`:''}</button>`).join('')+`</div>`;
@@ -676,6 +676,7 @@ function render(){
   else if(S.view==='edit') body=editView();
   else if(S.view==='ext') body=extView();
   else if(S.view==='tools') body=toolsView();
+  else if(S.view==='expense') body=`<div id="expMount" class="exp-mount"></div>`;   // 지출결의서(assets/expense.js)가 그린다
   // 입력하다 화면이 다시 그려져도 그 칸(포커스·커서)과 스크롤 위치를 지킨다 — 같은 화면일 때만
   // (같은 화면이라도 다른 절차·다른 건으로 바뀌었으면 되살리지 않는다 — 앞 건의 메모·날짜가 새 건에 저장되지 않게)
   // (새 건은 첫 입력 때 만들어지므로 '건 없음 → 새 건'은 같은 건으로 본다)
@@ -685,6 +686,8 @@ function render(){
   let ss=null, se=null; try{ ss=ae&&ae.selectionStart; se=ae&&ae.selectionEnd; }catch(e){}
   const keep=same?{sig:sig(ae), v:ae&&'value' in ae?ae.value:null, ss, se, y:window.scrollY}:null;
   w.innerHTML=extUpdateBar()+ask+nav+`<div class="sec-body">${body}</div>`;
+  if(S.view==='expense'){ const m=document.getElementById('expMount'); if(m && window.Expense) window.Expense.mount(m);
+    else if(m) m.innerHTML='<div class="assist-loading">지출결의서 화면을 불러오지 못했습니다. 새로 고침해 주세요.</div>'; }
   S._lastView=where;
   if(keep){
     if(keep.sig){ const el=[...w.querySelectorAll(ae.tagName)].find(x=>sig(x)===keep.sig);

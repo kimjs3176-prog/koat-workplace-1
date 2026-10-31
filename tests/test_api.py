@@ -559,3 +559,50 @@ def test_extension_zip_has_update_tools(client):
     assert client.get("/api/secretary/extension/update.command", base_url="https://sec.example.org").data.startswith(b"#!/bin/bash")
     assert client.get("/api/secretary/extension/update.cmd", base_url="http://erp.example.org").status_code == 400
     assert client.get("/api/secretary/extension/info", base_url="https://sec.example.org").get_json()["update_tools"] is True
+
+
+# ── 지출결의서(agro-law 에서 이관) ─────────────────────────────────────────
+def test_expense_hwpx_builds_table(client):
+    import io, zipfile
+    payload = {"title": "지출결의서 (여비)", "filename": "지출결의서_여비", "colCnt": 3, "colWidths": [9000, 20000, 9000],
+               "rows": [[{"t": "일자", "hd": True}, {"t": "내용", "hd": True}, {"t": "금액", "hd": True}],
+                        [{"t": "2026-10-21"}, {"t": "KTX <서울→대전>"}, {"t": "23,700"}]]}
+    r = client.post("/api/expense/hwpx", data=json.dumps(payload), content_type="application/json")
+    assert r.status_code == 200, r.data[:200]
+    assert "attachment" in r.headers["Content-Disposition"]
+    z = zipfile.ZipFile(io.BytesIO(r.data))
+    assert z.read("mimetype") == b"application/hwp+zip"
+    sec = z.read("Contents/section0.xml").decode("utf-8")
+    assert 'rowCnt="2"' in sec and "KTX &lt;서울→대전&gt;" in sec
+    bf = __import__("re").search(r'<hp:tbl [^>]*borderFillIDRef="(\d+)"', sec).group(1)
+    assert f'<hh:borderFill id="{bf}"' in z.read("Contents/header.xml").decode("utf-8")   # 표 테두리 스타일이 서식에 있다
+
+
+@pytest.mark.parametrize("body", [[1], {"rows": []}, {"rows": "x"}])
+def test_expense_hwpx_bad_input(client, body):
+    r = client.post("/api/expense/hwpx", data=json.dumps(body), content_type="application/json")
+    assert r.status_code == 400 and r.get_json()["success"] is False
+
+
+def test_expense_biz_without_key(client, monkeypatch):
+    monkeypatch.delenv("DATA_GO_KR_KEY", raising=False)
+    d = client.get("/api/expense/biz", query_string={"query": "한국농업기술진흥원"}).get_json()
+    assert d["success"] is False and d["need_key"] is True
+
+
+def test_expense_hwpx_tolerates_bad_numbers(client):
+    """colCnt·cs 가 숫자가 아니어도 500 이 아니라 기본값으로 만든다"""
+    payload = {"colCnt": "abc", "colWidths": ["x", 9000], "rows": [[{"t": "a", "cs": "많이"}, {"t": "b", "cs": None}]]}
+    r = client.post("/api/expense/hwpx", data=json.dumps(payload), content_type="application/json")
+    assert r.status_code == 200 and r.data[:2] == b"PK"
+
+
+def test_expense_receipt_template_has_no_default_department():
+    """표준 라이브러리로만 읽는다(CI 에 openpyxl 없음)"""
+    import zipfile, re as _re
+    z = zipfile.ZipFile("assets/expense_receipt_template.xlsx")
+    sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    g3 = _re.search(r'<c r="G3"[^>]*?(?:/>|>(.*?)</c>)', sheet)
+    assert not (g3 and g3.group(1) and "<v>" in g3.group(1))                     # 부서명은 화면이 항상 채운다(기본값이 새어 나가지 않게)
+    merges = set(_re.findall(r'<mergeCell ref="([A-Z]+9:[A-Z]+9)"', sheet))
+    assert merges == {"C9:D9", "E9:G9", "H9:J9"}
