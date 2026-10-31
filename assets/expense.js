@@ -333,7 +333,7 @@ function _expVendorAutofill(el){ const info=_expScopeOf(el&&el.id); if(!info) re
 // ── 사업자 상태(국세청) 배지 — /api/expense/biz?query=<10자리> (mode:bno) ──
 function _bnoStatusCls(text, closed){ const t=String(text||''); if(closed||/폐업/.test(t)) return 'dead'; if(/휴업/.test(t)) return 'warn'; if(/계속/.test(t)) return 'ok'; return 'warn'; }
 function _expFetchBnoStatus(bno){ const d=String(bno||'').replace(/\D/g,''); if(d.length!==10) return Promise.resolve(null);
-  return fetch('/api/expense/biz?query='+d).then(r=>r.json()).then(j=>{
+  return fetch('/api/expense/biz',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:d})}).then(r=>r.json()).then(j=>{
     if(!j||j.success===false) return null;
     if(j.mode==='bno'){ if((j.count||0)===0) return {text:'국세청 상태 정보 없음',cls:'warn'}; const it=(j.items||[])[0]||{};
       return {text:it.biz||'상태 확인됨', cls:_bnoStatusCls(it.biz||'', it.closed)}; }
@@ -368,7 +368,7 @@ function _expBizLookup(scope, idx){
   const nm=((document.getElementById(scope==='multi'?('gvVendor'+idx):'gVendor')||{}).value||'').trim();
   if(!nm){ _expBizMsg(scope,'거래처(상호)를 먼저 입력하세요.'); return; }
   _expBizMsg(scope,'"'+nm+'" 사업자번호 조회 중...');
-  fetch('/api/expense/biz?query='+encodeURIComponent(nm)).then(r=>r.json()).then(d=>{
+  fetch('/api/expense/biz',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:nm})}).then(r=>r.json()).then(d=>{   // 거래처명을 주소에 싣지 않는다
     if(d&&d.need_key){ _expBizMsg(scope,'공공데이터 서비스키(DATA_GO_KR_KEY)가 설정되지 않았습니다.'); return; }
     if(!d||d.success===false){ _expBizMsg(scope,'조회 실패: '+((d&&d.error)||'네트워크 오류')); return; }
     const items=(d.items||[]).filter(it=>it.bno);

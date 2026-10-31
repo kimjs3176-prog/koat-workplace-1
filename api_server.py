@@ -2323,10 +2323,12 @@ def secretary_basis():
     return jsonify({"success": True, "reg": title, "q": q, "text": snippet, **extra})
 
 
-@app.route("/api/secretary/related")
+@app.route("/api/secretary/related", methods=["GET", "POST"])
 def secretary_related():
-    """등록된 절차가 없을 때 — 상황 문장과 관련 있는 내규 조문(키워드 + 가능하면 의미 검색)."""
-    q = (request.args.get("q") or "").strip()[:300]          # /ask 와 같은 길이 — 긴 글 하나로 서버·의미 검색 키를 붙잡지 않게
+    """등록된 절차가 없을 때 — 상황 문장과 관련 있는 내규 조문(키워드 + 가능하면 의미 검색).
+    화면은 POST 로 보낸다 — 사용자가 적은 상황 문장이 주소(쿼리)로 접속 로그에 남지 않게. GET 은 호환용."""
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    q = (str((body or {}).get("q") or "") if isinstance(body, dict) else (request.args.get("q") or "")).strip()[:300]          # /ask 와 같은 길이 — 긴 글 하나로 서버·의미 검색 키를 붙잡지 않게
     if len(q) < 2:
         return jsonify({"success": True, "items": []})
     return jsonify({"success": True, "items": [{k: v for k, v in it.items() if k != "text"} for it in _sec_related_items(q)]})
@@ -3370,10 +3372,12 @@ _EXP_FSC_BASE = ("https://apis.data.go.kr/1160100/service/"
                  "GetCorpBasicInfoService_V2/getCorpOutline_V2")
 
 
-@app.route("/api/expense/biz")
+@app.route("/api/expense/biz", methods=["GET", "POST"])
 def expense_biz():
-    """거래처 조회 — 사업자등록번호(10자리)면 국세청 상태, 그 외(회사명)면 금융위 기업기본정보 후보."""
-    query = (request.args.get("query", "") or "").strip()[:80]
+    """거래처 조회 — 사업자등록번호(10자리)면 국세청 상태, 그 외(회사명)면 금융위 기업기본정보 후보.
+    화면은 POST 로 보낸다(거래처명·사업자번호가 주소로 접속 로그에 남지 않게). GET 은 호환용."""
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    query = (str((body or {}).get("query") or "") if isinstance(body, dict) else (request.args.get("query", "") or "")).strip()[:80]
     if not query:
         return jsonify({"success": False, "error": "회사명 또는 사업자등록번호를 입력하세요."})
     key = _exp_dgk_key()
